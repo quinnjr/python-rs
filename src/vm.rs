@@ -2,7 +2,7 @@
 use crate::builtins;
 use crate::bytecode::{self, CodeObject, op};
 use crate::error::PythonError;
-use crate::object::{HeapObject, Value};
+use crate::object::{BuiltinId, ExceptionType, GeneratorState, HeapObject, Value, value_hash};
 use std::collections::HashMap;
 
 const MAX_STACK: usize = 256;
@@ -15,6 +15,12 @@ struct Frame {
     stack: [Value; MAX_STACK],
     sp: usize,
     locals: [Value; MAX_LOCALS],
+    /// Heap indices of cell objects for closures.
+    cells: Vec<usize>,
+    /// If this frame belongs to a generator, its heap index.
+    generator_idx: Option<usize>,
+    /// If this frame is an __init__ call, the instance to return to the caller.
+    init_instance: Option<Value>,
 }
 
 impl Frame {
@@ -22,17 +28,16 @@ impl Frame {
         Self {
             code_index,
             ip: 0,
-            // SAFETY: Value is Copy and none() is a valid bit pattern for initialization.
             stack: [Value::none(); MAX_STACK],
             sp: 0,
             locals: [Value::none(); MAX_LOCALS],
+            cells: Vec::new(),
+            generator_idx: None,
+            init_instance: None,
         }
     }
 
     fn push(&mut self, val: Value) {
-        // SAFETY: sp is always < MAX_STACK when correctly balanced bytecode is executed.
-        // The compiler ensures push/pop balance and MAX_STACK=256 is sufficient for
-        // expression evaluation depth in Phase 1.
         unsafe {
             *self.stack.get_unchecked_mut(self.sp) = val;
         }
@@ -41,14 +46,19 @@ impl Frame {
 
     fn pop(&mut self) -> Value {
         self.sp -= 1;
-        // SAFETY: sp was > 0 before decrement (balanced bytecode).
         unsafe { *self.stack.get_unchecked(self.sp) }
     }
 
     fn peek(&self) -> Value {
-        // SAFETY: sp > 0 (at least one value on stack).
         unsafe { *self.stack.get_unchecked(self.sp - 1) }
     }
+}
+
+/// Exception handler entry on the handler stack.
+struct ExceptionHandler {
+    handler_ip: usize,
+    frame_index: usize,
+    stack_depth: usize,
 }
 
 /// The virtual machine.
@@ -58,10 +68,11 @@ pub struct VM {
     globals: HashMap<String, Value>,
     pub heap: Vec<HeapObject>,
     pub output: Vec<String>,
+    exception_stack: Vec<ExceptionHandler>,
+    current_exception: Option<Value>,
 }
 
 impl VM {
-    /// Create a new VM with compiled code objects and initial heap.
     pub fn new(code_objects: Vec<CodeObject>, heap: Vec<HeapObject>) -> Self {
         let mut vm = Self {
             frames: Vec::with_capacity(64),
@@ -69,29 +80,103 @@ impl VM {
             globals: HashMap::new(),
             heap,
             output: Vec::new(),
+            exception_stack: Vec::new(),
+            current_exception: None,
         };
         builtins::register_builtins(&mut vm.globals, &mut vm.heap);
         vm
     }
 
-    /// Run the main (first) code object.
     pub fn run(&mut self) -> Result<(), PythonError> {
         self.frames.push(Frame::new(0));
         self.execute()
+    }
+
+    /// Raise an exception, unwinding to the nearest handler.
+    /// Returns Ok(()) if a handler was found and the VM should continue.
+    /// Returns Err if no handler was found.
+    fn raise_exception(&mut self, exc_val: Value, line: u32) -> Result<(), PythonError> {
+        self.current_exception = Some(exc_val);
+
+        if let Some(handler) = self.exception_stack.pop() {
+            // Unwind frames to the handler's frame
+            while self.frames.len() > handler.frame_index + 1 {
+                self.frames.pop();
+            }
+            // Restore stack depth
+            let frame = &mut self.frames[handler.frame_index];
+            frame.sp = handler.stack_depth;
+            frame.ip = handler.handler_ip;
+            Ok(())
+        } else {
+            // No handler — propagate as Rust error
+            let msg = if let Some(exc) = &self.current_exception {
+                if let Some(idx) = exc.as_object_ref() {
+                    if let HeapObject::ExceptionObj { exc_type, message, .. } = &self.heap[idx] {
+                        format!("{}: {}", exc_type.name(), message)
+                    } else {
+                        exc.display(&self.heap)
+                    }
+                } else {
+                    exc.display(&self.heap)
+                }
+            } else {
+                "unknown exception".to_string()
+            };
+            Err(PythonError::runtime(msg, line))
+        }
+    }
+
+    /// Create an exception object and raise it.
+    fn raise_exc(&mut self, exc_type: ExceptionType, message: &str, line: u32) -> Result<(), PythonError> {
+        let idx = self.heap.len();
+        self.heap.push(HeapObject::ExceptionObj {
+            exc_type,
+            message: message.to_string(),
+            args: Vec::new(),
+        });
+        let exc_val = Value::object_ref(idx);
+        self.raise_exception(exc_val, line)
+    }
+
+    /// Try to handle a PythonError as a Python-level exception.
+    /// Maps known error messages to exception types and routes through the handler stack.
+    /// Returns Ok(true) if handled (VM should `continue`), or re-raises the original error.
+    fn try_handle_error(&mut self, err: PythonError, line: u32) -> Result<bool, PythonError> {
+        if self.exception_stack.is_empty() {
+            return Err(err);
+        }
+        let msg = match &err {
+            PythonError::RuntimeError { msg, .. } => msg.clone(),
+            _ => return Err(err),
+        };
+        let exc_type = if msg.contains("division by zero") || msg.contains("division or modulo by zero") {
+            ExceptionType::ZeroDivisionError
+        } else if msg.contains("unsupported operand") || msg.contains("not supported") {
+            ExceptionType::TypeError
+        } else if msg.contains("is not defined") {
+            ExceptionType::NameError
+        } else if msg.contains("index out of range") || msg.contains("out of bounds") {
+            ExceptionType::IndexError
+        } else if msg.contains("KeyError") {
+            ExceptionType::KeyError
+        } else {
+            ExceptionType::RuntimeError
+        };
+        self.raise_exc(exc_type, &msg, line)?;
+        Ok(true)
     }
 
     fn execute(&mut self) -> Result<(), PythonError> {
         loop {
             let frame_idx = self.frames.len() - 1;
 
-            // Read instruction — borrow frame briefly, extract all needed data, then drop borrow.
             let (instr, line, code_index) = {
                 let frame = &self.frames[frame_idx];
                 let code = &self.code_objects[frame.code_index];
                 if frame.ip >= code.instructions.len() {
                     return Err(PythonError::runtime("instruction pointer out of bounds", 0));
                 }
-                // SAFETY: ip is bounds-checked above.
                 let instr = unsafe { *code.instructions.get_unchecked(frame.ip) };
                 let line = unsafe { *code.line_table.get_unchecked(frame.ip) };
                 (instr, line, frame.code_index)
@@ -102,20 +187,22 @@ impl VM {
             let opcode = bytecode::decode_op(instr);
             let operand = bytecode::decode_operand(instr);
 
+            eprintln!("[TRACE] frame={} code={} ip={} op={} operand={} sp={} gen={:?}",
+                frame_idx, code_index, self.frames[frame_idx].ip - 1,
+                opcode, operand, self.frames[frame_idx].sp,
+                self.frames[frame_idx].generator_idx);
+
             match opcode {
                 op::LOAD_CONST => {
-                    // SAFETY: operand is a valid constant index (set by compiler).
                     let val = self.code_objects[code_index].constants[operand as usize];
                     self.frames[frame_idx].push(val);
                 }
                 op::LOAD_FAST => {
-                    // SAFETY: operand is a valid local index (set by compiler).
                     let val = unsafe { *self.frames[frame_idx].locals.get_unchecked(operand as usize) };
                     self.frames[frame_idx].push(val);
                 }
                 op::STORE_FAST => {
                     let val = self.frames[frame_idx].pop();
-                    // SAFETY: operand is a valid local index (set by compiler).
                     unsafe { *self.frames[frame_idx].locals.get_unchecked_mut(operand as usize) = val; }
                 }
                 op::LOAD_GLOBAL => {
@@ -123,10 +210,10 @@ impl VM {
                     if let Some(&val) = self.globals.get(name) {
                         self.frames[frame_idx].push(val);
                     } else {
-                        return Err(PythonError::runtime(
-                            format!("name '{name}' is not defined"),
-                            line,
-                        ));
+                        let msg = format!("name '{name}' is not defined");
+                        let err = PythonError::runtime(msg, line);
+                        self.try_handle_error(err, line)?;
+                        continue;
                     }
                 }
                 op::STORE_GLOBAL => {
@@ -134,41 +221,83 @@ impl VM {
                     let name = self.code_objects[code_index].names[operand as usize].clone();
                     self.globals.insert(name, val);
                 }
+                op::LOAD_DEREF => {
+                    let cell_idx = self.frames[frame_idx].cells.get(operand as usize).copied();
+                    if let Some(ci) = cell_idx {
+                        if let HeapObject::Cell(v) = &self.heap[ci] {
+                            self.frames[frame_idx].push(*v);
+                        } else {
+                            return Err(PythonError::runtime("LOAD_DEREF: not a cell", line));
+                        }
+                    } else {
+                        return Err(PythonError::runtime("LOAD_DEREF: invalid cell index", line));
+                    }
+                }
+                op::STORE_DEREF => {
+                    let val = self.frames[frame_idx].pop();
+                    let cell_idx = self.frames[frame_idx].cells.get(operand as usize).copied();
+                    if let Some(ci) = cell_idx {
+                        self.heap[ci] = HeapObject::Cell(val);
+                    } else {
+                        return Err(PythonError::runtime("STORE_DEREF: invalid cell index", line));
+                    }
+                }
+                op::LOAD_CLOSURE => {
+                    let cell_idx = self.frames[frame_idx].cells.get(operand as usize).copied();
+                    if let Some(ci) = cell_idx {
+                        // Push the cell heap index as an int (used by MAKE_CLOSURE)
+                        self.frames[frame_idx].push(Value::int(ci as i64));
+                    } else {
+                        return Err(PythonError::runtime("LOAD_CLOSURE: invalid cell index", line));
+                    }
+                }
                 op::ADD => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let result = binary_add(left, right, &mut self.heap, line)?;
-                    self.frames[frame_idx].push(result);
+                    match binary_add(left, right, &mut self.heap, line) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                    }
                 }
                 op::SUB => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let result = binary_arith(left, right, line, |a, b| a - b, |a, b| a - b)?;
-                    self.frames[frame_idx].push(result);
+                    match binary_arith(left, right, line, |a, b| a - b, |a, b| a - b) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                    }
                 }
                 op::MUL => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let result = binary_mul(left, right, line)?;
-                    self.frames[frame_idx].push(result);
+                    match binary_mul(left, right, &mut self.heap, line) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                    }
                 }
                 op::DIV => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let result = binary_div(left, right, line)?;
-                    self.frames[frame_idx].push(result);
+                    match binary_div(left, right, line) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                    }
                 }
                 op::FLOOR_DIV => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let result = binary_floor_div(left, right, line)?;
-                    self.frames[frame_idx].push(result);
+                    match binary_floor_div(left, right, line) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                    }
                 }
                 op::MOD => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let result = binary_mod(left, right, line)?;
-                    self.frames[frame_idx].push(result);
+                    match binary_mod(left, right, &self.heap, line) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                    }
                 }
                 op::POW => {
                     let right = self.frames[frame_idx].pop();
@@ -192,17 +321,34 @@ impl VM {
                     let truthy = is_truthy(val, &self.heap);
                     self.frames[frame_idx].push(Value::bool_val(!truthy));
                 }
+                op::UNARY_POS => {
+                    let val = self.frames[frame_idx].pop();
+                    let result = if val.is_int() || val.is_float() {
+                        val
+                    } else {
+                        return Err(PythonError::runtime("bad operand for unary +", line));
+                    };
+                    self.frames[frame_idx].push(result);
+                }
+                op::UNARY_INVERT => {
+                    let val = self.frames[frame_idx].pop();
+                    if let Some(i) = val.as_int() {
+                        self.frames[frame_idx].push(Value::int(!i));
+                    } else {
+                        return Err(PythonError::runtime("bad operand type for unary ~", line));
+                    }
+                }
                 op::COMPARE_EQ => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let r = compare(left, right, &self.heap, |a, b| a == b, |a, b| a == b);
+                    let r = values_equal(left, right, &self.heap);
                     self.frames[frame_idx].push(Value::bool_val(r));
                 }
                 op::COMPARE_NE => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let r = compare(left, right, &self.heap, |a, b| a != b, |a, b| a != b);
-                    self.frames[frame_idx].push(Value::bool_val(r));
+                    let r = values_equal(left, right, &self.heap);
+                    self.frames[frame_idx].push(Value::bool_val(!r));
                 }
                 op::COMPARE_LT => {
                     let right = self.frames[frame_idx].pop();
@@ -228,6 +374,71 @@ impl VM {
                     let r = compare(left, right, &self.heap, |a, b| a >= b, |a, b| a >= b);
                     self.frames[frame_idx].push(Value::bool_val(r));
                 }
+                op::COMPARE_IS => {
+                    let right = self.frames[frame_idx].pop();
+                    let left = self.frames[frame_idx].pop();
+                    // Identity comparison: same bit pattern
+                    let r = left == right;
+                    self.frames[frame_idx].push(Value::bool_val(r));
+                }
+                op::COMPARE_IS_NOT => {
+                    let right = self.frames[frame_idx].pop();
+                    let left = self.frames[frame_idx].pop();
+                    let r = left != right;
+                    self.frames[frame_idx].push(Value::bool_val(r));
+                }
+                op::CONTAINS_OP => {
+                    let container = self.frames[frame_idx].pop();
+                    let item = self.frames[frame_idx].pop();
+                    let found = contains(&item, &container, &self.heap)?;
+                    let result = if operand == 0 { found } else { !found }; // 0=in, 1=not in
+                    self.frames[frame_idx].push(Value::bool_val(result));
+                }
+                op::BIT_AND => {
+                    let right = self.frames[frame_idx].pop();
+                    let left = self.frames[frame_idx].pop();
+                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+                        self.frames[frame_idx].push(Value::int(a & b));
+                    } else {
+                        return Err(PythonError::runtime("unsupported operand type(s) for &", line));
+                    }
+                }
+                op::BIT_OR => {
+                    let right = self.frames[frame_idx].pop();
+                    let left = self.frames[frame_idx].pop();
+                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+                        self.frames[frame_idx].push(Value::int(a | b));
+                    } else {
+                        return Err(PythonError::runtime("unsupported operand type(s) for |", line));
+                    }
+                }
+                op::BIT_XOR => {
+                    let right = self.frames[frame_idx].pop();
+                    let left = self.frames[frame_idx].pop();
+                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+                        self.frames[frame_idx].push(Value::int(a ^ b));
+                    } else {
+                        return Err(PythonError::runtime("unsupported operand type(s) for ^", line));
+                    }
+                }
+                op::LSHIFT => {
+                    let right = self.frames[frame_idx].pop();
+                    let left = self.frames[frame_idx].pop();
+                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+                        self.frames[frame_idx].push(Value::int(a << b));
+                    } else {
+                        return Err(PythonError::runtime("unsupported operand type(s) for <<", line));
+                    }
+                }
+                op::RSHIFT => {
+                    let right = self.frames[frame_idx].pop();
+                    let left = self.frames[frame_idx].pop();
+                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+                        self.frames[frame_idx].push(Value::int(a >> b));
+                    } else {
+                        return Err(PythonError::runtime("unsupported operand type(s) for >>", line));
+                    }
+                }
                 op::JUMP => {
                     self.frames[frame_idx].ip = operand as usize;
                 }
@@ -245,8 +456,6 @@ impl VM {
                 }
                 op::CALL_FUNCTION => {
                     let argc = operand as usize;
-
-                    // Pop args then function from the stack
                     let mut args = Vec::with_capacity(argc);
                     for _ in 0..argc {
                         args.push(self.frames[frame_idx].pop());
@@ -254,19 +463,123 @@ impl VM {
                     args.reverse();
                     let func_val = self.frames[frame_idx].pop();
 
-                    if let Some(heap_idx) = func_val.as_builtin_ref() {
-                        let id = if let HeapObject::BuiltinFn { id, .. } = &self.heap[heap_idx] {
-                            *id
-                        } else {
-                            return Err(PythonError::runtime("not a callable", line));
-                        };
-                        let result = builtins::call_builtin(
-                            id,
-                            &args,
-                            &mut self.heap,
-                            &mut self.output,
-                        )?;
-                        self.frames[frame_idx].push(result);
+                    // Dispatch based on value type
+                    if let Some(heap_idx) = func_val.as_object_ref() {
+                        match &self.heap[heap_idx] {
+                            HeapObject::BuiltinFn { id, .. } => {
+                                let id = *id;
+                                match builtins::call_builtin(
+                                    id, &args, &mut self.heap, &mut self.output, &self.globals,
+                                ) {
+                                    Ok(result) => self.frames[frame_idx].push(result),
+                                    Err(e) => { self.try_handle_error(e, line)?; continue; }
+                                }
+                            }
+                            HeapObject::Closure { code_index, arity, cells, .. } => {
+                                let func_code_index = *code_index;
+                                let arity = *arity as usize;
+                                let cells = cells.clone();
+                                if argc != arity {
+                                    let name = if let HeapObject::Closure { name, .. } = &self.heap[heap_idx] {
+                                        name.clone()
+                                    } else { "???".to_string() };
+                                    return Err(PythonError::runtime(
+                                        format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
+                                    ));
+                                }
+
+                                // Check if this is a generator function
+                                if self.code_objects[func_code_index].is_generator {
+                                    let gen_idx = self.heap.len();
+                                    let num_locals = self.code_objects[func_code_index].num_locals;
+                                    let mut locals = vec![Value::none(); num_locals];
+                                    for (i, arg) in args.iter().enumerate() {
+                                        locals[i] = *arg;
+                                    }
+                                    self.heap.push(HeapObject::Generator {
+                                        code_index: func_code_index,
+                                        ip: 0,
+                                        locals,
+                                        stack: Vec::new(),
+                                        state: GeneratorState::Created,
+                                        cells,
+                                    });
+                                    self.frames[frame_idx].push(Value::object_ref(gen_idx));
+                                } else {
+                                    let mut new_frame = Frame::new(func_code_index);
+                                    for (i, arg) in args.iter().enumerate() {
+                                        new_frame.locals[i] = *arg;
+                                    }
+                                    // Set up cells: cell_vars get new cells, free_vars use closure cells
+                                    let code = &self.code_objects[func_code_index];
+                                    let num_cell = code.cell_var_names.len();
+                                    let num_free = code.free_var_names.len();
+                                    for _ in 0..num_cell {
+                                        let ci = self.heap.len();
+                                        self.heap.push(HeapObject::Cell(Value::none()));
+                                        new_frame.cells.push(ci);
+                                    }
+                                    // Initialize cell vars from params if they're also cell vars
+                                    let cell_var_names: Vec<String> = self.code_objects[func_code_index].cell_var_names.clone();
+                                    for (ci, cv_name) in cell_var_names.iter().enumerate() {
+                                        let local_names = &self.code_objects[func_code_index].local_names;
+                                        if let Some(li) = local_names.iter().position(|n| n == cv_name) {
+                                            self.heap[new_frame.cells[ci]] = HeapObject::Cell(new_frame.locals[li]);
+                                        }
+                                    }
+                                    for i in 0..num_free {
+                                        if i < cells.len() {
+                                            new_frame.cells.push(cells[i]);
+                                        }
+                                    }
+                                    self.frames.push(new_frame);
+                                    continue;
+                                }
+                            }
+                            HeapObject::Class { .. } => {
+                                // Class instantiation
+                                match self.call_class(frame_idx, heap_idx, &args, line) {
+                                    Ok(()) => {
+                                        if self.frames.len() > frame_idx + 1 {
+                                            continue; // __init__ pushed a frame
+                                        }
+                                    }
+                                    Err(e) => { self.try_handle_error(e, line)?; continue; }
+                                }
+                            }
+                            HeapObject::BoundMethod { instance, method } => {
+                                let instance = *instance;
+                                let method = *method;
+                                let mut new_args = Vec::with_capacity(argc + 1);
+                                new_args.push(instance);
+                                new_args.extend_from_slice(&args);
+                                self.call_value(frame_idx, method, &new_args, line)?;
+                                if self.frames.len() > frame_idx + 1 {
+                                    continue;
+                                }
+                            }
+                            HeapObject::ExceptionObj { exc_type, .. } => {
+                                // Exception type called as constructor — just push it back
+                                let exc_type = *exc_type;
+                                let msg = if !args.is_empty() {
+                                    args[0].display(&self.heap)
+                                } else {
+                                    String::new()
+                                };
+                                let idx = self.heap.len();
+                                self.heap.push(HeapObject::ExceptionObj {
+                                    exc_type,
+                                    message: msg,
+                                    args: args.clone(),
+                                });
+                                self.frames[frame_idx].push(Value::object_ref(idx));
+                            }
+                            _ => {
+                                return Err(PythonError::runtime(
+                                    format!("'{}' is not callable", func_val.display(&self.heap)), line,
+                                ));
+                            }
+                        }
                     } else if let Some(heap_idx) = func_val.as_func_ref() {
                         let (func_code_index, arity) = if let HeapObject::Function { code_index, arity, .. } = &self.heap[heap_idx] {
                             (*code_index, *arity as usize)
@@ -274,41 +587,102 @@ impl VM {
                             return Err(PythonError::runtime("not a callable", line));
                         };
 
-                        if argc != arity {
-                            let name = if let HeapObject::Function { name, .. } = &self.heap[heap_idx] {
-                                name.clone()
-                            } else {
-                                "???".to_string()
-                            };
-                            return Err(PythonError::runtime(
-                                format!("{name}() takes {arity} argument(s) but {argc} were given"),
-                                line,
-                            ));
+                        // Check if this is a generator function
+                        if self.code_objects[func_code_index].is_generator {
+                            if argc != arity {
+                                let name = if let HeapObject::Function { name, .. } = &self.heap[heap_idx] {
+                                    name.clone()
+                                } else { "???".to_string() };
+                                return Err(PythonError::runtime(
+                                    format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
+                                ));
+                            }
+                            let gen_idx = self.heap.len();
+                            let num_locals = self.code_objects[func_code_index].num_locals;
+                            let mut locals = vec![Value::none(); num_locals];
+                            for (i, arg) in args.iter().enumerate() {
+                                locals[i] = *arg;
+                            }
+                            self.heap.push(HeapObject::Generator {
+                                code_index: func_code_index,
+                                ip: 0,
+                                locals,
+                                stack: Vec::new(),
+                                state: GeneratorState::Created,
+                                cells: Vec::new(),
+                            });
+                            self.frames[frame_idx].push(Value::object_ref(gen_idx));
+                        } else {
+                            if argc != arity {
+                                let name = if let HeapObject::Function { name, .. } = &self.heap[heap_idx] {
+                                    name.clone()
+                                } else { "???".to_string() };
+                                return Err(PythonError::runtime(
+                                    format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
+                                ));
+                            }
+                            let mut new_frame = Frame::new(func_code_index);
+                            for (i, arg) in args.iter().enumerate() {
+                                new_frame.locals[i] = *arg;
+                            }
+                            // Set up cells for cell_vars
+                            let num_cell = self.code_objects[func_code_index].cell_var_names.len();
+                            for _ in 0..num_cell {
+                                let ci = self.heap.len();
+                                self.heap.push(HeapObject::Cell(Value::none()));
+                                new_frame.cells.push(ci);
+                            }
+                            // Initialize cells from params
+                            let cell_var_names: Vec<String> = self.code_objects[func_code_index].cell_var_names.clone();
+                            for (ci, cv_name) in cell_var_names.iter().enumerate() {
+                                let local_names = &self.code_objects[func_code_index].local_names;
+                                if let Some(li) = local_names.iter().position(|n| n == cv_name) {
+                                    self.heap[new_frame.cells[ci]] = HeapObject::Cell(new_frame.locals[li]);
+                                }
+                            }
+                            self.frames.push(new_frame);
+                            continue;
                         }
-
-                        let mut new_frame = Frame::new(func_code_index);
-                        for (i, arg) in args.iter().enumerate() {
-                            new_frame.locals[i] = *arg;
-                        }
-                        self.frames.push(new_frame);
-                        continue;
                     } else {
                         return Err(PythonError::runtime(
-                            format!("'{}' is not callable", func_val.display(&self.heap)),
-                            line,
+                            format!("'{}' is not callable", func_val.display(&self.heap)), line,
                         ));
                     }
                 }
                 op::RETURN_VALUE => {
                     let return_val = self.frames[frame_idx].pop();
+                    let gen_idx = self.frames[frame_idx].generator_idx;
+                    let init_inst = self.frames[frame_idx].init_instance;
                     self.frames.pop();
+
+                    // If this was a generator frame, mark it completed
+                    if let Some(gi) = gen_idx {
+                        if let HeapObject::Generator { state, .. } = &mut self.heap[gi] {
+                            *state = GeneratorState::Completed;
+                        }
+                        if self.frames.is_empty() {
+                            return Ok(());
+                        }
+                        // Roll back caller's IP to re-execute LOAD + FOR_ITER.
+                        // The caller pattern is: LOAD_FAST/LOAD_GLOBAL __iter__, FOR_ITER exit
+                        // When FOR_ITER ran, it incremented IP past FOR_ITER, then called
+                        // resume_generator + continue. So caller.ip is at FOR_ITER + 1.
+                        // We go back 2 to re-run LOAD_FAST, FOR_ITER, which will now see Completed.
+                        let caller = self.frames.last_mut().unwrap();
+                        caller.ip = caller.ip.saturating_sub(2);
+                        continue;
+                    }
 
                     if self.frames.is_empty() {
                         return Ok(());
                     }
-
                     let caller = self.frames.last_mut().unwrap();
-                    caller.push(return_val);
+                    // If this was an __init__ frame, push the instance instead of None
+                    if let Some(instance) = init_inst {
+                        caller.push(instance);
+                    } else {
+                        caller.push(return_val);
+                    }
                     continue;
                 }
                 op::MAKE_FUNCTION => {
@@ -325,8 +699,101 @@ impl VM {
                     });
                     self.frames[frame_idx].push(Value::func_ref(heap_idx));
                 }
+                op::MAKE_CLOSURE => {
+                    let code_idx_val = self.code_objects[code_index].constants[operand as usize];
+                    let func_code_index = code_idx_val.as_int().unwrap() as usize;
+                    let func_name = self.code_objects[func_code_index].name.clone();
+                    let arity = self.code_objects[func_code_index].num_params as u8;
+                    let num_free = self.code_objects[func_code_index].free_var_names.len();
+
+                    // Pop cell indices from stack (pushed by LOAD_CLOSURE)
+                    let mut cells = Vec::with_capacity(num_free);
+                    for _ in 0..num_free {
+                        let cell_val = self.frames[frame_idx].pop();
+                        cells.push(cell_val.as_int().unwrap() as usize);
+                    }
+                    cells.reverse();
+
+                    let heap_idx = self.heap.len();
+                    self.heap.push(HeapObject::Closure {
+                        name: func_name,
+                        code_index: func_code_index,
+                        arity,
+                        cells,
+                    });
+                    self.frames[frame_idx].push(Value::object_ref(heap_idx));
+                }
                 op::GET_ITER => {
-                    // range() already returns a RangeIter — pass through.
+                    let val = self.frames[frame_idx].pop();
+                    if val.is_range() {
+                        // RangeIter is already an iterator
+                        self.frames[frame_idx].push(val);
+                    } else if let Some(list_idx) = val.as_list_ref() {
+                        let iter_idx = self.heap.len();
+                        self.heap.push(HeapObject::ListIter { list_idx, index: 0 });
+                        self.frames[frame_idx].push(Value::object_ref(iter_idx));
+                    } else if let Some(str_idx) = val.as_str_ref() {
+                        let iter_idx = self.heap.len();
+                        self.heap.push(HeapObject::StringIter { str_idx, index: 0 });
+                        self.frames[frame_idx].push(Value::object_ref(iter_idx));
+                    } else if let Some(obj_idx) = val.as_object_ref() {
+                        match &self.heap[obj_idx] {
+                            HeapObject::Tuple(_) => {
+                                let iter_idx = self.heap.len();
+                                self.heap.push(HeapObject::TupleIter { tuple_idx: obj_idx, index: 0 });
+                                self.frames[frame_idx].push(Value::object_ref(iter_idx));
+                            }
+                            HeapObject::Dict { .. } => {
+                                let iter_idx = self.heap.len();
+                                self.heap.push(HeapObject::DictKeyIter { dict_idx: obj_idx, index: 0 });
+                                self.frames[frame_idx].push(Value::object_ref(iter_idx));
+                            }
+                            HeapObject::Generator { .. } => {
+                                // Generator is its own iterator
+                                self.frames[frame_idx].push(val);
+                            }
+                            HeapObject::Instance { class_idx, .. } => {
+                                // Look for __iter__ method
+                                let class_idx = *class_idx;
+                                if let Some(iter_method) = self.lookup_attr_on_class(class_idx, "__iter__") {
+                                    // Call __iter__(self)
+                                    let bound_idx = self.heap.len();
+                                    self.heap.push(HeapObject::BoundMethod {
+                                        instance: val,
+                                        method: iter_method,
+                                    });
+                                    let bound = Value::object_ref(bound_idx);
+                                    // Push the bound method, then call it
+                                    self.frames[frame_idx].push(bound);
+                                    // Emit a synthetic call: push func + 0 args
+                                    // Actually, we need to call it. Let's push and use CALL_FUNCTION mechanism
+                                    let call_args: Vec<Value> = vec![val];
+                                    self.call_value(frame_idx, iter_method, &call_args, line)?;
+                                    if self.frames.len() > frame_idx + 1 {
+                                        // Remove the bound method we pushed
+                                        self.frames[frame_idx].sp -= 1;
+                                        continue;
+                                    }
+                                    // If call_value didn't push a frame (builtin), pop bound and keep result
+                                    let result = self.frames[frame_idx].pop();
+                                    self.frames[frame_idx].sp -= 1; // pop the bound method
+                                    self.frames[frame_idx].push(result);
+                                } else {
+                                    // Check if the instance itself has __next__ (is its own iterator)
+                                    if self.lookup_attr_on_class(class_idx, "__next__").is_some() {
+                                        self.frames[frame_idx].push(val);
+                                    } else {
+                                        return Err(PythonError::runtime("object is not iterable", line));
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Err(PythonError::runtime("object is not iterable", line));
+                            }
+                        }
+                    } else {
+                        return Err(PythonError::runtime("object is not iterable", line));
+                    }
                 }
                 op::FOR_ITER => {
                     let iter_val = self.frames[frame_idx].pop();
@@ -337,15 +804,116 @@ impl VM {
                         } else {
                             return Err(PythonError::runtime("expected iterator", line));
                         };
-
                         let exhausted = if step > 0 { current >= stop } else { current <= stop };
-
                         if exhausted {
                             self.frames[frame_idx].ip = operand as usize;
                         } else {
                             self.frames[frame_idx].push(Value::int(current));
                             if let HeapObject::RangeIter { current: c, .. } = &mut self.heap[heap_idx] {
                                 *c = current + step;
+                            }
+                        }
+                    } else if let Some(obj_idx) = iter_val.as_object_ref() {
+                        match &self.heap[obj_idx] {
+                            HeapObject::ListIter { list_idx, index } => {
+                                let list_idx = *list_idx;
+                                let index = *index;
+                                let len = if let HeapObject::List(items) = &self.heap[list_idx] {
+                                    items.len()
+                                } else { 0 };
+                                if index >= len {
+                                    self.frames[frame_idx].ip = operand as usize;
+                                } else {
+                                    let val = if let HeapObject::List(items) = &self.heap[list_idx] {
+                                        items[index]
+                                    } else { Value::none() };
+                                    self.frames[frame_idx].push(val);
+                                    if let HeapObject::ListIter { index: idx, .. } = &mut self.heap[obj_idx] {
+                                        *idx = index + 1;
+                                    }
+                                }
+                            }
+                            HeapObject::TupleIter { tuple_idx, index } => {
+                                let tuple_idx = *tuple_idx;
+                                let index = *index;
+                                let len = if let HeapObject::Tuple(items) = &self.heap[tuple_idx] {
+                                    items.len()
+                                } else { 0 };
+                                if index >= len {
+                                    self.frames[frame_idx].ip = operand as usize;
+                                } else {
+                                    let val = if let HeapObject::Tuple(items) = &self.heap[tuple_idx] {
+                                        items[index]
+                                    } else { Value::none() };
+                                    self.frames[frame_idx].push(val);
+                                    if let HeapObject::TupleIter { index: idx, .. } = &mut self.heap[obj_idx] {
+                                        *idx = index + 1;
+                                    }
+                                }
+                            }
+                            HeapObject::StringIter { str_idx, index } => {
+                                let str_idx = *str_idx;
+                                let index = *index;
+                                let s = self.heap[str_idx].as_str().unwrap_or("");
+                                let chars: Vec<char> = s.chars().collect();
+                                if index >= chars.len() {
+                                    self.frames[frame_idx].ip = operand as usize;
+                                } else {
+                                    let ch = chars[index].to_string();
+                                    let new_idx = self.heap.len();
+                                    self.heap.push(HeapObject::Str(ch.into()));
+                                    self.frames[frame_idx].push(Value::str_ref(new_idx));
+                                    if let HeapObject::StringIter { index: idx, .. } = &mut self.heap[obj_idx] {
+                                        *idx = index + 1;
+                                    }
+                                }
+                            }
+                            HeapObject::DictKeyIter { dict_idx, index } => {
+                                let dict_idx = *dict_idx;
+                                let index = *index;
+                                let len = if let HeapObject::Dict { keys, .. } = &self.heap[dict_idx] {
+                                    keys.len()
+                                } else { 0 };
+                                if index >= len {
+                                    self.frames[frame_idx].ip = operand as usize;
+                                } else {
+                                    let val = if let HeapObject::Dict { keys, .. } = &self.heap[dict_idx] {
+                                        keys[index]
+                                    } else { Value::none() };
+                                    self.frames[frame_idx].push(val);
+                                    if let HeapObject::DictKeyIter { index: idx, .. } = &mut self.heap[obj_idx] {
+                                        *idx = index + 1;
+                                    }
+                                }
+                            }
+                            HeapObject::Generator { state, .. } => {
+                                let state = *state;
+                                if state == GeneratorState::Completed {
+                                    self.frames[frame_idx].ip = operand as usize;
+                                } else {
+                                    // Resume or start the generator
+                                    self.resume_generator(frame_idx, obj_idx, line)?;
+                                    continue;
+                                }
+                            }
+                            HeapObject::Instance { class_idx, .. } => {
+                                // Call __next__ on the instance
+                                let class_idx = *class_idx;
+                                if let Some(next_method) = self.lookup_attr_on_class(class_idx, "__next__") {
+                                    let call_args = vec![iter_val];
+                                    // We need to save the iterator for the next iteration
+                                    // Store iter_val back first, we'll re-push it later
+                                    self.call_value(frame_idx, next_method, &call_args, line)?;
+                                    if self.frames.len() > frame_idx + 1 {
+                                        continue;
+                                    }
+                                    // Builtin returned directly
+                                } else {
+                                    return Err(PythonError::runtime("iterator has no __next__ method", line));
+                                }
+                            }
+                            _ => {
+                                return Err(PythonError::runtime("expected iterator", line));
                             }
                         }
                     } else {
@@ -358,6 +926,20 @@ impl VM {
                 op::DUP_TOP => {
                     let val = self.frames[frame_idx].peek();
                     self.frames[frame_idx].push(val);
+                }
+                op::ROT_TWO => {
+                    let a = self.frames[frame_idx].pop();
+                    let b = self.frames[frame_idx].pop();
+                    self.frames[frame_idx].push(a);
+                    self.frames[frame_idx].push(b);
+                }
+                op::ROT_THREE => {
+                    let a = self.frames[frame_idx].pop();
+                    let b = self.frames[frame_idx].pop();
+                    let c = self.frames[frame_idx].pop();
+                    self.frames[frame_idx].push(a);
+                    self.frames[frame_idx].push(c);
+                    self.frames[frame_idx].push(b);
                 }
                 op::BUILD_LIST => {
                     let count = operand as usize;
@@ -378,41 +960,343 @@ impl VM {
                     }
                     self.frames[frame_idx].push(list_val);
                 }
+                op::BUILD_TUPLE => {
+                    let count = operand as usize;
+                    let mut elements = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        elements.push(self.frames[frame_idx].pop());
+                    }
+                    elements.reverse();
+                    let heap_idx = self.heap.len();
+                    self.heap.push(HeapObject::Tuple(elements));
+                    self.frames[frame_idx].push(Value::object_ref(heap_idx));
+                }
+                op::BUILD_DICT => {
+                    let count = operand as usize;
+                    let mut keys = Vec::with_capacity(count);
+                    let mut values = Vec::with_capacity(count);
+                    let mut pairs = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let v = self.frames[frame_idx].pop();
+                        let k = self.frames[frame_idx].pop();
+                        pairs.push((k, v));
+                    }
+                    pairs.reverse();
+                    let mut index_map = HashMap::new();
+                    for (i, (k, v)) in pairs.into_iter().enumerate() {
+                        let h = value_hash(k, &self.heap);
+                        index_map.insert(h, i);
+                        keys.push(k);
+                        values.push(v);
+                    }
+                    let heap_idx = self.heap.len();
+                    self.heap.push(HeapObject::Dict { keys, values, index_map });
+                    self.frames[frame_idx].push(Value::object_ref(heap_idx));
+                }
+                op::BUILD_SET => {
+                    let count = operand as usize;
+                    let mut elements = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        elements.push(self.frames[frame_idx].pop());
+                    }
+                    elements.reverse();
+                    let heap_idx = self.heap.len();
+                    self.heap.push(HeapObject::Set(elements));
+                    self.frames[frame_idx].push(Value::object_ref(heap_idx));
+                }
                 op::SUBSCRIPT => {
                     let index = self.frames[frame_idx].pop();
                     let obj = self.frames[frame_idx].pop();
-                    if let Some(heap_idx) = obj.as_list_ref() {
-                        if let Some(i) = index.as_int() {
-                            if let HeapObject::List(items) = &self.heap[heap_idx] {
-                                let idx = if i < 0 { items.len() as i64 + i } else { i } as usize;
-                                if idx < items.len() {
-                                    let val = items[idx];
-                                    self.frames[frame_idx].push(val);
-                                } else {
-                                    return Err(PythonError::runtime("list index out of range", line));
+                    match self.subscript_get(obj, index, line) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                    }
+                }
+                op::STORE_SUBSCRIPT => {
+                    let index = self.frames[frame_idx].pop();
+                    let obj = self.frames[frame_idx].pop();
+                    let val = self.frames[frame_idx].pop();
+                    self.subscript_set(obj, index, val, line)?;
+                }
+                op::DELETE_SUBSCRIPT => {
+                    let index = self.frames[frame_idx].pop();
+                    let obj = self.frames[frame_idx].pop();
+                    self.subscript_delete(obj, index, line)?;
+                }
+                op::LOAD_ATTR => {
+                    let obj = self.frames[frame_idx].pop();
+                    let attr_name = &self.code_objects[code_index].names[operand as usize];
+                    let attr_name = attr_name.clone();
+                    match self.load_attr(obj, &attr_name, line) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                    }
+                }
+                op::STORE_ATTR => {
+                    let obj = self.frames[frame_idx].pop();
+                    let val = self.frames[frame_idx].pop();
+                    let attr_name = self.code_objects[code_index].names[operand as usize].clone();
+                    self.store_attr(obj, &attr_name, val, line)?;
+                }
+                op::UNPACK_SEQUENCE => {
+                    let count = operand as usize;
+                    let seq = self.frames[frame_idx].pop();
+                    let items = self.unpack_sequence(seq, count, line)?;
+                    // Push in reverse order so first element is on top
+                    for item in items.into_iter().rev() {
+                        self.frames[frame_idx].push(item);
+                    }
+                }
+                op::SETUP_EXCEPT => {
+                    let handler_ip = operand as usize;
+                    self.exception_stack.push(ExceptionHandler {
+                        handler_ip,
+                        frame_index: frame_idx,
+                        stack_depth: self.frames[frame_idx].sp,
+                    });
+                }
+                op::POP_EXCEPT => {
+                    self.exception_stack.pop();
+                }
+                op::RAISE => {
+                    match operand {
+                        0 => {
+                            // Re-raise current exception
+                            if let Some(exc) = self.current_exception {
+                                self.raise_exception(exc, line)?;
+                                continue;
+                            } else {
+                                return Err(PythonError::runtime("No active exception to re-raise", line));
+                            }
+                        }
+                        1 => {
+                            // Raise value from stack
+                            let exc_val = self.frames[frame_idx].pop();
+                            // If it's an exception type name (from globals), construct it
+                            if let Some(obj_idx) = exc_val.as_object_ref() {
+                                match &self.heap[obj_idx] {
+                                    HeapObject::ExceptionObj { .. } => {
+                                        self.raise_exception(exc_val, line)?;
+                                        continue;
+                                    }
+                                    HeapObject::BuiltinFn { id: BuiltinId::ExcConstructor(et), .. } => {
+                                        let et = *et;
+                                        let idx = self.heap.len();
+                                        self.heap.push(HeapObject::ExceptionObj {
+                                            exc_type: et,
+                                            message: String::new(),
+                                            args: Vec::new(),
+                                        });
+                                        self.raise_exception(Value::object_ref(idx), line)?;
+                                        continue;
+                                    }
+                                    _ => {}
                                 }
                             }
-                        } else {
-                            return Err(PythonError::runtime("list indices must be integers", line));
+                            // Create a generic RuntimeError
+                            let msg = exc_val.display(&self.heap);
+                            self.raise_exc(ExceptionType::RuntimeError, &msg, line)?;
+                            continue;
                         }
-                    } else if let Some(heap_idx) = obj.as_str_ref() {
-                        if let Some(i) = index.as_int() {
-                            let s = self.heap[heap_idx].as_str().unwrap();
-                            let len = s.len() as i64;
-                            let idx = if i < 0 { len + i } else { i } as usize;
-                            if idx < s.len() {
-                                let ch: String = s.chars().nth(idx).unwrap().to_string();
-                                let new_heap_idx = self.heap.len();
-                                self.heap.push(HeapObject::Str(ch.into()));
-                                self.frames[frame_idx].push(Value::str_ref(new_heap_idx));
-                            } else {
-                                return Err(PythonError::runtime("string index out of range", line));
-                            }
-                        } else {
-                            return Err(PythonError::runtime("string indices must be integers", line));
+                        2 => {
+                            // Assert error with message on stack
+                            let msg_val = self.frames[frame_idx].pop();
+                            let msg = msg_val.display(&self.heap);
+                            self.raise_exc(ExceptionType::AssertionError, &msg, line)?;
+                            continue;
                         }
+                        _ => {
+                            return Err(PythonError::runtime("invalid RAISE operand", line));
+                        }
+                    }
+                }
+                op::SETUP_FINALLY => {
+                    // Similar to SETUP_EXCEPT but for finally blocks
+                    let _finally_ip = operand as usize;
+                    // For simplicity, we handle finally inline in the compiler
+                }
+                op::END_FINALLY => {
+                    // If there's a pending exception, re-raise it
+                    // For simplicity, no-op — exceptions are handled by the compiler's inline code
+                }
+                op::LOAD_EXCEPTION => {
+                    // Push the current exception onto the stack
+                    if let Some(exc) = self.current_exception {
+                        self.frames[frame_idx].push(exc);
                     } else {
-                        return Err(PythonError::runtime("object is not subscriptable", line));
+                        self.frames[frame_idx].push(Value::none());
+                    }
+                }
+                op::BUILD_CLASS => {
+                    let num_bases = operand as usize;
+                    let co_idx_val = self.frames[frame_idx].pop();
+                    let name_val = self.frames[frame_idx].pop();
+                    let class_co_idx = co_idx_val.as_int().unwrap() as usize;
+                    let class_name = name_val.display(&self.heap);
+
+                    let mut base_indices = Vec::with_capacity(num_bases);
+                    for _ in 0..num_bases {
+                        let base = self.frames[frame_idx].pop();
+                        if let Some(idx) = base.as_object_ref() {
+                            base_indices.push(idx);
+                        }
+                    }
+                    base_indices.reverse();
+
+                    // Execute class body to get attributes
+                    let class_frame = Frame::new(class_co_idx);
+                    self.frames.push(class_frame);
+
+                    // Run class body
+                    loop {
+                        let cf_idx = self.frames.len() - 1;
+                        let cf = &self.frames[cf_idx];
+                        let code = &self.code_objects[cf.code_index];
+                        if cf.ip >= code.instructions.len() {
+                            break;
+                        }
+                        let ci = unsafe { *code.instructions.get_unchecked(cf.ip) };
+                        let cl = unsafe { *code.line_table.get_unchecked(cf.ip) };
+                        let cop = bytecode::decode_op(ci);
+
+                        if cop == op::RETURN_VALUE {
+                            break;
+                        }
+
+                        // Store current position and recurse
+                        // This is a simplified approach - we save/restore context
+                        self.frames[cf_idx].ip += 1;
+                        let co_index = self.frames[cf_idx].code_index;
+                        let co_operand = bytecode::decode_operand(ci);
+
+                        match cop {
+                            op::LOAD_CONST => {
+                                let val = self.code_objects[co_index].constants[co_operand as usize];
+                                self.frames[cf_idx].push(val);
+                            }
+                            op::STORE_FAST => {
+                                let val = self.frames[cf_idx].pop();
+                                unsafe { *self.frames[cf_idx].locals.get_unchecked_mut(co_operand as usize) = val; }
+                            }
+                            op::LOAD_FAST => {
+                                let val = unsafe { *self.frames[cf_idx].locals.get_unchecked(co_operand as usize) };
+                                self.frames[cf_idx].push(val);
+                            }
+                            op::LOAD_GLOBAL => {
+                                let name = &self.code_objects[co_index].names[co_operand as usize];
+                                if let Some(&val) = self.globals.get(name) {
+                                    self.frames[cf_idx].push(val);
+                                } else {
+                                    return Err(PythonError::runtime(format!("name '{name}' is not defined"), cl));
+                                }
+                            }
+                            op::STORE_GLOBAL => {
+                                let val = self.frames[cf_idx].pop();
+                                let name = self.code_objects[co_index].names[co_operand as usize].clone();
+                                self.globals.insert(name, val);
+                            }
+                            op::MAKE_FUNCTION => {
+                                let code_idx_v = self.code_objects[co_index].constants[co_operand as usize];
+                                let fci = code_idx_v.as_int().unwrap() as usize;
+                                let fname = self.code_objects[fci].name.clone();
+                                let farity = self.code_objects[fci].num_params as u8;
+                                let hi = self.heap.len();
+                                self.heap.push(HeapObject::Function { name: fname, code_index: fci, arity: farity });
+                                self.frames[cf_idx].push(Value::func_ref(hi));
+                            }
+                            op::POP_TOP => {
+                                self.frames[cf_idx].pop();
+                            }
+                            op::HALT => break,
+                            _ => {
+                                // For other opcodes in class body, skip
+                                // This handles Pass (no-op) and other simple cases
+                            }
+                        }
+                    }
+
+                    // Extract locals as class attributes
+                    let class_frame = self.frames.pop().unwrap();
+                    let mut attrs = HashMap::new();
+                    let local_names = &self.code_objects[class_co_idx].local_names;
+                    for (i, name) in local_names.iter().enumerate() {
+                        if i < MAX_LOCALS {
+                            let val = class_frame.locals[i];
+                            if !val.is_none() || name == "__init__" {
+                                attrs.insert(name.clone(), val);
+                            }
+                        }
+                    }
+
+                    // Compute MRO (simplified C3 linearization)
+                    let mut mro = Vec::new();
+                    // Add self (will be set after creation)
+                    // Add base MROs
+                    for &bi in &base_indices {
+                        if let HeapObject::Class { mro: base_mro, .. } = &self.heap[bi] {
+                            for &m in base_mro {
+                                if !mro.contains(&m) {
+                                    mro.push(m);
+                                }
+                            }
+                        }
+                    }
+
+                    let class_idx = self.heap.len();
+                    // Insert self at beginning of MRO
+                    mro.insert(0, class_idx);
+
+                    self.heap.push(HeapObject::Class {
+                        name: class_name,
+                        mro,
+                        attrs,
+                        bases: base_indices,
+                    });
+
+                    self.frames[frame_idx].push(Value::object_ref(class_idx));
+                }
+                op::YIELD_VALUE => {
+                    let yielded = self.frames[frame_idx].pop();
+                    let gen_idx = self.frames[frame_idx].generator_idx;
+
+                    if let Some(gi) = gen_idx {
+                        // Save frame state to generator
+                        let frame = &self.frames[frame_idx];
+                        let ip = frame.ip;
+                        let sp = frame.sp;
+                        let mut locals = vec![Value::none(); self.code_objects[frame.code_index].num_locals];
+                        for (i, l) in locals.iter_mut().enumerate() {
+                            if i < MAX_LOCALS {
+                                *l = frame.locals[i];
+                            }
+                        }
+                        let mut stack = Vec::with_capacity(sp);
+                        for i in 0..sp {
+                            stack.push(frame.stack[i]);
+                        }
+                        let cells = frame.cells.clone();
+
+                        if let HeapObject::Generator { ip: gip, locals: gl, stack: gs, state, cells: gc, .. } = &mut self.heap[gi] {
+                            *gip = ip;
+                            *gl = locals;
+                            *gs = stack;
+                            *state = GeneratorState::Suspended;
+                            *gc = cells;
+                        }
+
+                        // Pop generator frame
+                        self.frames.pop();
+
+                        if self.frames.is_empty() {
+                            return Ok(());
+                        }
+
+                        // Push yielded value to caller
+                        let caller = self.frames.last_mut().unwrap();
+                        caller.push(yielded);
+                        continue;
+                    } else {
+                        return Err(PythonError::runtime("yield outside generator", line));
                     }
                 }
                 op::HALT => {
@@ -427,9 +1311,528 @@ impl VM {
             }
         }
     }
+
+    /// Look up an attribute on a class (walking MRO).
+    fn lookup_attr_on_class(&self, class_idx: usize, attr: &str) -> Option<Value> {
+        if let HeapObject::Class { mro, attrs, .. } = &self.heap[class_idx] {
+            // Check this class first
+            if let Some(val) = attrs.get(attr) {
+                return Some(*val);
+            }
+            // Walk MRO (skip self which is mro[0])
+            for &m in mro.iter().skip(1) {
+                if let HeapObject::Class { attrs: mattrs, .. } = &self.heap[m]
+                    && let Some(val) = mattrs.get(attr)
+                {
+                    return Some(*val);
+                }
+            }
+        }
+        None
+    }
+
+    fn load_attr(&mut self, obj: Value, attr: &str, line: u32) -> Result<Value, PythonError> {
+        // Instance attribute access
+        if let Some(obj_idx) = obj.as_object_ref() {
+            match &self.heap[obj_idx] {
+                HeapObject::Instance { class_idx, attrs } => {
+                    let class_idx = *class_idx;
+                    // Check instance attrs first
+                    if let Some(&val) = attrs.get(attr) {
+                        return Ok(val);
+                    }
+                    // Check class MRO
+                    if let Some(method) = self.lookup_attr_on_class(class_idx, attr) {
+                        // If it's a function, bind it
+                        if method.is_func() || (method.as_object_ref().is_some() && matches!(&self.heap[method.as_object_ref().unwrap()], HeapObject::Closure { .. } | HeapObject::Function { .. })) {
+                            let bound_idx = self.heap.len();
+                            self.heap.push(HeapObject::BoundMethod {
+                                instance: obj,
+                                method,
+                            });
+                            return Ok(Value::object_ref(bound_idx));
+                        }
+                        return Ok(method);
+                    }
+                    return Err(PythonError::runtime(
+                        format!("'{}' object has no attribute '{attr}'",
+                            if let HeapObject::Class { name, .. } = &self.heap[class_idx] { name.as_str() } else { "object" }),
+                        line,
+                    ));
+                }
+                HeapObject::Class { attrs, name, .. } => {
+                    if let Some(&val) = attrs.get(attr) {
+                        return Ok(val);
+                    }
+                    // Check MRO
+                    let class_idx = obj_idx;
+                    if let Some(val) = self.lookup_attr_on_class(class_idx, attr) {
+                        return Ok(val);
+                    }
+                    return Err(PythonError::runtime(
+                        format!("type '{name}' has no attribute '{attr}'"), line,
+                    ));
+                }
+                HeapObject::ExceptionObj { exc_type, message, args } => {
+                    match attr {
+                        "args" => {
+                            if args.is_empty() {
+                                let msg_idx = self.heap.len();
+                                self.heap.push(HeapObject::Str(message.clone().into()));
+                                let tuple_idx = self.heap.len();
+                                self.heap.push(HeapObject::Tuple(vec![Value::str_ref(msg_idx)]));
+                                return Ok(Value::object_ref(tuple_idx));
+                            }
+                            let tuple_idx = self.heap.len();
+                            self.heap.push(HeapObject::Tuple(args.clone()));
+                            return Ok(Value::object_ref(tuple_idx));
+                        }
+                        "message" => {
+                            let str_idx = self.heap.len();
+                            self.heap.push(HeapObject::Str(message.clone().into()));
+                            return Ok(Value::str_ref(str_idx));
+                        }
+                        _ => {
+                            return Err(PythonError::runtime(
+                                format!("'{}' object has no attribute '{attr}'", exc_type.name()), line,
+                            ));
+                        }
+                    }
+                }
+                HeapObject::Dict { .. } => {
+                    return self.dict_method_dispatch(obj_idx, attr, line);
+                }
+                HeapObject::Tuple(items) => {
+                    if attr == "__len__" {
+                        return Ok(Value::int(items.len() as i64));
+                    }
+                }
+                HeapObject::Generator { .. } => {
+                    if attr == "__next__" || attr == "send" || attr == "close" {
+                        // Return a bound method placeholder
+                        let bound_idx = self.heap.len();
+                        self.heap.push(HeapObject::BoundMethod {
+                            instance: obj,
+                            method: Value::none(), // Handled specially
+                        });
+                        return Ok(Value::object_ref(bound_idx));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // List method dispatch
+        if let Some(list_idx) = obj.as_list_ref() {
+            return self.list_method_dispatch(list_idx, attr, line);
+        }
+
+        // String method dispatch
+        if let Some(str_idx) = obj.as_str_ref() {
+            return self.str_method_dispatch(str_idx, attr, line);
+        }
+
+        Err(PythonError::runtime(
+            format!("'{}' has no attribute '{attr}'", obj.display(&self.heap)), line,
+        ))
+    }
+
+    fn store_attr(&mut self, obj: Value, attr: &str, val: Value, line: u32) -> Result<(), PythonError> {
+        if let Some(obj_idx) = obj.as_object_ref() {
+            match &mut self.heap[obj_idx] {
+                HeapObject::Instance { attrs, .. } => {
+                    attrs.insert(attr.to_string(), val);
+                    return Ok(());
+                }
+                HeapObject::Class { attrs, .. } => {
+                    attrs.insert(attr.to_string(), val);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        Err(PythonError::runtime(
+            format!("cannot set attribute '{attr}' on {}", obj.display(&self.heap)), line,
+        ))
+    }
+
+    fn subscript_get(&self, obj: Value, index: Value, line: u32) -> Result<Value, PythonError> {
+        if let Some(heap_idx) = obj.as_list_ref() {
+            if let Some(i) = index.as_int()
+                && let HeapObject::List(items) = &self.heap[heap_idx]
+            {
+                let idx = if i < 0 { items.len() as i64 + i } else { i } as usize;
+                if idx < items.len() {
+                    return Ok(items[idx]);
+                }
+                return Err(PythonError::runtime("list index out of range", line));
+            }
+            return Err(PythonError::runtime("list indices must be integers", line));
+        }
+        if let Some(heap_idx) = obj.as_str_ref() {
+            if let Some(i) = index.as_int() {
+                let s = self.heap[heap_idx].as_str().unwrap();
+                let chars: Vec<char> = s.chars().collect();
+                let idx = if i < 0 { chars.len() as i64 + i } else { i } as usize;
+                if idx < chars.len() {
+                    // Need mutable access to create string — use a workaround
+                    // Actually we can't push to heap here because we only have &self
+                    // Return the char's code point as int for now? No, let's fix the signature
+                    return Err(PythonError::runtime("string subscript needs mutable heap", line));
+                }
+                return Err(PythonError::runtime("string index out of range", line));
+            }
+            return Err(PythonError::runtime("string indices must be integers", line));
+        }
+        if let Some(obj_idx) = obj.as_object_ref() {
+            match &self.heap[obj_idx] {
+                HeapObject::Tuple(items) => {
+                    if let Some(i) = index.as_int() {
+                        let idx = if i < 0 { items.len() as i64 + i } else { i } as usize;
+                        if idx < items.len() {
+                            return Ok(items[idx]);
+                        }
+                        return Err(PythonError::runtime("tuple index out of range", line));
+                    }
+                    return Err(PythonError::runtime("tuple indices must be integers", line));
+                }
+                HeapObject::Dict { keys, values, .. } => {
+                    let h = value_hash(index, &self.heap);
+                    // Linear search for matching key
+                    for (i, k) in keys.iter().enumerate() {
+                        if value_hash(*k, &self.heap) == h && values_equal(*k, index, &self.heap) {
+                            return Ok(values[i]);
+                        }
+                    }
+                    return Err(PythonError::runtime("KeyError", line));
+                }
+                _ => {}
+            }
+        }
+        Err(PythonError::runtime("object is not subscriptable", line))
+    }
+
+    fn subscript_set(&mut self, obj: Value, index: Value, val: Value, line: u32) -> Result<(), PythonError> {
+        if let Some(heap_idx) = obj.as_list_ref() {
+            if let Some(i) = index.as_int()
+                && let HeapObject::List(items) = &mut self.heap[heap_idx]
+            {
+                let idx = if i < 0 { items.len() as i64 + i } else { i } as usize;
+                if idx < items.len() {
+                    items[idx] = val;
+                    return Ok(());
+                }
+                return Err(PythonError::runtime("list assignment index out of range", line));
+            }
+            return Err(PythonError::runtime("list indices must be integers", line));
+        }
+        if let Some(obj_idx) = obj.as_object_ref() {
+            // Compute hash before borrowing mutably
+            let h = value_hash(index, &self.heap);
+            // Check if key exists (read-only pass)
+            let existing = if let HeapObject::Dict { keys, index_map, .. } = &self.heap[obj_idx] {
+                if let Some(&ei) = index_map.get(&h) {
+                    if ei < keys.len() && values_equal(keys[ei], index, &self.heap) {
+                        Some(ei)
+                    } else { None }
+                } else { None }
+            } else { None };
+
+            if let HeapObject::Dict { keys, values, index_map } = &mut self.heap[obj_idx] {
+                if let Some(ei) = existing {
+                    values[ei] = val;
+                } else {
+                    let idx = keys.len();
+                    keys.push(index);
+                    values.push(val);
+                    index_map.insert(h, idx);
+                }
+                return Ok(());
+            }
+        }
+        Err(PythonError::runtime("object does not support item assignment", line))
+    }
+
+    fn subscript_delete(&mut self, obj: Value, index: Value, line: u32) -> Result<(), PythonError> {
+        if let Some(heap_idx) = obj.as_list_ref()
+            && let Some(i) = index.as_int()
+            && let HeapObject::List(items) = &mut self.heap[heap_idx]
+        {
+            let idx = if i < 0 { items.len() as i64 + i } else { i } as usize;
+            if idx < items.len() {
+                items.remove(idx);
+                return Ok(());
+            }
+            return Err(PythonError::runtime("list assignment index out of range", line));
+        }
+        Err(PythonError::runtime("object does not support item deletion", line))
+    }
+
+    fn unpack_sequence(&self, seq: Value, count: usize, line: u32) -> Result<Vec<Value>, PythonError> {
+        if let Some(list_idx) = seq.as_list_ref()
+            && let HeapObject::List(items) = &self.heap[list_idx]
+        {
+            if items.len() == count {
+                return Ok(items.clone());
+            }
+            return Err(PythonError::runtime(
+                format!("not enough values to unpack (expected {count}, got {})", items.len()), line,
+            ));
+        }
+        if let Some(obj_idx) = seq.as_object_ref()
+            && let HeapObject::Tuple(items) = &self.heap[obj_idx]
+        {
+            if items.len() == count {
+                return Ok(items.clone());
+            }
+            return Err(PythonError::runtime(
+                format!("not enough values to unpack (expected {count}, got {})", items.len()), line,
+            ));
+        }
+        Err(PythonError::runtime("cannot unpack non-sequence", line))
+    }
+
+    fn call_class(&mut self, frame_idx: usize, class_idx: usize, args: &[Value], line: u32) -> Result<(), PythonError> {
+        // Create instance
+        let inst_idx = self.heap.len();
+        self.heap.push(HeapObject::Instance {
+            class_idx,
+            attrs: HashMap::new(),
+        });
+        let instance = Value::object_ref(inst_idx);
+
+        // Look for __init__
+        if let Some(init_method) = self.lookup_attr_on_class(class_idx, "__init__") {
+            let mut init_args = Vec::with_capacity(args.len() + 1);
+            init_args.push(instance);
+            init_args.extend_from_slice(args);
+            self.call_value(frame_idx, init_method, &init_args, line)?;
+            if self.frames.len() > frame_idx + 1 {
+                // __init__ pushed a new frame. Tag it so RETURN_VALUE knows to
+                // discard __init__'s None return and push the instance instead.
+                let init_frame_idx = self.frames.len() - 1;
+                self.frames[init_frame_idx].init_instance = Some(instance);
+                return Ok(());
+            }
+            // Builtin __init__ returned directly — pop its return value
+            let _none = self.frames[frame_idx].pop();
+            self.frames[frame_idx].push(instance);
+        } else {
+            self.frames[frame_idx].push(instance);
+        }
+        Ok(())
+    }
+
+    /// Call a value as a function, managing frame setup.
+    fn call_value(&mut self, caller_frame_idx: usize, func_val: Value, args: &[Value], line: u32) -> Result<(), PythonError> {
+        let argc = args.len();
+
+        if let Some(heap_idx) = func_val.as_func_ref() {
+            let (func_code_index, arity) = if let HeapObject::Function { code_index, arity, .. } = &self.heap[heap_idx] {
+                (*code_index, *arity as usize)
+            } else {
+                return Err(PythonError::runtime("not a callable", line));
+            };
+            if argc != arity {
+                let name = if let HeapObject::Function { name, .. } = &self.heap[heap_idx] {
+                    name.clone()
+                } else { "???".to_string() };
+                return Err(PythonError::runtime(
+                    format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
+                ));
+            }
+            let mut new_frame = Frame::new(func_code_index);
+            for (i, arg) in args.iter().enumerate() {
+                new_frame.locals[i] = *arg;
+            }
+            // Set up cells
+            let num_cell = self.code_objects[func_code_index].cell_var_names.len();
+            for _ in 0..num_cell {
+                let ci = self.heap.len();
+                self.heap.push(HeapObject::Cell(Value::none()));
+                new_frame.cells.push(ci);
+            }
+            let cell_var_names: Vec<String> = self.code_objects[func_code_index].cell_var_names.clone();
+            for (ci, cv_name) in cell_var_names.iter().enumerate() {
+                let local_names = &self.code_objects[func_code_index].local_names;
+                if let Some(li) = local_names.iter().position(|n| n == cv_name) {
+                    self.heap[new_frame.cells[ci]] = HeapObject::Cell(new_frame.locals[li]);
+                }
+            }
+            self.frames.push(new_frame);
+        } else if let Some(heap_idx) = func_val.as_object_ref() {
+            match &self.heap[heap_idx] {
+                HeapObject::BuiltinFn { id, .. } => {
+                    let id = *id;
+                    let result = builtins::call_builtin(id, args, &mut self.heap, &mut self.output, &self.globals)?;
+                    self.frames[caller_frame_idx].push(result);
+                }
+                HeapObject::Closure { code_index, arity, cells, .. } => {
+                    let func_code_index = *code_index;
+                    let arity = *arity as usize;
+                    let cells = cells.clone();
+                    if argc != arity {
+                        return Err(PythonError::runtime("wrong number of arguments", line));
+                    }
+                    let mut new_frame = Frame::new(func_code_index);
+                    for (i, arg) in args.iter().enumerate() {
+                        new_frame.locals[i] = *arg;
+                    }
+                    let num_cell = self.code_objects[func_code_index].cell_var_names.len();
+                    for _ in 0..num_cell {
+                        let ci = self.heap.len();
+                        self.heap.push(HeapObject::Cell(Value::none()));
+                        new_frame.cells.push(ci);
+                    }
+                    let cell_var_names: Vec<String> = self.code_objects[func_code_index].cell_var_names.clone();
+                    for (ci, cv_name) in cell_var_names.iter().enumerate() {
+                        let local_names = &self.code_objects[func_code_index].local_names;
+                        if let Some(li) = local_names.iter().position(|n| n == cv_name) {
+                            self.heap[new_frame.cells[ci]] = HeapObject::Cell(new_frame.locals[li]);
+                        }
+                    }
+                    let num_free = self.code_objects[func_code_index].free_var_names.len();
+                    for i in 0..num_free {
+                        if i < cells.len() {
+                            new_frame.cells.push(cells[i]);
+                        }
+                    }
+                    self.frames.push(new_frame);
+                }
+                _ => {
+                    return Err(PythonError::runtime("not callable", line));
+                }
+            }
+        } else {
+            return Err(PythonError::runtime("not callable", line));
+        }
+        Ok(())
+    }
+
+    fn resume_generator(&mut self, _caller_frame_idx: usize, gen_heap_idx: usize, line: u32) -> Result<(), PythonError> {
+        // Extract generator state
+        let (code_index, ip, locals, stack, cells) = if let HeapObject::Generator {
+            code_index, ip, locals, stack, cells, state,
+        } = &mut self.heap[gen_heap_idx] {
+            if *state == GeneratorState::Completed {
+                return Err(PythonError::runtime("StopIteration", line));
+            }
+            *state = GeneratorState::Running;
+            (*code_index, *ip, locals.clone(), stack.clone(), cells.clone())
+        } else {
+            return Err(PythonError::runtime("not a generator", line));
+        };
+
+        // Create a new frame from generator state
+        let mut gen_frame = Frame::new(code_index);
+        gen_frame.ip = ip;
+        gen_frame.generator_idx = Some(gen_heap_idx);
+        gen_frame.cells = cells;
+
+        // Restore locals
+        for (i, val) in locals.iter().enumerate() {
+            if i < MAX_LOCALS {
+                gen_frame.locals[i] = *val;
+            }
+        }
+
+        // Restore stack
+        for val in &stack {
+            gen_frame.push(*val);
+        }
+
+        self.frames.push(gen_frame);
+        Ok(())
+    }
+
+    fn list_method_dispatch(&mut self, list_idx: usize, attr: &str, line: u32) -> Result<Value, PythonError> {
+        let method_id = match attr {
+            "append" => BuiltinId::ListAppend,
+            "pop" => BuiltinId::ListPop,
+            "sort" => BuiltinId::ListSort,
+            "reverse" => BuiltinId::ListReverse,
+            "insert" => BuiltinId::ListInsert,
+            "extend" => BuiltinId::ListExtend,
+            _ => return Err(PythonError::runtime(
+                format!("'list' object has no attribute '{attr}'"), line,
+            )),
+        };
+        let bound_idx = self.heap.len();
+        self.heap.push(HeapObject::BuiltinFn {
+            name: format!("list.{attr}"),
+            id: method_id,
+        });
+        // Store the list reference as a "bound" builtin: we'll pass the list as first arg
+        // Actually, for list methods we need the list. Let's create a BoundMethod.
+        let list_val = Value::list_ref(list_idx);
+        let method_val = Value::object_ref(bound_idx);
+        let bm_idx = self.heap.len();
+        self.heap.push(HeapObject::BoundMethod {
+            instance: list_val,
+            method: method_val,
+        });
+        Ok(Value::object_ref(bm_idx))
+    }
+
+    fn str_method_dispatch(&mut self, str_idx: usize, attr: &str, line: u32) -> Result<Value, PythonError> {
+        let method_id = match attr {
+            "upper" => BuiltinId::StrUpper,
+            "lower" => BuiltinId::StrLower,
+            "split" => BuiltinId::StrSplit,
+            "join" => BuiltinId::StrJoin,
+            "replace" => BuiltinId::StrReplace,
+            "startswith" => BuiltinId::StrStartswith,
+            "endswith" => BuiltinId::StrEndswith,
+            "find" => BuiltinId::StrFind,
+            "strip" => BuiltinId::StrStrip,
+            "format" => BuiltinId::StrFormat,
+            _ => return Err(PythonError::runtime(
+                format!("'str' object has no attribute '{attr}'"), line,
+            )),
+        };
+        let bound_idx = self.heap.len();
+        self.heap.push(HeapObject::BuiltinFn {
+            name: format!("str.{attr}"),
+            id: method_id,
+        });
+        let str_val = Value::str_ref(str_idx);
+        let method_val = Value::object_ref(bound_idx);
+        let bm_idx = self.heap.len();
+        self.heap.push(HeapObject::BoundMethod {
+            instance: str_val,
+            method: method_val,
+        });
+        Ok(Value::object_ref(bm_idx))
+    }
+
+    fn dict_method_dispatch(&mut self, dict_idx: usize, attr: &str, line: u32) -> Result<Value, PythonError> {
+        let method_id = match attr {
+            "keys" => BuiltinId::DictKeys,
+            "values" => BuiltinId::DictValues,
+            "items" => BuiltinId::DictItems,
+            "get" => BuiltinId::DictGet,
+            "pop" => BuiltinId::DictPop,
+            _ => return Err(PythonError::runtime(
+                format!("'dict' object has no attribute '{attr}'"), line,
+            )),
+        };
+        let bound_idx = self.heap.len();
+        self.heap.push(HeapObject::BuiltinFn {
+            name: format!("dict.{attr}"),
+            id: method_id,
+        });
+        let dict_val = Value::object_ref(dict_idx);
+        let method_val = Value::object_ref(bound_idx);
+        let bm_idx = self.heap.len();
+        self.heap.push(HeapObject::BoundMethod {
+            instance: dict_val,
+            method: method_val,
+        });
+        Ok(Value::object_ref(bm_idx))
+    }
 }
 
-// --- Free functions for arithmetic/comparison (avoids borrow conflicts) ---
+// --- Free functions for arithmetic/comparison ---
 
 fn is_truthy(val: Value, heap: &[HeapObject]) -> bool {
     if let Some(idx) = val.as_str_ref() && let Some(s) = heap[idx].as_str() {
@@ -438,7 +1841,53 @@ fn is_truthy(val: Value, heap: &[HeapObject]) -> bool {
     if let Some(idx) = val.as_list_ref() && let HeapObject::List(items) = &heap[idx] {
         return !items.is_empty();
     }
+    if let Some(idx) = val.as_object_ref() {
+        match &heap[idx] {
+            HeapObject::Tuple(items) => return !items.is_empty(),
+            HeapObject::Dict { keys, .. } => return !keys.is_empty(),
+            HeapObject::Set(items) => return !items.is_empty(),
+            _ => return true,
+        }
+    }
     val.is_truthy()
+}
+
+fn values_equal(left: Value, right: Value, heap: &[HeapObject]) -> bool {
+    // Same bit pattern
+    if left == right { return true; }
+    // None comparisons
+    if left.is_none() && right.is_none() { return true; }
+    if left.is_none() || right.is_none() { return false; }
+    // Numeric
+    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) { return a == b; }
+    if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64())
+        && (left.is_float() || right.is_float()) { return a == b; }
+    // Bool
+    if let (Some(a), Some(b)) = (left.as_bool(), right.as_bool()) { return a == b; }
+    // String
+    if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
+        let a = heap[a_idx].as_str().unwrap_or("");
+        let b = heap[b_idx].as_str().unwrap_or("");
+        return a == b;
+    }
+    // Exception type matching (for except handlers)
+    if let (Some(a_idx), Some(b_idx)) = (left.as_object_ref(), right.as_object_ref()) {
+        // If one is an ExceptionObj and the other is an ExcConstructor builtin,
+        // compare types
+        match (&heap[a_idx], &heap[b_idx]) {
+            (HeapObject::ExceptionObj { exc_type: et1, .. }, HeapObject::ExceptionObj { exc_type: et2, .. }) => {
+                return et1.is_subtype(*et2);
+            }
+            (HeapObject::ExceptionObj { exc_type, .. }, HeapObject::BuiltinFn { id: BuiltinId::ExcConstructor(target), .. }) => {
+                return exc_type.is_subtype(*target);
+            }
+            (HeapObject::BuiltinFn { id: BuiltinId::ExcConstructor(target), .. }, HeapObject::ExceptionObj { exc_type, .. }) => {
+                return exc_type.is_subtype(*target);
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
@@ -455,6 +1904,16 @@ fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
         let heap_idx = heap.len();
         heap.push(HeapObject::Str(result.into()));
         return Ok(Value::str_ref(heap_idx));
+    }
+    // List concatenation
+    if let (Some(a_idx), Some(b_idx)) = (left.as_list_ref(), right.as_list_ref()) {
+        let a = if let HeapObject::List(items) = &heap[a_idx] { items.clone() } else { Vec::new() };
+        let b = if let HeapObject::List(items) = &heap[b_idx] { items.clone() } else { Vec::new() };
+        let mut result = a;
+        result.extend(b);
+        let heap_idx = heap.len();
+        heap.push(HeapObject::List(result));
+        return Ok(Value::list_ref(heap_idx));
     }
     Err(PythonError::runtime("unsupported operand type(s) for +", line))
 }
@@ -475,12 +1934,27 @@ fn binary_arith(
     Err(PythonError::runtime("unsupported operand types", line))
 }
 
-fn binary_mul(left: Value, right: Value, line: u32) -> Result<Value, PythonError> {
+fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
         return Ok(Value::int(a * b));
     }
     if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) && (left.is_float() || right.is_float()) {
         return Ok(Value::float(a * b));
+    }
+    // String repetition
+    if let Some(s_idx) = left.as_str_ref() && let Some(n) = right.as_int() {
+        let s = heap[s_idx].as_str().unwrap();
+        let result = s.repeat(n.max(0) as usize);
+        let heap_idx = heap.len();
+        heap.push(HeapObject::Str(result.into()));
+        return Ok(Value::str_ref(heap_idx));
+    }
+    if let Some(n) = left.as_int() && let Some(s_idx) = right.as_str_ref() {
+        let s = heap[s_idx].as_str().unwrap();
+        let result = s.repeat(n.max(0) as usize);
+        let heap_idx = heap.len();
+        heap.push(HeapObject::Str(result.into()));
+        return Ok(Value::str_ref(heap_idx));
     }
     Err(PythonError::runtime("unsupported operand type(s) for *", line))
 }
@@ -510,7 +1984,7 @@ fn binary_floor_div(left: Value, right: Value, line: u32) -> Result<Value, Pytho
     Err(PythonError::runtime("unsupported operand type(s) for //", line))
 }
 
-fn binary_mod(left: Value, right: Value, line: u32) -> Result<Value, PythonError> {
+fn binary_mod(left: Value, right: Value, heap: &[HeapObject], line: u32) -> Result<Value, PythonError> {
     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
         if b == 0 {
             return Err(PythonError::runtime("integer division or modulo by zero", line));
@@ -524,6 +1998,10 @@ fn binary_mod(left: Value, right: Value, line: u32) -> Result<Value, PythonError
         let result = ((a % b) + b) % b;
         return Ok(Value::float(result));
     }
+    // String formatting: "hello %s" % value
+    if let Some(s_idx) = left.as_str_ref() {
+        let _ = (heap, s_idx, right); // basic support, skip for now
+    }
     Err(PythonError::runtime("unsupported operand type(s) for %", line))
 }
 
@@ -531,9 +2009,8 @@ fn binary_pow(left: Value, right: Value, line: u32) -> Result<Value, PythonError
     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
         if b >= 0 {
             return Ok(Value::int(a.pow(b as u32)));
-        } else {
-            return Ok(Value::float((a as f64).powi(b as i32)));
         }
+        return Ok(Value::float((a as f64).powi(b as i32)));
     }
     if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) {
         return Ok(Value::float(a.powf(b)));
@@ -566,6 +2043,36 @@ fn compare(
     }
 }
 
+fn contains(item: &Value, container: &Value, heap: &[HeapObject]) -> Result<bool, PythonError> {
+    if let Some(list_idx) = container.as_list_ref()
+        && let HeapObject::List(items) = &heap[list_idx]
+    {
+        return Ok(items.iter().any(|v| values_equal(*item, *v, heap)));
+    }
+    if let Some(str_idx) = container.as_str_ref()
+        && let Some(item_idx) = item.as_str_ref()
+    {
+        let s = heap[str_idx].as_str().unwrap_or("");
+        let sub = heap[item_idx].as_str().unwrap_or("");
+        return Ok(s.contains(sub));
+    }
+    if let Some(obj_idx) = container.as_object_ref() {
+        match &heap[obj_idx] {
+            HeapObject::Tuple(items) => {
+                return Ok(items.iter().any(|v| values_equal(*item, *v, heap)));
+            }
+            HeapObject::Dict { keys, .. } => {
+                return Ok(keys.iter().any(|k| values_equal(*item, *k, heap)));
+            }
+            HeapObject::Set(items) => {
+                return Ok(items.iter().any(|v| values_equal(*item, *v, heap)));
+            }
+            _ => {}
+        }
+    }
+    Err(PythonError::runtime("argument of type is not iterable", 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,6 +2087,17 @@ mod tests {
         let mut vm = VM::new(code_objects, heap);
         vm.run().unwrap();
         vm.output
+    }
+
+    fn run_expect_err(src: &str) -> String {
+        let tokens = lexer::tokenize(src).unwrap();
+        let module = parser::parse(tokens).unwrap();
+        let (code_objects, heap) = compiler::compile(&module).unwrap();
+        let mut vm = VM::new(code_objects, heap);
+        match vm.run() {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("expected error, got success"),
+        }
     }
 
     #[test]

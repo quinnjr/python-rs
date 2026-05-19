@@ -6,17 +6,35 @@ pub struct Module {
     pub body: Vec<Stmt>,
 }
 
+/// Assignment target — supports name, attribute, subscript, tuple unpacking.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignTarget {
+    Name(String),
+    Attribute { value: Box<Expr>, attr: String },
+    Subscript { value: Box<Expr>, index: Box<Expr> },
+    Tuple(Vec<AssignTarget>),
+}
+
+/// An except handler clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExceptHandler {
+    pub exc_type: Option<Expr>,
+    pub name: Option<String>,
+    pub body: Vec<Stmt>,
+    pub line: u32,
+}
+
 /// A statement.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub enum Stmt {
     Assign {
-        target: String,
+        target: AssignTarget,
         value: Expr,
         line: u32,
     },
     AugAssign {
-        target: String,
+        target: AssignTarget,
         op: BinOp,
         value: Expr,
         line: u32,
@@ -38,7 +56,7 @@ pub enum Stmt {
         line: u32,
     },
     For {
-        target: String,
+        target: AssignTarget,
         iter: Expr,
         body: Vec<Stmt>,
         line: u32,
@@ -47,6 +65,7 @@ pub enum Stmt {
         name: String,
         params: Vec<String>,
         body: Vec<Stmt>,
+        decorators: Vec<Expr>,
         line: u32,
     },
     Return {
@@ -62,10 +81,46 @@ pub enum Stmt {
     Continue {
         line: u32,
     },
+    ClassDef {
+        name: String,
+        bases: Vec<Expr>,
+        body: Vec<Stmt>,
+        decorators: Vec<Expr>,
+        line: u32,
+    },
+    Try {
+        body: Vec<Stmt>,
+        handlers: Vec<ExceptHandler>,
+        else_body: Vec<Stmt>,
+        finally_body: Vec<Stmt>,
+        line: u32,
+    },
+    Raise {
+        exc: Option<Expr>,
+        line: u32,
+    },
+    Assert {
+        test: Expr,
+        msg: Option<Expr>,
+        line: u32,
+    },
+    Delete {
+        target: AssignTarget,
+        line: u32,
+    },
+    GlobalDecl {
+        names: Vec<String>,
+        line: u32,
+    },
+    NonlocalDecl {
+        names: Vec<String>,
+        line: u32,
+    },
 }
 
 /// An expression.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Expr {
     IntLit {
         value: i64,
@@ -127,6 +182,43 @@ pub enum Expr {
         elements: Vec<Expr>,
         line: u32,
     },
+    Attribute {
+        value: Box<Expr>,
+        attr: String,
+        line: u32,
+    },
+    Tuple {
+        elements: Vec<Expr>,
+        line: u32,
+    },
+    Dict {
+        keys: Vec<Expr>,
+        values: Vec<Expr>,
+        line: u32,
+    },
+    Set {
+        elements: Vec<Expr>,
+        line: u32,
+    },
+    Lambda {
+        params: Vec<String>,
+        body: Box<Expr>,
+        line: u32,
+    },
+    IfExpr {
+        body: Box<Expr>,
+        test: Box<Expr>,
+        orelse: Box<Expr>,
+        line: u32,
+    },
+    Yield {
+        value: Option<Box<Expr>>,
+        line: u32,
+    },
+    Starred {
+        value: Box<Expr>,
+        line: u32,
+    },
 }
 
 impl Expr {
@@ -146,7 +238,15 @@ impl Expr {
             | Self::BoolOp { line, .. }
             | Self::Call { line, .. }
             | Self::Subscript { line, .. }
-            | Self::List { line, .. } => *line,
+            | Self::List { line, .. }
+            | Self::Attribute { line, .. }
+            | Self::Tuple { line, .. }
+            | Self::Dict { line, .. }
+            | Self::Set { line, .. }
+            | Self::Lambda { line, .. }
+            | Self::IfExpr { line, .. }
+            | Self::Yield { line, .. }
+            | Self::Starred { line, .. } => *line,
         }
     }
 }
@@ -161,6 +261,11 @@ pub enum BinOp {
     FloorDiv,
     Mod,
     Pow,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
 }
 
 /// Unary operators.
@@ -168,6 +273,8 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    Invert,
+    Pos,
 }
 
 /// Comparison operators.
@@ -179,6 +286,10 @@ pub enum CmpOp {
     LtEq,
     Gt,
     GtEq,
+    Is,
+    IsNot,
+    In,
+    NotIn,
 }
 
 /// Boolean operators (short-circuit).

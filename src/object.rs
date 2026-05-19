@@ -13,8 +13,9 @@
 //!   4 = List(heap idx)
 //!   5 = Function(heap idx)
 //!   6 = RangeIter(heap idx)
-//!   7 = BuiltinFn(heap idx)
+//!   7 = Object(heap idx) — all other heap types (dict, tuple, class, instance, etc.)
 
+use std::collections::HashMap;
 use std::fmt;
 
 /// Quiet NaN with tag bits set — base for all tagged values.
@@ -32,7 +33,7 @@ const TAG_STR: u64 = 3;       // sign=0, bits=11
 const TAG_LIST: u64 = 4;      // sign=1, bits=00
 const TAG_FUNC: u64 = 5;      // sign=1, bits=01
 const TAG_RANGE: u64 = 6;     // sign=1, bits=10
-const TAG_BUILTIN: u64 = 7;   // sign=1, bits=11
+const TAG_OBJECT: u64 = 7;    // sign=1, bits=11 — generalized object tag
 
 /// A NaN-boxed Python value — 8 bytes, Copy.
 #[derive(Clone, Copy, PartialEq)]
@@ -57,12 +58,8 @@ impl fmt::Debug for Value {
 impl Value {
     /// Create a float value.
     pub fn float(v: f64) -> Self {
-        // SAFETY: f64 and u64 have the same size and alignment.
         let bits = v.to_bits();
-        // If the float happens to look like our tag pattern, use canonical NaN.
         if (bits & QNAN) == QNAN {
-            // It's a NaN — store canonical NaN to avoid collision with tags.
-            // SAFETY: this is a valid f64 bit pattern (quiet NaN).
             Self(0x7FF8_0000_0000_0000)
         } else {
             Self(bits)
@@ -71,7 +68,6 @@ impl Value {
 
     /// Create an integer value (i48 range).
     pub fn int(v: i64) -> Self {
-        // Truncate to 48 bits (sign-extended on read).
         let payload = (v as u64) & PAYLOAD_MASK;
         Self(make_tagged(TAG_INT, payload))
     }
@@ -106,9 +102,15 @@ impl Value {
         Self(make_tagged(TAG_RANGE, heap_idx as u64))
     }
 
-    /// Create a builtin function reference (heap index).
+    /// Create an object reference (heap index) — tag 7, covers all other heap types.
+    pub fn object_ref(heap_idx: usize) -> Self {
+        Self(make_tagged(TAG_OBJECT, heap_idx as u64))
+    }
+
+    /// Backward-compat alias for object_ref.
+    #[allow(dead_code)]
     pub fn builtin_ref(heap_idx: usize) -> Self {
-        Self(make_tagged(TAG_BUILTIN, heap_idx as u64))
+        Self::object_ref(heap_idx)
     }
 
     /// Check if this is a float (not a tagged NaN value).
@@ -124,8 +126,8 @@ impl Value {
     /// Extract the 3-bit tag from a tagged value.
     fn tag(&self) -> u64 {
         debug_assert!(self.is_tagged());
-        let sign_bit = (self.0 >> 63) << 2; // bit 63 → bit 2 of tag
-        let mid = (self.0 & TAG_BITS_MASK) >> 48; // bits 49:48 → bits 1:0
+        let sign_bit = (self.0 >> 63) << 2;
+        let mid = (self.0 & TAG_BITS_MASK) >> 48;
         sign_bit | mid
     }
 
@@ -139,61 +141,25 @@ impl Value {
         self.0 & PAYLOAD_MASK
     }
 
-    /// Check if this is an integer.
-    pub fn is_int(&self) -> bool {
-        self.has_tag(TAG_INT)
-    }
+    pub fn is_int(&self) -> bool { self.has_tag(TAG_INT) }
+    pub fn is_bool(&self) -> bool { self.has_tag(TAG_BOOL) }
+    pub fn is_none(&self) -> bool { self.has_tag(TAG_NONE) }
+    pub fn is_str(&self) -> bool { self.has_tag(TAG_STR) }
+    pub fn is_list(&self) -> bool { self.has_tag(TAG_LIST) }
+    pub fn is_func(&self) -> bool { self.has_tag(TAG_FUNC) }
+    pub fn is_range(&self) -> bool { self.has_tag(TAG_RANGE) }
+    pub fn is_object(&self) -> bool { self.has_tag(TAG_OBJECT) }
+    /// Backward-compat alias.
+    #[allow(dead_code)]
+    pub fn is_builtin(&self) -> bool { self.is_object() }
 
-    /// Check if this is a boolean.
-    pub fn is_bool(&self) -> bool {
-        self.has_tag(TAG_BOOL)
-    }
-
-    /// Check if this is None.
-    pub fn is_none(&self) -> bool {
-        self.has_tag(TAG_NONE)
-    }
-
-    /// Check if this is a string reference.
-    pub fn is_str(&self) -> bool {
-        self.has_tag(TAG_STR)
-    }
-
-    /// Check if this is a list reference.
-    pub fn is_list(&self) -> bool {
-        self.has_tag(TAG_LIST)
-    }
-
-    /// Check if this is a function reference.
-    pub fn is_func(&self) -> bool {
-        self.has_tag(TAG_FUNC)
-    }
-
-    /// Check if this is a range iterator reference.
-    pub fn is_range(&self) -> bool {
-        self.has_tag(TAG_RANGE)
-    }
-
-    /// Check if this is a builtin function reference.
-    pub fn is_builtin(&self) -> bool {
-        self.has_tag(TAG_BUILTIN)
-    }
-
-    /// Extract as f64.
     pub fn as_float(&self) -> Option<f64> {
-        if self.is_float() {
-            // SAFETY: we verified this is a float (not a tagged NaN).
-            Some(f64::from_bits(self.0))
-        } else {
-            None
-        }
+        if self.is_float() { Some(f64::from_bits(self.0)) } else { None }
     }
 
-    /// Extract as i64 (sign-extended from i48).
     pub fn as_int(&self) -> Option<i64> {
         if self.is_int() {
             let raw = self.payload();
-            // Sign-extend from 48 bits.
             let shifted = (raw as i64) << 16;
             Some(shifted >> 16)
         } else {
@@ -201,38 +167,39 @@ impl Value {
         }
     }
 
-    /// Extract as bool.
     pub fn as_bool(&self) -> Option<bool> {
-        if self.is_bool() {
-            Some(self.payload() != 0)
-        } else {
-            None
-        }
+        if self.is_bool() { Some(self.payload() != 0) } else { None }
     }
 
-    /// Extract heap index for string.
     pub fn as_str_ref(&self) -> Option<usize> {
         if self.is_str() { Some(self.payload() as usize) } else { None }
     }
 
-    /// Extract heap index for list.
     pub fn as_list_ref(&self) -> Option<usize> {
         if self.is_list() { Some(self.payload() as usize) } else { None }
     }
 
-    /// Extract heap index for function.
     pub fn as_func_ref(&self) -> Option<usize> {
         if self.is_func() { Some(self.payload() as usize) } else { None }
     }
 
-    /// Extract heap index for range iterator.
     pub fn as_range_ref(&self) -> Option<usize> {
         if self.is_range() { Some(self.payload() as usize) } else { None }
     }
 
-    /// Extract heap index for builtin function.
+    pub fn as_object_ref(&self) -> Option<usize> {
+        if self.is_object() { Some(self.payload() as usize) } else { None }
+    }
+
+    /// Backward-compat alias.
+    #[allow(dead_code)]
     pub fn as_builtin_ref(&self) -> Option<usize> {
-        if self.is_builtin() { Some(self.payload() as usize) } else { None }
+        self.as_object_ref()
+    }
+
+    /// Get the raw bits (for id() builtin).
+    pub fn display_bits(self) -> u64 {
+        self.0
     }
 
     /// Get a numeric value as f64 (works for int and float).
@@ -244,7 +211,7 @@ impl Value {
         }
     }
 
-    /// Python truthiness.
+    /// Python truthiness (basic — doesn't check __bool__/__len__).
     pub fn is_truthy(&self) -> bool {
         if let Some(b) = self.as_bool() {
             b
@@ -252,12 +219,8 @@ impl Value {
             i != 0
         } else if let Some(f) = self.as_float() {
             f != 0.0
-        } else if self.is_none() {
-            false
         } else {
-            // Heap objects (str, list, etc.) — truthy by default.
-            // Actual truthiness for strings/lists checked in VM with heap access.
-            true
+            !self.is_none()
         }
     }
 
@@ -286,12 +249,8 @@ impl Value {
             } else {
                 "<function>".to_string()
             }
-        } else if let Some(idx) = self.as_builtin_ref() {
-            if let HeapObject::BuiltinFn { name, .. } = &heap[idx] {
-                format!("<built-in function {name}>")
-            } else {
-                "<builtin>".to_string()
-            }
+        } else if let Some(idx) = self.as_object_ref() {
+            display_object(idx, heap)
         } else {
             format!("<object 0x{:016X}>", self.0)
         }
@@ -305,6 +264,51 @@ impl Value {
         } else {
             self.display(heap)
         }
+    }
+}
+
+fn display_object(idx: usize, heap: &[HeapObject]) -> String {
+    match &heap[idx] {
+        HeapObject::BuiltinFn { name, .. } => format!("<built-in function {name}>"),
+        HeapObject::Tuple(items) => {
+            let parts: Vec<String> = items.iter().map(|v| v.repr(heap)).collect();
+            if items.len() == 1 {
+                format!("({},)", parts[0])
+            } else {
+                format!("({})", parts.join(", "))
+            }
+        }
+        HeapObject::Dict { keys, values, .. } => {
+            let parts: Vec<String> = keys.iter().zip(values.iter())
+                .map(|(k, v)| format!("{}: {}", k.repr(heap), v.repr(heap)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        HeapObject::Class { name, .. } => format!("<class '{name}'>"),
+        HeapObject::Instance { class_idx, .. } => {
+            if let HeapObject::Class { name, .. } = &heap[*class_idx] {
+                format!("<{name} instance>")
+            } else {
+                "<instance>".to_string()
+            }
+        }
+        HeapObject::BoundMethod { .. } => "<bound method>".to_string(),
+        HeapObject::Generator { .. } => "<generator object>".to_string(),
+        HeapObject::Cell(v) => format!("<cell: {}>", v.display(heap)),
+        HeapObject::Closure { name, .. } => format!("<function {name}>"),
+        HeapObject::ExceptionObj { exc_type, message, .. } => {
+            format!("{exc_type:?}({message})")
+        }
+        HeapObject::ListIter { .. } => "<list_iterator>".to_string(),
+        HeapObject::Set(items) => {
+            if items.is_empty() {
+                "set()".to_string()
+            } else {
+                let parts: Vec<String> = items.iter().map(|v| v.repr(heap)).collect();
+                format!("{{{}}}", parts.join(", "))
+            }
+        }
+        _ => format!("<object@{idx}>"),
     }
 }
 
@@ -323,8 +327,8 @@ fn format_float(f: f64) -> String {
 
 /// Construct a tagged NaN-boxed value from a 3-bit tag and 48-bit payload.
 fn make_tagged(tag: u64, payload: u64) -> u64 {
-    let sign = ((tag >> 2) & 1) << 63; // bit 2 of tag → bit 63 (sign bit)
-    let mid = (tag & 0b011) << 48;     // bits 0-1 of tag → bits 49:48
+    let sign = ((tag >> 2) & 1) << 63;
+    let mid = (tag & 0b011) << 48;
     QNAN | sign | mid | (payload & PAYLOAD_MASK)
 }
 
@@ -352,6 +356,78 @@ pub enum HeapObject {
         name: String,
         id: BuiltinId,
     },
+    /// Tuple (immutable sequence).
+    Tuple(Vec<Value>),
+    /// Dictionary.
+    Dict {
+        keys: Vec<Value>,
+        values: Vec<Value>,
+        index_map: HashMap<u64, usize>,
+    },
+    /// Set.
+    Set(Vec<Value>),
+    /// Class object.
+    Class {
+        name: String,
+        mro: Vec<usize>,
+        attrs: HashMap<String, Value>,
+        #[allow(dead_code)]
+        bases: Vec<usize>,
+    },
+    /// Instance of a class.
+    Instance {
+        class_idx: usize,
+        attrs: HashMap<String, Value>,
+    },
+    /// Bound method (instance + function).
+    BoundMethod {
+        instance: Value,
+        method: Value,
+    },
+    /// Generator object.
+    Generator {
+        code_index: usize,
+        ip: usize,
+        locals: Vec<Value>,
+        stack: Vec<Value>,
+        state: GeneratorState,
+        cells: Vec<usize>,
+    },
+    /// Cell for closures.
+    Cell(Value),
+    /// Closure (function + captured cells).
+    Closure {
+        name: String,
+        code_index: usize,
+        arity: u8,
+        cells: Vec<usize>,
+    },
+    /// Exception object.
+    ExceptionObj {
+        exc_type: ExceptionType,
+        message: String,
+        args: Vec<Value>,
+    },
+    /// List iterator.
+    ListIter {
+        list_idx: usize,
+        index: usize,
+    },
+    /// Tuple iterator.
+    TupleIter {
+        tuple_idx: usize,
+        index: usize,
+    },
+    /// String iterator.
+    StringIter {
+        str_idx: usize,
+        index: usize,
+    },
+    /// Dict key iterator.
+    DictKeyIter {
+        dict_idx: usize,
+        index: usize,
+    },
 }
 
 impl HeapObject {
@@ -359,6 +435,86 @@ impl HeapObject {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+/// Generator execution state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GeneratorState {
+    Created,
+    Suspended,
+    Running,
+    Completed,
+}
+
+/// Python exception types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionType {
+    BaseException,
+    Exception,
+    TypeError,
+    ValueError,
+    NameError,
+    AttributeError,
+    IndexError,
+    KeyError,
+    ZeroDivisionError,
+    StopIteration,
+    RuntimeError,
+    NotImplementedError,
+    AssertionError,
+    OverflowError,
+}
+
+impl ExceptionType {
+    /// Check if self is a subtype of target.
+    pub fn is_subtype(self, target: Self) -> bool {
+        if self == target { return true; }
+        match target {
+            Self::BaseException => true,
+            Self::Exception => self != Self::BaseException,
+            _ => false,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BaseException => "BaseException",
+            Self::Exception => "Exception",
+            Self::TypeError => "TypeError",
+            Self::ValueError => "ValueError",
+            Self::NameError => "NameError",
+            Self::AttributeError => "AttributeError",
+            Self::IndexError => "IndexError",
+            Self::KeyError => "KeyError",
+            Self::ZeroDivisionError => "ZeroDivisionError",
+            Self::StopIteration => "StopIteration",
+            Self::RuntimeError => "RuntimeError",
+            Self::NotImplementedError => "NotImplementedError",
+            Self::AssertionError => "AssertionError",
+            Self::OverflowError => "OverflowError",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "BaseException" => Some(Self::BaseException),
+            "Exception" => Some(Self::Exception),
+            "TypeError" => Some(Self::TypeError),
+            "ValueError" => Some(Self::ValueError),
+            "NameError" => Some(Self::NameError),
+            "AttributeError" => Some(Self::AttributeError),
+            "IndexError" => Some(Self::IndexError),
+            "KeyError" => Some(Self::KeyError),
+            "ZeroDivisionError" => Some(Self::ZeroDivisionError),
+            "StopIteration" => Some(Self::StopIteration),
+            "RuntimeError" => Some(Self::RuntimeError),
+            "NotImplementedError" => Some(Self::NotImplementedError),
+            "AssertionError" | "AssertError" => Some(Self::AssertionError),
+            "OverflowError" => Some(Self::OverflowError),
             _ => None,
         }
     }
@@ -378,8 +534,62 @@ pub enum BuiltinId {
     Abs,
     Min,
     Max,
-    #[allow(dead_code)]
-    Append,
+    Isinstance,
+    Issubclass,
+    Super,
+    Hasattr,
+    Getattr,
+    Setattr,
+    Id,
+    Iter,
+    Next,
+    // List methods
+    ListAppend,
+    ListPop,
+    ListSort,
+    ListReverse,
+    ListInsert,
+    ListExtend,
+    // String methods
+    StrUpper,
+    StrLower,
+    StrSplit,
+    StrJoin,
+    StrReplace,
+    StrStartswith,
+    StrEndswith,
+    StrFind,
+    StrStrip,
+    StrFormat,
+    // Dict methods
+    DictKeys,
+    DictValues,
+    DictItems,
+    DictGet,
+    DictPop,
+    // Exception constructors
+    ExcConstructor(ExceptionType),
+}
+
+/// Compute a hash for a Value, used in dict key lookup.
+pub fn value_hash(v: Value, heap: &[HeapObject]) -> u64 {
+    if let Some(i) = v.as_int() {
+        i as u64
+    } else if let Some(b) = v.as_bool() {
+        b as u64
+    } else if v.is_none() {
+        0x_DEAD_CAFE
+    } else if let Some(idx) = v.as_str_ref() {
+        let s = heap[idx].as_str().unwrap_or("");
+        let mut h: u64 = 5381;
+        for b in s.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        }
+        h
+    } else {
+        // Identity hash for other types
+        v.0
+    }
 }
 
 #[cfg(test)]
@@ -472,9 +682,8 @@ mod tests {
             Value::list_ref(0),
             Value::func_ref(0),
             Value::range_ref(0),
-            Value::builtin_ref(0),
+            Value::object_ref(0),
         ];
-        // Each should only match its own type.
         for (i, v) in values.iter().enumerate() {
             let checks = [
                 v.is_int(),
@@ -484,7 +693,7 @@ mod tests {
                 v.is_list(),
                 v.is_func(),
                 v.is_range(),
-                v.is_builtin(),
+                v.is_object(),
             ];
             for (j, &check) in checks.iter().enumerate() {
                 if i == j {
@@ -494,5 +703,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn object_ref_backward_compat() {
+        let v = Value::builtin_ref(5);
+        assert!(v.is_object());
+        assert!(v.is_builtin()); // alias
+        assert_eq!(v.as_object_ref(), Some(5));
+        assert_eq!(v.as_builtin_ref(), Some(5));
     }
 }

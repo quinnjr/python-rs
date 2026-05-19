@@ -30,6 +30,21 @@ pub enum TokenKind {
     Pass,
     Break,
     Continue,
+    Class,
+    Try,
+    Except,
+    Finally,
+    Raise,
+    As,
+    With,
+    Assert,
+    Del,
+    Global,
+    Nonlocal,
+    Lambda,
+    Yield,
+    Is,
+    From,
 
     // Operators
     Plus,
@@ -53,15 +68,32 @@ pub enum TokenKind {
     DoubleSlashAssign,
     PercentAssign,
     DoubleStarAssign,
+    Ampersand,
+    Pipe,
+    Caret,
+    Tilde,
+    LShift,
+    RShift,
+    AmpersandAssign,
+    PipeAssign,
+    CaretAssign,
+    LShiftAssign,
+    RShiftAssign,
+    At,
 
     // Delimiters
     LParen,
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Colon,
     Comma,
     Dot,
+    Semicolon,
+    Ellipsis,
+    Arrow,
 
     // Structure
     Newline,
@@ -275,10 +307,54 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 "pass" => TokenKind::Pass,
                 "break" => TokenKind::Break,
                 "continue" => TokenKind::Continue,
+                "class" => TokenKind::Class,
+                "try" => TokenKind::Try,
+                "except" => TokenKind::Except,
+                "finally" => TokenKind::Finally,
+                "raise" => TokenKind::Raise,
+                "as" => TokenKind::As,
+                "with" => TokenKind::With,
+                "assert" => TokenKind::Assert,
+                "del" => TokenKind::Del,
+                "global" => TokenKind::Global,
+                "nonlocal" => TokenKind::Nonlocal,
+                "lambda" => TokenKind::Lambda,
+                "yield" => TokenKind::Yield,
+                "is" => TokenKind::Is,
+                "from" => TokenKind::From,
                 _ => TokenKind::Ident(word),
             };
             tokens.push(Token { kind, line, col: start_col });
             continue;
+        }
+
+        // Three-character tokens
+        if pos + 2 < len {
+            let three: String = chars[pos..pos + 3].iter().collect();
+            let kind3 = match three.as_str() {
+                "..." => Some(TokenKind::Ellipsis),
+                "<<=" => Some(TokenKind::LShiftAssign),
+                ">>=" => Some(TokenKind::RShiftAssign),
+                "**=" => {
+                    pos += 3;
+                    col += 3;
+                    tokens.push(Token { kind: TokenKind::DoubleStarAssign, line, col: start_col });
+                    continue;
+                }
+                "//=" => {
+                    pos += 3;
+                    col += 3;
+                    tokens.push(Token { kind: TokenKind::DoubleSlashAssign, line, col: start_col });
+                    continue;
+                }
+                _ => Option::None,
+            };
+            if let Some(k) = kind3 {
+                pos += 3;
+                col += 3;
+                tokens.push(Token { kind: k, line, col: start_col });
+                continue;
+            }
         }
 
         // Two-character operators
@@ -289,29 +365,19 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 "!=" => Some(TokenKind::NotEq),
                 "<=" => Some(TokenKind::LtEq),
                 ">=" => Some(TokenKind::GtEq),
-                "//" => {
-                    if pos + 2 < len && chars[pos + 2] == '=' {
-                        pos += 3;
-                        col += 3;
-                        tokens.push(Token { kind: TokenKind::DoubleSlashAssign, line, col: start_col });
-                        continue;
-                    }
-                    Some(TokenKind::DoubleSlash)
-                }
-                "**" => {
-                    if pos + 2 < len && chars[pos + 2] == '=' {
-                        pos += 3;
-                        col += 3;
-                        tokens.push(Token { kind: TokenKind::DoubleStarAssign, line, col: start_col });
-                        continue;
-                    }
-                    Some(TokenKind::DoubleStar)
-                }
+                "//" => Some(TokenKind::DoubleSlash),
+                "**" => Some(TokenKind::DoubleStar),
                 "+=" => Some(TokenKind::PlusAssign),
                 "-=" => Some(TokenKind::MinusAssign),
                 "*=" => Some(TokenKind::StarAssign),
                 "/=" => Some(TokenKind::SlashAssign),
                 "%=" => Some(TokenKind::PercentAssign),
+                "<<" => Some(TokenKind::LShift),
+                ">>" => Some(TokenKind::RShift),
+                "&=" => Some(TokenKind::AmpersandAssign),
+                "|=" => Some(TokenKind::PipeAssign),
+                "^=" => Some(TokenKind::CaretAssign),
+                "->" => Some(TokenKind::Arrow),
                 _ => Option::None,
             };
             if let Some(k) = kind {
@@ -332,6 +398,11 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
             '<' => Some(TokenKind::Lt),
             '>' => Some(TokenKind::Gt),
             '=' => Some(TokenKind::Assign),
+            '&' => Some(TokenKind::Ampersand),
+            '|' => Some(TokenKind::Pipe),
+            '^' => Some(TokenKind::Caret),
+            '~' => Some(TokenKind::Tilde),
+            '@' => Some(TokenKind::At),
             '(' => {
                 paren_depth += 1;
                 Some(TokenKind::LParen)
@@ -348,9 +419,18 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 paren_depth = paren_depth.saturating_sub(1);
                 Some(TokenKind::RBracket)
             }
+            '{' => {
+                paren_depth += 1;
+                Some(TokenKind::LBrace)
+            }
+            '}' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                Some(TokenKind::RBrace)
+            }
             ':' => Some(TokenKind::Colon),
             ',' => Some(TokenKind::Comma),
             '.' => Some(TokenKind::Dot),
+            ';' => Some(TokenKind::Semicolon),
             _ => Option::None,
         };
 
@@ -487,5 +567,45 @@ mod tests {
     fn augmented_assign() {
         let k = kinds("x += 1\n");
         assert_eq!(k[1], TokenKind::PlusAssign);
+    }
+
+    #[test]
+    fn new_keywords() {
+        let k = kinds("class try except finally raise as with assert del global nonlocal lambda yield is from\n");
+        assert!(k.contains(&TokenKind::Class));
+        assert!(k.contains(&TokenKind::Try));
+        assert!(k.contains(&TokenKind::Except));
+        assert!(k.contains(&TokenKind::Finally));
+        assert!(k.contains(&TokenKind::Raise));
+        assert!(k.contains(&TokenKind::As));
+        assert!(k.contains(&TokenKind::With));
+        assert!(k.contains(&TokenKind::Assert));
+        assert!(k.contains(&TokenKind::Del));
+        assert!(k.contains(&TokenKind::Global));
+        assert!(k.contains(&TokenKind::Nonlocal));
+        assert!(k.contains(&TokenKind::Lambda));
+        assert!(k.contains(&TokenKind::Yield));
+        assert!(k.contains(&TokenKind::Is));
+        assert!(k.contains(&TokenKind::From));
+    }
+
+    #[test]
+    fn bitwise_operators() {
+        let k = kinds("a & b | c ^ d ~ e << f >> g\n");
+        assert!(k.contains(&TokenKind::Ampersand));
+        assert!(k.contains(&TokenKind::Pipe));
+        assert!(k.contains(&TokenKind::Caret));
+        assert!(k.contains(&TokenKind::Tilde));
+        assert!(k.contains(&TokenKind::LShift));
+        assert!(k.contains(&TokenKind::RShift));
+    }
+
+    #[test]
+    fn braces_and_semicolons() {
+        let k = kinds("{1: 2}; ...\n");
+        assert!(k.contains(&TokenKind::LBrace));
+        assert!(k.contains(&TokenKind::RBrace));
+        assert!(k.contains(&TokenKind::Semicolon));
+        assert!(k.contains(&TokenKind::Ellipsis));
     }
 }
