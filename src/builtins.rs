@@ -377,21 +377,28 @@ fn builtin_divmod(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, P
 }
 
 fn builtin_min(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
-    minmax(args, heap, std::cmp::Ordering::Less, "min")
+    minmax(args, heap, MinMax::Min)
 }
 
 fn builtin_max(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
-    minmax(args, heap, std::cmp::Ordering::Greater, "max")
+    minmax(args, heap, MinMax::Max)
 }
 
-fn minmax(
-    args: &[Value],
-    heap: &[HeapObject],
-    want: std::cmp::Ordering,
-    name: &str,
-) -> Result<Value, PythonError> {
+#[derive(Clone, Copy)]
+enum MinMax { Min, Max }
+
+impl MinMax {
+    fn name(self) -> &'static str {
+        match self { Self::Min => "min", Self::Max => "max" }
+    }
+    fn want(self) -> std::cmp::Ordering {
+        match self { Self::Min => std::cmp::Ordering::Less, Self::Max => std::cmp::Ordering::Greater }
+    }
+}
+
+fn minmax(args: &[Value], heap: &[HeapObject], kind: MinMax) -> Result<Value, PythonError> {
     if args.len() < 2 {
-        return Err(PythonError::runtime(format!("{name}() requires at least 2 arguments"), 0));
+        return Err(PythonError::runtime(format!("{}() requires at least 2 arguments", kind.name()), 0));
     }
     let mut result = args[0];
     for arg in &args[1..] {
@@ -399,13 +406,11 @@ fn minmax(
             PyInt::from_value_or_bool(*arg, heap),
             PyInt::from_value_or_bool(result, heap),
         ) {
-            a.cmp(b) == want
+            a.cmp(b) == kind.want()
         } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64()) {
-            match want {
-                std::cmp::Ordering::Less    => a < b,
-                std::cmp::Ordering::Greater => a > b,
-                std::cmp::Ordering::Equal   => false,
-            }
+            // partial_cmp returns None for NaN, so NaN never replaces — same
+            // behavior as the prior `a < b` / `a > b` checks.
+            a.partial_cmp(&b) == Some(kind.want())
         } else {
             false
         };

@@ -2500,6 +2500,14 @@ print(fib(10))
     }
 
     #[test]
+    fn float_builtin_converts_negative_bigint_to_neginf() {
+        // Regression: bigint_to_f64 now branches on sign for the unrepresentable
+        // case. Previously the string round-trip always returned +inf.
+        let out = run_and_capture("print(float(-(2 ** 2000)))\n");
+        assert_eq!(out, vec!["-inf"]);
+    }
+
+    #[test]
     fn float_builtin_converts_small_bigint_exactly() {
         // 10^15 is exactly representable in f64 (52-bit mantissa is enough).
         let out = run_and_capture("print(float(10 ** 15))\n");

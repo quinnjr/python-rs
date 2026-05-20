@@ -1356,6 +1356,29 @@ mod tests {
     }
 
     #[test]
+    fn const_pool_deduplicates_repeated_literals() {
+        // Three occurrences of the literal 0 must collapse to one constant.
+        // Verifies the HashMap-backed dedup in add_const works end-to-end.
+        let (cos, _) = compile_src("x = 0\ny = 0\nz = 0\n");
+        let zeros = cos[0].constants.iter()
+            .filter(|c| c.as_int() == Some(0))
+            .count();
+        assert_eq!(zeros, 1, "expected the constant 0 to appear exactly once in the pool");
+    }
+
+    #[test]
+    fn const_pool_keeps_distinct_literals_distinct() {
+        // Counterpart to the dedup test: a hash-key collision that lost the
+        // value comparison would erroneously dedupe these into one entry.
+        let (cos, _) = compile_src("x = 0\ny = 1\nz = 2\n");
+        let mut ints: Vec<i64> = cos[0].constants.iter()
+            .filter_map(|c| c.as_int())
+            .collect();
+        ints.sort();
+        assert_eq!(ints, vec![0, 1, 2], "distinct int literals must not be deduped");
+    }
+
+    #[test]
     fn compile_class() {
         let (cos, _) = compile_src("class Foo:\n    pass\n");
         assert!(cos.len() >= 2);

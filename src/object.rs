@@ -839,7 +839,7 @@ impl PyIntOwned {
 
 // ---------- shared helpers ----------
 
-/// Returns `DivByZero` if `d` is zero. Used by floordiv/mod/divmod/pow_mod.
+/// Returns `DivByZero` if `d` is zero. Shared between division-like ops.
 #[inline]
 fn check_nonzero(d: PyInt<'_>) -> Result<(), ArithError> {
     match d {
@@ -881,6 +881,8 @@ fn pyint_to_shift_amount(p: PyInt<'_>) -> Result<usize, ArithError> {
 pub fn pyint_truediv(a: PyInt<'_>, b: PyInt<'_>) -> Result<f64, ArithError> {
     check_nonzero(b)?;
     let bf = b.to_f64();
+    // Defensive: even after check_nonzero, a non-zero BigInt can in
+    // principle underflow to 0.0 in f64. Keep this guard.
     if bf == 0.0 { return Err(ArithError::DivByZero); }
     Ok(a.to_f64() / bf)
 }
@@ -1611,6 +1613,25 @@ mod tests {
     fn pyint_shift_negative_errors() {
         assert_eq!(small(1).shl(small(-1)).unwrap_err(), ArithError::NegativeShift);
         assert_eq!(small(1).shr(small(-1)).unwrap_err(), ArithError::NegativeShift);
+    }
+
+    #[test]
+    fn pyint_shl_negative_msb_promotes() {
+        // Regression: the old `(r >> s) == a` arithmetic-shift round-trip
+        // check could falsely succeed for negative i64 values near the
+        // sign bit. The current i128 fast path promotes correctly.
+        // i64::MIN << 1 overflows i64; must become BigInt.
+        let r = small(i64::MIN).shl(small(1)).unwrap();
+        assert!(as_big(&r).is_some(), "i64::MIN << 1 must promote to BigInt");
+        assert_eq!(as_big(&r).unwrap(), &(BigInt::from(i64::MIN) << 1));
+
+        // Negative small int with a shift that keeps it in i48: stays small.
+        let r = small(-1).shl(small(2)).unwrap();
+        assert_eq!(as_i64(&r), Some(-4));
+
+        // Negative shifted past i48 boundary: BigInt.
+        let r = small(-1).shl(small(48)).unwrap();
+        assert!(as_big(&r).is_some(), "-(1<<48) must promote to BigInt");
     }
 
     #[test]
