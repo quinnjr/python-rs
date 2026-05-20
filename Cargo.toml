@@ -26,3 +26,7 @@ exclude = [
 # Arbitrary-precision integers backing HeapObject::BigInt and the PyInt
 # overflow path. Required for Python 3 int semantics — see M2 design spec.
 num-bigint = "0.4"
+# div_floor / mod_floor / div_mod_floor on BigInt; sister crate to num-bigint.
+num-integer = "0.1"
+# Sign extraction and unsigned-to-signed bridges for the hash algorithm.
+num-traits = "0.2"

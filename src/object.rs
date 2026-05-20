@@ -18,7 +18,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
+use num_integer::Integer;
 
 /// Quiet NaN with tag bits set — base for all tagged values.
 const QNAN: u64 = 0x7FFC_0000_0000_0000;
@@ -490,6 +491,429 @@ fn value_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
 /// outside f64's exact range it loses precision, consistent with CPython.
 fn bigint_to_f64(b: &BigInt) -> Option<f64> {
     Some(b.to_string().parse::<f64>().unwrap_or(f64::INFINITY))
+}
+
+// =====================================================================
+// PyInt — unified small/big int arithmetic surface (M2 commit 2)
+// =====================================================================
+
+/// Borrowed view of a Python int — small (i64, always within i48) or big
+/// (heap BigInt). The single chokepoint for every arithmetic operation
+/// involving ints. Constructed from a Value via `from_value`; arithmetic
+/// methods return `PyIntOwned`, which the caller converts back into a
+/// Value via `PyIntOwned::into_value`.
+#[derive(Debug, Clone, Copy)]
+pub enum PyInt<'a> {
+    Small(i64),
+    Big(&'a BigInt),
+}
+
+/// Owned form returned by arithmetic. Invariant: `Small(i)` always holds
+/// a value in the i48 range — `demote()` enforces this on every result.
+#[derive(Debug, Clone)]
+pub enum PyIntOwned {
+    Small(i64),
+    Big(BigInt),
+}
+
+/// `pow` result: integer base raised to integer exp can be either int
+/// (non-negative exp) or float (negative exp, e.g., `2 ** -3 == 0.125`).
+#[derive(Debug)]
+pub enum PyPowResult {
+    Int(PyIntOwned),
+    Float(f64),
+}
+
+/// Arithmetic errors at the int-op level. Each maps to a specific
+/// Python exception at the VM boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithError {
+    DivByZero,
+    NegativeShift,
+    NegativePower, // pow_mod with negative exponent and no modulus
+}
+
+impl<'a> PyInt<'a> {
+    /// Construct from a Value. Returns None if `v` is not an int.
+    /// Does NOT treat bool as int — use `from_value_or_bool` for that.
+    pub fn from_value(v: Value, heap: &'a [HeapObject]) -> Option<Self> {
+        if let Some(i) = v.as_int() { return Some(PyInt::Small(i)); }
+        if let Some(idx) = v.as_object_ref()
+            && let HeapObject::BigInt(b) = &heap[idx] {
+            return Some(PyInt::Big(b));
+        }
+        None
+    }
+
+    /// Construct from a Value, widening bool to int (True→1, False→0).
+    /// Use at arithmetic call sites — Python treats `True + 1 == 2`.
+    pub fn from_value_or_bool(v: Value, heap: &'a [HeapObject]) -> Option<Self> {
+        if let Some(b) = v.as_bool() { return Some(PyInt::Small(b as i64)); }
+        Self::from_value(v, heap)
+    }
+
+    /// Allocate an owned BigInt from this view. Cheap clone for Big;
+    /// constructs from i64 for Small.
+    fn to_owned_bigint(self) -> BigInt {
+        match self {
+            PyInt::Small(i) => BigInt::from(i),
+            PyInt::Big(b) => b.clone(),
+        }
+    }
+
+    /// f64 view. Loses precision for ints beyond f64's exact range; for
+    /// magnitudes beyond f64's exponent range, collapses to ±inf, matching
+    /// CPython's documented `float(huge_int)` behavior.
+    pub fn to_f64(self) -> f64 {
+        match self {
+            PyInt::Small(i) => i as f64,
+            PyInt::Big(b) => bigint_to_f64(b).unwrap_or(f64::INFINITY),
+        }
+    }
+
+    pub fn add(self, other: Self) -> PyIntOwned {
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            if let Some(r) = a.checked_add(b) {
+                return PyIntOwned::Small(r).demote();
+            }
+        }
+        PyIntOwned::Big(self.to_owned_bigint() + other.to_owned_bigint()).demote()
+    }
+
+    pub fn sub(self, other: Self) -> PyIntOwned {
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            if let Some(r) = a.checked_sub(b) {
+                return PyIntOwned::Small(r).demote();
+            }
+        }
+        PyIntOwned::Big(self.to_owned_bigint() - other.to_owned_bigint()).demote()
+    }
+
+    pub fn mul(self, other: Self) -> PyIntOwned {
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            if let Some(r) = a.checked_mul(b) {
+                return PyIntOwned::Small(r).demote();
+            }
+        }
+        PyIntOwned::Big(self.to_owned_bigint() * other.to_owned_bigint()).demote()
+    }
+
+    pub fn floordiv(self, other: Self) -> Result<PyIntOwned, ArithError> {
+        if let PyInt::Small(0) = other { return Err(ArithError::DivByZero); }
+        if let PyInt::Big(b) = other
+            && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
+
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            // Avoid i64::MIN / -1 overflow by falling through to BigInt.
+            if !(a == i64::MIN && b == -1) {
+                return Ok(PyIntOwned::Small(floor_div_i64(a, b)).demote());
+            }
+        }
+        let a = self.to_owned_bigint();
+        let b = other.to_owned_bigint();
+        Ok(PyIntOwned::Big(a.div_floor(&b)).demote())
+    }
+
+    pub fn mod_(self, other: Self) -> Result<PyIntOwned, ArithError> {
+        if let PyInt::Small(0) = other { return Err(ArithError::DivByZero); }
+        if let PyInt::Big(b) = other
+            && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
+
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            if !(a == i64::MIN && b == -1) {
+                return Ok(PyIntOwned::Small(floor_mod_i64(a, b)).demote());
+            }
+        }
+        let a = self.to_owned_bigint();
+        let b = other.to_owned_bigint();
+        Ok(PyIntOwned::Big(a.mod_floor(&b)).demote())
+    }
+
+    pub fn divmod(self, other: Self) -> Result<(PyIntOwned, PyIntOwned), ArithError> {
+        if let PyInt::Small(0) = other { return Err(ArithError::DivByZero); }
+        if let PyInt::Big(b) = other
+            && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
+
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            if !(a == i64::MIN && b == -1) {
+                let q = floor_div_i64(a, b);
+                let r = floor_mod_i64(a, b);
+                return Ok((PyIntOwned::Small(q).demote(), PyIntOwned::Small(r).demote()));
+            }
+        }
+        let a = self.to_owned_bigint();
+        let b = other.to_owned_bigint();
+        let (q, r) = a.div_mod_floor(&b);
+        Ok((PyIntOwned::Big(q).demote(), PyIntOwned::Big(r).demote()))
+    }
+
+    /// `pow(self, exp)` — negative exp returns float; otherwise int.
+    /// For huge exponents this can be slow; that's an inherent cost of
+    /// arbitrary-precision arithmetic.
+    pub fn pow(self, exp: Self) -> PyPowResult {
+        // Negative exponent → float.
+        if matches!(exp, PyInt::Small(e) if e < 0)
+            || matches!(exp, PyInt::Big(b) if b.sign() == Sign::Minus)
+        {
+            let base_f = self.to_f64();
+            let exp_f  = exp.to_f64();
+            return PyPowResult::Float(base_f.powf(exp_f));
+        }
+
+        // Non-negative integer exponent. Extract as u32 if it fits; otherwise
+        // the operation is effectively infeasible (would produce a >4-billion-
+        // bit result), so we fall back to f64 powf.
+        let exp_u32 = match exp {
+            PyInt::Small(e) => u32::try_from(e).ok(),
+            PyInt::Big(b)   => u32::try_from(b).ok(),
+        };
+        match exp_u32 {
+            Some(e) => {
+                let base = self.to_owned_bigint();
+                PyPowResult::Int(PyIntOwned::Big(base.pow(e)).demote())
+            }
+            None => {
+                // Exponent too large for any plausible computation; defer to f64.
+                PyPowResult::Float(self.to_f64().powf(exp.to_f64()))
+            }
+        }
+    }
+
+    /// Three-arg pow: `pow(self, exp, modulus)`. Negative `exp` requires a
+    /// modular inverse which is out of M2 scope — we error on it.
+    pub fn pow_mod(self, exp: Self, modulus: Self) -> Result<PyIntOwned, ArithError> {
+        if matches!(modulus, PyInt::Small(0)) { return Err(ArithError::DivByZero); }
+        if let PyInt::Big(b) = modulus
+            && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
+        if matches!(exp, PyInt::Small(e) if e < 0) {
+            return Err(ArithError::NegativePower);
+        }
+        if let PyInt::Big(b) = exp
+            && b.sign() == Sign::Minus { return Err(ArithError::NegativePower); }
+
+        let base = self.to_owned_bigint();
+        let e = exp.to_owned_bigint();
+        let m = modulus.to_owned_bigint();
+        Ok(PyIntOwned::Big(base.modpow(&e, &m)).demote())
+    }
+
+    pub fn neg(self) -> PyIntOwned {
+        match self {
+            PyInt::Small(i) => {
+                // i64::MIN.checked_neg() returns None; spills to BigInt.
+                match i.checked_neg() {
+                    Some(r) => PyIntOwned::Small(r).demote(),
+                    None    => PyIntOwned::Big(-BigInt::from(i)).demote(),
+                }
+            }
+            PyInt::Big(b) => PyIntOwned::Big(-b).demote(),
+        }
+    }
+
+    pub fn abs(self) -> PyIntOwned {
+        match self {
+            PyInt::Small(i) => {
+                match i.checked_abs() {
+                    Some(r) => PyIntOwned::Small(r).demote(),
+                    None    => PyIntOwned::Big(BigInt::from(i).magnitude().clone().into()).demote(),
+                }
+            }
+            PyInt::Big(b) => {
+                let mag: BigInt = b.magnitude().clone().into();
+                PyIntOwned::Big(mag).demote()
+            }
+        }
+    }
+
+    pub fn and_(self, other: Self) -> PyIntOwned {
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            return PyIntOwned::Small(a & b).demote();
+        }
+        PyIntOwned::Big(self.to_owned_bigint() & other.to_owned_bigint()).demote()
+    }
+
+    pub fn or_(self, other: Self) -> PyIntOwned {
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            return PyIntOwned::Small(a | b).demote();
+        }
+        PyIntOwned::Big(self.to_owned_bigint() | other.to_owned_bigint()).demote()
+    }
+
+    pub fn xor_(self, other: Self) -> PyIntOwned {
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
+            return PyIntOwned::Small(a ^ b).demote();
+        }
+        PyIntOwned::Big(self.to_owned_bigint() ^ other.to_owned_bigint()).demote()
+    }
+
+    pub fn invert(self) -> PyIntOwned {
+        // ~x == -x - 1 in Python's two's-complement int model.
+        match self {
+            PyInt::Small(i) => PyIntOwned::Small(!i).demote(),
+            PyInt::Big(b)   => PyIntOwned::Big(!b.clone()).demote(),
+        }
+    }
+
+    pub fn shl(self, other: Self) -> Result<PyIntOwned, ArithError> {
+        let shift = pyint_to_shift_amount(other)?;
+        if let PyInt::Small(a) = self
+            && let Ok(s) = u32::try_from(shift) {
+            if let Some(r) = a.checked_shl(s) {
+                // Check the result also fits i64 (shl by 63 can blow up sign).
+                if (r >> s) == a {
+                    return Ok(PyIntOwned::Small(r).demote());
+                }
+            }
+        }
+        Ok(PyIntOwned::Big(self.to_owned_bigint() << shift).demote())
+    }
+
+    pub fn shr(self, other: Self) -> Result<PyIntOwned, ArithError> {
+        let shift = pyint_to_shift_amount(other)?;
+        if let PyInt::Small(a) = self {
+            // Python int shr is arithmetic (sign-extending). For shifts >= 64,
+            // the result is 0 for non-negative, -1 for negative.
+            let s = shift.min(63) as u32;
+            return Ok(PyIntOwned::Small(a >> s).demote());
+        }
+        Ok(PyIntOwned::Big(self.to_owned_bigint() >> shift).demote())
+    }
+
+    pub fn cmp(self, other: Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (PyInt::Small(a), PyInt::Small(b)) => a.cmp(&b),
+            (PyInt::Big(a), PyInt::Big(b))     => a.cmp(b),
+            (PyInt::Small(a), PyInt::Big(b))   => BigInt::from(a).cmp(b),
+            (PyInt::Big(a), PyInt::Small(b))   => a.cmp(&BigInt::from(b)),
+        }
+    }
+
+    pub fn eq(self, other: Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+
+    /// CPython-compatible int hash. Returns i64 so the `-2` sentinel
+    /// substitution is expressible. Optimized Mersenne reduction —
+    /// allocation-free, division-free.
+    #[inline]
+    pub fn hash(&self) -> i64 {
+        match self {
+            PyInt::Small(i) => hash_small_i64(*i),
+            PyInt::Big(b)   => hash_bigint(b),
+        }
+    }
+}
+
+impl PyIntOwned {
+    /// Upholds the demote invariant: small magnitudes always Small.
+    pub fn demote(self) -> Self {
+        match self {
+            PyIntOwned::Small(i) if !fits_in_i48(i) => PyIntOwned::Big(BigInt::from(i)),
+            PyIntOwned::Big(b) => match bigint_to_i48(&b) {
+                Some(i) => PyIntOwned::Small(i),
+                None    => PyIntOwned::Big(b),
+            },
+            small => small,
+        }
+    }
+
+    /// Convert back into a Value, allocating a HeapObject::BigInt if the
+    /// result didn't fit in i48. Always upholds the demote invariant.
+    pub fn into_value(self, heap: &mut Vec<HeapObject>) -> Value {
+        match self.demote() {
+            PyIntOwned::Small(i) => Value::small_int_unchecked(i),
+            PyIntOwned::Big(b) => {
+                let idx = heap.len();
+                heap.push(HeapObject::BigInt(b));
+                Value::object_ref(idx)
+            }
+        }
+    }
+
+    /// View as a borrowed PyInt without allocating.
+    pub fn as_view(&self) -> PyInt<'_> {
+        match self {
+            PyIntOwned::Small(i) => PyInt::Small(*i),
+            PyIntOwned::Big(b)   => PyInt::Big(b),
+        }
+    }
+}
+
+// ---------- shared helpers ----------
+
+#[inline]
+fn floor_div_i64(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    let r = a % b;
+    if (r != 0) && ((r < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+#[inline]
+fn floor_mod_i64(a: i64, b: i64) -> i64 {
+    let r = a % b;
+    if (r != 0) && ((r < 0) != (b < 0)) { r + b } else { r }
+}
+
+fn pyint_to_shift_amount(p: PyInt<'_>) -> Result<usize, ArithError> {
+    match p {
+        PyInt::Small(s) => {
+            if s < 0 { Err(ArithError::NegativeShift) }
+            else { Ok(s as usize) }
+        }
+        PyInt::Big(b) => {
+            if b.sign() == Sign::Minus { return Err(ArithError::NegativeShift); }
+            usize::try_from(b).map_err(|_| ArithError::NegativeShift)
+        }
+    }
+}
+
+/// Truediv lives outside PyInt because it always returns float.
+pub fn pyint_truediv(a: PyInt<'_>, b: PyInt<'_>) -> Result<f64, ArithError> {
+    let bf = b.to_f64();
+    if bf == 0.0 { return Err(ArithError::DivByZero); }
+    Ok(a.to_f64() / bf)
+}
+
+// ---------- Mersenne hash (allocation-free, division-free) ----------
+
+const PYHASH_BITS:    u32 = 61;
+const PYHASH_MODULUS: u64 = (1u64 << PYHASH_BITS) - 1; // 2^61 - 1
+
+#[inline(always)]
+const fn mod_mersenne_u64(x: u64) -> u64 {
+    let r = (x & PYHASH_MODULUS) + (x >> PYHASH_BITS);
+    if r >= PYHASH_MODULUS { r - PYHASH_MODULUS } else { r }
+}
+
+#[inline(always)]
+const fn mod_mersenne_u128(mut x: u128) -> u64 {
+    x = (x & PYHASH_MODULUS as u128) + (x >> PYHASH_BITS);
+    x = (x & PYHASH_MODULUS as u128) + (x >> PYHASH_BITS);
+    let r = x as u64;
+    if r >= PYHASH_MODULUS { r - PYHASH_MODULUS } else { r }
+}
+
+#[inline(always)]
+fn hash_small_i64(i: i64) -> i64 {
+    let abs    = i.unsigned_abs();
+    let h      = mod_mersenne_u64(abs) as i64;
+    let signed = if i < 0 { -h } else { h };
+    signed - ((signed == -1) as i64) // -1 → -2, branchless
+}
+
+#[inline(never)]
+#[cold]
+fn hash_bigint(b: &BigInt) -> i64 {
+    let mut h:    u64 = 0;
+    let mut pow8: u64 = 1; // 8^i mod P
+    for limb in b.iter_u64_digits() {
+        let limb_mod = mod_mersenne_u64(limb);
+        let term     = mod_mersenne_u128(limb_mod as u128 * pow8 as u128);
+        h            = mod_mersenne_u64(h + term);
+        pow8         = mod_mersenne_u64(pow8 << 3);
+    }
+    let signed = if b.sign() == Sign::Minus { -(h as i64) } else { h as i64 };
+    signed - ((signed == -1) as i64)
 }
 
 /// Construct a tagged NaN-boxed value from a 3-bit tag and 48-bit payload.
@@ -996,5 +1420,271 @@ mod tests {
         assert!(!Value::bool_val(true).is_pyint(&heap));
         assert!(!Value::float(1.0).is_pyint(&heap));
         assert!(!Value::none().is_pyint(&heap));
+    }
+
+    // ---------- M2 commit 2: PyInt arithmetic ----------
+
+    fn small(i: i64) -> PyInt<'static> { PyInt::Small(i) }
+
+    fn as_i64(p: &PyIntOwned) -> Option<i64> {
+        match p {
+            PyIntOwned::Small(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    fn as_big(p: &PyIntOwned) -> Option<&BigInt> {
+        match p {
+            PyIntOwned::Big(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pyint_add_small_no_overflow() {
+        assert_eq!(as_i64(&small(3).add(small(4))), Some(7));
+        assert_eq!(as_i64(&small(-5).add(small(2))), Some(-3));
+    }
+
+    #[test]
+    fn pyint_add_promotes_to_bigint_on_i64_overflow() {
+        let r = small(i64::MAX).add(small(1));
+        let b = as_big(&r).expect("expected Big");
+        assert_eq!(b, &(BigInt::from(i64::MAX) + 1));
+    }
+
+    #[test]
+    fn pyint_add_promotes_to_bigint_on_i48_overflow() {
+        // 2^46 + 2^46 = 2^47 — fits in i64 but NOT in i48; must Big.
+        let r = small(1i64 << 46).add(small(1i64 << 46));
+        assert!(as_big(&r).is_some(), "i48 overflow must produce Big");
+    }
+
+    #[test]
+    fn pyint_sub_demotes_on_result_fit() {
+        // BigInt - BigInt where result fits in i48 → demoted to Small.
+        let big = BigInt::from(1u64) << 100;
+        let r = PyInt::Big(&big).sub(PyInt::Big(&big));
+        assert_eq!(as_i64(&r), Some(0));
+    }
+
+    #[test]
+    fn pyint_mul_overflow() {
+        let r = small(i64::MAX).mul(small(2));
+        let b = as_big(&r).expect("Big");
+        assert_eq!(b, &(BigInt::from(i64::MAX) * 2));
+    }
+
+    #[test]
+    fn pyint_floordiv_python_semantics() {
+        // Python: -7 // 2 == -4 (not -3 as Rust gives).
+        assert_eq!(as_i64(&small(-7).floordiv(small(2)).unwrap()), Some(-4));
+        assert_eq!(as_i64(&small(7).floordiv(small(-2)).unwrap()), Some(-4));
+        assert_eq!(as_i64(&small(7).floordiv(small(2)).unwrap()), Some(3));
+        assert_eq!(as_i64(&small(-7).floordiv(small(-2)).unwrap()), Some(3));
+    }
+
+    #[test]
+    fn pyint_mod_python_semantics() {
+        // Python: result has same sign as divisor.
+        assert_eq!(as_i64(&small(-7).mod_(small(2)).unwrap()), Some(1));
+        assert_eq!(as_i64(&small(7).mod_(small(-2)).unwrap()), Some(-1));
+        assert_eq!(as_i64(&small(7).mod_(small(2)).unwrap()), Some(1));
+    }
+
+    #[test]
+    fn pyint_div_by_zero() {
+        assert_eq!(small(1).floordiv(small(0)).unwrap_err(), ArithError::DivByZero);
+        assert_eq!(small(1).mod_(small(0)).unwrap_err(), ArithError::DivByZero);
+        assert_eq!(small(1).divmod(small(0)).unwrap_err(), ArithError::DivByZero);
+    }
+
+    #[test]
+    fn pyint_divmod_pair() {
+        let (q, r) = small(-7).divmod(small(2)).unwrap();
+        assert_eq!(as_i64(&q), Some(-4));
+        assert_eq!(as_i64(&r), Some(1));
+    }
+
+    #[test]
+    fn pyint_pow_positive_exp() {
+        match small(2).pow(small(10)) {
+            PyPowResult::Int(o) => assert_eq!(as_i64(&o), Some(1024)),
+            other => panic!("expected Int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pyint_pow_big_result() {
+        // 2**100 doesn't fit in i64, must be Big.
+        match small(2).pow(small(100)) {
+            PyPowResult::Int(o) => {
+                let b = as_big(&o).expect("Big");
+                assert_eq!(b, &(BigInt::from(1u64) << 100));
+            }
+            other => panic!("expected Int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pyint_pow_negative_exp_returns_float() {
+        match small(2).pow(small(-3)) {
+            PyPowResult::Float(f) => assert!((f - 0.125).abs() < 1e-10),
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pyint_pow_mod() {
+        // 3**10 mod 7 = 59049 mod 7 = 4
+        let r = small(3).pow_mod(small(10), small(7)).unwrap();
+        assert_eq!(as_i64(&r), Some(4));
+    }
+
+    #[test]
+    fn pyint_pow_mod_negative_exp_errors() {
+        assert_eq!(small(2).pow_mod(small(-1), small(7)).unwrap_err(), ArithError::NegativePower);
+    }
+
+    #[test]
+    fn pyint_neg() {
+        assert_eq!(as_i64(&small(5).neg()), Some(-5));
+        assert_eq!(as_i64(&small(-5).neg()), Some(5));
+        // i64::MIN.neg() overflows i64; PyInt promotes to Big and computes correctly.
+        let r = small(i64::MIN).neg();
+        let b = as_big(&r).expect("Big");
+        assert_eq!(b, &-BigInt::from(i64::MIN));
+    }
+
+    #[test]
+    fn pyint_abs() {
+        assert_eq!(as_i64(&small(5).abs()), Some(5));
+        assert_eq!(as_i64(&small(-5).abs()), Some(5));
+    }
+
+    #[test]
+    fn pyint_bitwise() {
+        assert_eq!(as_i64(&small(0b1100).and_(small(0b1010))), Some(0b1000));
+        assert_eq!(as_i64(&small(0b1100).or_(small(0b1010))), Some(0b1110));
+        assert_eq!(as_i64(&small(0b1100).xor_(small(0b1010))), Some(0b0110));
+        assert_eq!(as_i64(&small(5).invert()), Some(-6)); // ~5 == -6
+    }
+
+    #[test]
+    fn pyint_shifts() {
+        assert_eq!(as_i64(&small(1).shl(small(10)).unwrap()), Some(1024));
+        assert_eq!(as_i64(&small(1024).shr(small(10)).unwrap()), Some(1));
+        // 1 << 100 → BigInt
+        let r = small(1).shl(small(100)).unwrap();
+        let b = as_big(&r).expect("Big");
+        assert_eq!(b, &(BigInt::from(1u64) << 100));
+    }
+
+    #[test]
+    fn pyint_shift_negative_errors() {
+        assert_eq!(small(1).shl(small(-1)).unwrap_err(), ArithError::NegativeShift);
+        assert_eq!(small(1).shr(small(-1)).unwrap_err(), ArithError::NegativeShift);
+    }
+
+    #[test]
+    fn pyint_cmp_and_eq_cross_representation() {
+        let big_7 = BigInt::from(7);
+        assert!(small(7).eq(PyInt::Big(&big_7)));
+        assert!(PyInt::Big(&big_7).eq(small(7)));
+        assert!(small(5).cmp(small(7)) == std::cmp::Ordering::Less);
+        assert!(PyInt::Big(&big_7).cmp(small(5)) == std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn pyint_to_f64() {
+        assert_eq!(small(3).to_f64(), 3.0);
+        assert_eq!(small(-7).to_f64(), -7.0);
+        let huge = BigInt::from(2u64).pow(2000); // way past f64 range
+        assert!(PyInt::Big(&huge).to_f64().is_infinite());
+    }
+
+    #[test]
+    fn pyint_truediv_basic() {
+        assert_eq!(pyint_truediv(small(7), small(2)).unwrap(), 3.5);
+        assert_eq!(pyint_truediv(small(1), small(0)).unwrap_err(), ArithError::DivByZero);
+    }
+
+    #[test]
+    fn pyint_from_value_or_bool_widens() {
+        let heap: Vec<HeapObject> = Vec::new();
+        let pi = PyInt::from_value_or_bool(Value::bool_val(true), &heap).unwrap();
+        assert!(matches!(pi, PyInt::Small(1)));
+        let pi = PyInt::from_value_or_bool(Value::bool_val(false), &heap).unwrap();
+        assert!(matches!(pi, PyInt::Small(0)));
+    }
+
+    #[test]
+    fn pyint_owned_into_value_demotes() {
+        let mut heap = Vec::new();
+        // BigInt that fits in i48 → small int Value, no heap entry.
+        let v = PyIntOwned::Big(BigInt::from(42)).into_value(&mut heap);
+        assert!(v.is_int());
+        assert_eq!(v.as_int(), Some(42));
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn pyint_owned_into_value_keeps_big() {
+        let mut heap = Vec::new();
+        let big: BigInt = BigInt::from(1u64) << 100;
+        let v = PyIntOwned::Big(big.clone()).into_value(&mut heap);
+        assert!(v.is_object());
+        assert_eq!(heap.len(), 1);
+        assert!(matches!(&heap[0], HeapObject::BigInt(b) if b == &big));
+    }
+
+    // ---------- Hash: pinned test corpus (Mersenne reduction) ----------
+
+    #[test]
+    fn hash_small_int_corpus() {
+        // From Section 4 spec table.
+        assert_eq!(small(0).hash(), 0);
+        assert_eq!(small(1).hash(), 1);
+        assert_eq!(small(-1).hash(), -2); // sentinel substitution
+        assert_eq!(small((1i64 << 47) - 1).hash(), (1i64 << 47) - 1); // i48 max
+        assert_eq!(small(-(1i64 << 47)).hash(), -(1i64 << 47)); // i48 min
+    }
+
+    #[test]
+    fn hash_bigint_corpus() {
+        // 2^61 - 1 == the modulus → 0
+        let p_minus_1 = (BigInt::from(1u64) << 61) - 1;
+        assert_eq!(PyInt::Big(&p_minus_1).hash(), 0);
+
+        // 2^61 → 1
+        let p_plus_1 = BigInt::from(1u64) << 61;
+        assert_eq!(PyInt::Big(&p_plus_1).hash(), 1);
+
+        // -(2^61) → -2 (|x| mod P = 1, sign flip → -1, sentinel → -2)
+        let positive_p_plus_1: BigInt = BigInt::from(1u64) << 61;
+        let neg_p_plus_1: BigInt = -positive_p_plus_1;
+        assert_eq!(PyInt::Big(&neg_p_plus_1).hash(), -2);
+
+        // 2^62 + 1 → 3 ((2P + 1) ≡ 0 + 2 + 1 ≡ 3 mod P)
+        let two_p_plus_1: BigInt = (BigInt::from(1u64) << 62) + 1;
+        assert_eq!(PyInt::Big(&two_p_plus_1).hash(), 3);
+    }
+
+    #[test]
+    fn hash_never_returns_minus_one() {
+        // Any input that mathematically maps to -1 must come out as -2.
+        for x in [-1i64, -((1u64 << 61) as i64 + 1)] {
+            let h = small(x).hash();
+            assert_ne!(h, -1, "hash({x}) returned the forbidden -1");
+        }
+    }
+
+    #[test]
+    fn mod_mersenne_u64_correctness() {
+        // Spot-check against straightforward % to confirm the optimization.
+        for x in [0u64, 1, PYHASH_MODULUS - 1, PYHASH_MODULUS, PYHASH_MODULUS + 1,
+                  u64::MAX, 1u64 << 61, (1u64 << 61) + 7] {
+            assert_eq!(mod_mersenne_u64(x), x % PYHASH_MODULUS, "x={x}");
+        }
     }
 }

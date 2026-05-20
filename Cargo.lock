@@ -41,4 +41,6 @@ name = "python-rs"
 version = "0.1.2"
 dependencies = [
  "num-bigint",
+ "num-integer",
+ "num-traits",
 ]
