@@ -1077,6 +1077,25 @@ impl HeapObject {
     }
 }
 
+/// A Rust-implemented Python module. Each cmodule lives in its own file
+/// under `src/cmodules/` and exposes itself via this trait. The import
+/// machinery indexes the registry by `name()`; `build_globals()` is called
+/// exactly once per VM run when the module is first imported.
+pub trait CModule {
+    /// Fully-qualified Python import name. M3 supports top-level only:
+    /// "sys", "_io", "math". Dotted submodule cmodules are out of scope.
+    fn name(&self) -> &'static str;
+
+    /// Build the module's namespace. Called the first time the module is
+    /// imported. Receives a mutable heap so the module can allocate
+    /// strings, tuples, functions, etc.
+    ///
+    /// Implementations MUST NOT cache the `heap` reference — the heap may
+    /// reallocate between calls. Build every Value during this call, drop
+    /// the reference, return the populated globals.
+    fn build_globals(&self, heap: &mut Vec<HeapObject>) -> HashMap<String, Value>;
+}
+
 /// Fetch a `&str` from heap at the given index. Used wherever we've
 /// already verified the Value carries a str ref via `as_str_ref()` and
 /// want the actual string content. Returns an internal RuntimeError if

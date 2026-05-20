@@ -1,6 +1,7 @@
 mod ast;
 mod builtins;
 mod bytecode;
+mod cmodules;
 mod compiler;
 mod error;
 mod lexer;
