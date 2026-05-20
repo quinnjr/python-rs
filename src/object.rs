@@ -1127,6 +1127,7 @@ pub enum BuiltinId {
     Bool,
     Float,
     Abs,
+    Divmod,
     Min,
     Max,
     Isinstance,

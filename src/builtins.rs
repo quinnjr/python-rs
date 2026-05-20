@@ -1,6 +1,7 @@
 /// Built-in functions: print, range, len, type, int, str, bool, isinstance, super, etc.
 use crate::error::PythonError;
-use crate::object::{BuiltinId, ExceptionType, HeapObject, Value, value_hash};
+use crate::object::{BuiltinId, ExceptionType, HeapObject, PyInt, Value, value_hash};
+use num_bigint::BigInt;
 use std::collections::HashMap;
 
 /// Register all built-in functions into globals.
@@ -15,6 +16,7 @@ pub fn register_builtins(globals: &mut HashMap<String, Value>, heap: &mut Vec<He
         ("bool", BuiltinId::Bool),
         ("float", BuiltinId::Float),
         ("abs", BuiltinId::Abs),
+        ("divmod", BuiltinId::Divmod),
         ("min", BuiltinId::Min),
         ("max", BuiltinId::Max),
         ("isinstance", BuiltinId::Isinstance),
@@ -82,9 +84,10 @@ pub fn call_builtin(
         BuiltinId::Str => builtin_str(args, heap),
         BuiltinId::Bool => builtin_bool(args, heap),
         BuiltinId::Float => builtin_float(args, heap),
-        BuiltinId::Abs => builtin_abs(args),
-        BuiltinId::Min => builtin_min(args),
-        BuiltinId::Max => builtin_max(args),
+        BuiltinId::Abs => builtin_abs(args, heap),
+        BuiltinId::Divmod => builtin_divmod(args, heap),
+        BuiltinId::Min => builtin_min(args, heap),
+        BuiltinId::Max => builtin_max(args, heap),
         BuiltinId::Isinstance => builtin_isinstance(args, heap),
         BuiltinId::Issubclass => builtin_issubclass(args, heap),
         BuiltinId::Super => builtin_super(args, globals),
@@ -231,7 +234,7 @@ fn builtin_type(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyt
     Ok(Value::str_ref(heap_idx))
 }
 
-fn builtin_int(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
+fn builtin_int(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
     if args.is_empty() {
         return Ok(Value::small_int_unchecked(0));
     }
@@ -239,21 +242,50 @@ fn builtin_int(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError
         return Err(PythonError::runtime("int() takes at most one argument", 0));
     }
     let val = args[0];
-    if let Some(i) = val.as_int() {
-        Ok(Value::small_int_unchecked(i))
-    } else if let Some(f) = val.as_float() {
-        Ok(Value::small_int_unchecked(f as i64))
-    } else if let Some(b) = val.as_bool() {
-        Ok(Value::small_int_unchecked(b as i64))
-    } else if let Some(idx) = val.as_str_ref() {
-        let s = heap[idx].as_str().unwrap();
-        let i: i64 = s.trim().parse().map_err(|_| {
+    // Already an int (small or big) or bool — pass through unchanged for ints,
+    // widen bool to small int.
+    if val.is_int() {
+        return Ok(val);
+    }
+    if let Some(idx) = val.as_object_ref()
+        && matches!(heap[idx], HeapObject::BigInt(_)) {
+        return Ok(val);
+    }
+    if let Some(b) = val.as_bool() {
+        return Ok(Value::small_int_unchecked(b as i64));
+    }
+    if let Some(f) = val.as_float() {
+        // float → int truncates toward zero. For huge floats this can produce
+        // a BigInt; for inf/nan, Python raises (we surface as a runtime error).
+        if !f.is_finite() {
+            return Err(PythonError::runtime(
+                "cannot convert float infinity/NaN to integer", 0,
+            ));
+        }
+        // Floats up to ~9e18 fit in i64; beyond that route through BigInt.
+        if f.abs() < (i64::MAX as f64) {
+            return Ok(Value::from_i64(f.trunc() as i64, heap));
+        }
+        // Use the string round-trip — slow but correct for the rare big-float case.
+        let truncated = f.trunc();
+        let s = format!("{truncated:.0}");
+        let b: BigInt = s.parse().map_err(|_| {
+            PythonError::runtime("cannot convert float to integer", 0)
+        })?;
+        return Ok(Value::from_bigint(b, heap));
+    }
+    if let Some(idx) = val.as_str_ref() {
+        let s = heap[idx].as_str().unwrap().trim();
+        // Try i64 first, fall back to BigInt — same dispatch pattern as the lexer.
+        if let Ok(i) = s.parse::<i64>() {
+            return Ok(Value::from_i64(i, heap));
+        }
+        let b: BigInt = s.parse().map_err(|_| {
             PythonError::runtime(format!("invalid literal for int() with base 10: '{s}'"), 0)
         })?;
-        Ok(Value::small_int_unchecked(i))
-    } else {
-        Err(PythonError::runtime("int() argument must be a string or number", 0))
+        return Ok(Value::from_bigint(b, heap));
     }
+    Err(PythonError::runtime("int() argument must be a string or number", 0))
 }
 
 fn builtin_str(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
@@ -298,58 +330,91 @@ fn builtin_float(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonErr
     }
     let val = args[0];
     if let Some(f) = val.as_float() {
-        Ok(Value::float(f))
-    } else if let Some(i) = val.as_int() {
-        Ok(Value::float(i as f64))
-    } else if let Some(idx) = val.as_str_ref() {
+        return Ok(Value::float(f));
+    }
+    // Int (small or big) or bool — go through PyInt::to_f64 (BigInt that
+    // overflows f64's exponent collapses to inf, matching CPython).
+    if let Some(pi) = PyInt::from_value_or_bool(val, heap) {
+        return Ok(Value::float(pi.to_f64()));
+    }
+    if let Some(idx) = val.as_str_ref() {
         let s = heap[idx].as_str().unwrap();
         let f: f64 = s.trim().parse().map_err(|_| {
             PythonError::runtime(format!("could not convert string to float: '{s}'"), 0)
         })?;
-        Ok(Value::float(f))
-    } else {
-        Err(PythonError::runtime("float() argument must be a string or number", 0))
+        return Ok(Value::float(f));
     }
+    Err(PythonError::runtime("float() argument must be a string or number", 0))
 }
 
-fn builtin_abs(args: &[Value]) -> Result<Value, PythonError> {
+fn builtin_abs(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
     if args.len() != 1 {
         return Err(PythonError::runtime("abs() takes exactly one argument", 0));
     }
     let val = args[0];
-    if let Some(i) = val.as_int() {
-        Ok(Value::small_int_unchecked(i.abs()))
-    } else if let Some(f) = val.as_float() {
-        Ok(Value::float(f.abs()))
-    } else {
-        Err(PythonError::runtime("bad operand type for abs()", 0))
+    if let Some(pi) = PyInt::from_value_or_bool(val, heap) {
+        return Ok(pi.abs().into_value(heap));
+    }
+    if let Some(f) = val.as_float() {
+        return Ok(Value::float(f.abs()));
+    }
+    Err(PythonError::runtime("bad operand type for abs()", 0))
+}
+
+fn builtin_divmod(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
+    if args.len() != 2 {
+        return Err(PythonError::runtime("divmod() takes exactly two arguments", 0));
+    }
+    let a = PyInt::from_value_or_bool(args[0], heap);
+    let b = PyInt::from_value_or_bool(args[1], heap);
+    match (a, b) {
+        (Some(ai), Some(bi)) => {
+            let (q, r) = ai.divmod(bi)
+                .map_err(|_| PythonError::runtime("integer division or modulo by zero", 0))?;
+            let qv = q.into_value(heap);
+            let rv = r.into_value(heap);
+            let tuple_idx = heap.len();
+            heap.push(HeapObject::Tuple(vec![qv, rv]));
+            Ok(Value::object_ref(tuple_idx))
+        }
+        _ => Err(PythonError::runtime("divmod() requires two integer arguments", 0)),
     }
 }
 
-fn builtin_min(args: &[Value]) -> Result<Value, PythonError> {
+fn builtin_min(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
     if args.len() < 2 {
         return Err(PythonError::runtime("min() requires at least 2 arguments", 0));
     }
     let mut result = args[0];
     for arg in &args[1..] {
-        if let (Some(a), Some(b)) = (arg.as_int(), result.as_int()) && a < b {
-            result = *arg;
-        } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64()) && a < b {
+        if let (Some(a), Some(b)) = (
+            PyInt::from_value_or_bool(*arg, heap),
+            PyInt::from_value_or_bool(result, heap),
+        ) {
+            if a.cmp(b) == std::cmp::Ordering::Less { result = *arg; }
+        } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64())
+            && a < b
+        {
             result = *arg;
         }
     }
     Ok(result)
 }
 
-fn builtin_max(args: &[Value]) -> Result<Value, PythonError> {
+fn builtin_max(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
     if args.len() < 2 {
         return Err(PythonError::runtime("max() requires at least 2 arguments", 0));
     }
     let mut result = args[0];
     for arg in &args[1..] {
-        if let (Some(a), Some(b)) = (arg.as_int(), result.as_int()) && a > b {
-            result = *arg;
-        } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64()) && a > b {
+        if let (Some(a), Some(b)) = (
+            PyInt::from_value_or_bool(*arg, heap),
+            PyInt::from_value_or_bool(result, heap),
+        ) {
+            if a.cmp(b) == std::cmp::Ordering::Greater { result = *arg; }
+        } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64())
+            && a > b
+        {
             result = *arg;
         }
     }

@@ -2495,4 +2495,70 @@ print(fib(10))
         let out = run_and_capture("print(140737488355328)\n");
         assert_eq!(out, vec!["140737488355328"]);
     }
+
+    // ---------- M2 commit 5: builtin migrations ----------
+
+    #[test]
+    fn int_builtin_parses_bigint_string() {
+        let out = run_and_capture("print(int(\"99999999999999999999\"))\n");
+        assert_eq!(out, vec!["99999999999999999999"]);
+    }
+
+    #[test]
+    fn int_builtin_passes_through_bigint() {
+        let out = run_and_capture("x = 100 ** 10\nprint(int(x))\n");
+        assert_eq!(out, vec!["100000000000000000000"]);
+    }
+
+    #[test]
+    fn int_builtin_widens_bool() {
+        let out = run_and_capture("print(int(True))\nprint(int(False))\n");
+        assert_eq!(out, vec!["1", "0"]);
+    }
+
+    #[test]
+    fn float_builtin_converts_bigint_to_inf_for_huge() {
+        // 2**2000 is way past f64's exponent range; Python's float() returns inf.
+        let out = run_and_capture("print(float(2 ** 2000))\n");
+        assert_eq!(out, vec!["inf"]);
+    }
+
+    #[test]
+    fn float_builtin_converts_small_bigint_exactly() {
+        // 10^15 is exactly representable in f64 (52-bit mantissa is enough).
+        let out = run_and_capture("print(float(10 ** 15))\n");
+        assert_eq!(out, vec!["1000000000000000.0"]);
+    }
+
+    #[test]
+    fn abs_builtin_on_bigint() {
+        let out = run_and_capture("print(abs(-(100 ** 10)))\n");
+        assert_eq!(out, vec!["100000000000000000000"]);
+    }
+
+    #[test]
+    fn divmod_builtin_python_semantics() {
+        // divmod(-7, 2) == (-4, 1) — floor div + sign-of-divisor mod.
+        let out = run_and_capture("print(divmod(-7, 2))\n");
+        assert_eq!(out, vec!["(-4, 1)"]);
+    }
+
+    #[test]
+    fn divmod_builtin_with_bigint() {
+        // divmod(10**20, 3) — Python: (33333333333333333333, 1)
+        let out = run_and_capture("print(divmod(10 ** 20, 3))\n");
+        assert_eq!(out, vec!["(33333333333333333333, 1)"]);
+    }
+
+    #[test]
+    fn min_max_handle_bigint() {
+        let out = run_and_capture("print(min(100 ** 10, 5))\nprint(max(100 ** 10, 5))\n");
+        assert_eq!(out, vec!["5", "100000000000000000000"]);
+    }
+
+    #[test]
+    fn str_builtin_renders_bigint_decimal() {
+        let out = run_and_capture("print(str(2 ** 100))\n");
+        assert_eq!(out, vec!["1267650600228229401496703205376"]);
+    }
 }
