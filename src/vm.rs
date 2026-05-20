@@ -10,15 +10,22 @@ use crate::object::{
 use std::collections::HashMap;
 
 const MAX_STACK: usize = 256;
-const MAX_LOCALS: usize = 128;
+/// Cap on locals slot count — same as the previous inline array size.
+/// New frames allocate exactly `code.num_locals` slots, so functions
+/// with a handful of locals use ~16 slots instead of always 128.
+const MAX_LOCALS_FALLBACK: usize = 128;
 
 /// A single execution frame.
 struct Frame {
     code_index: usize,
     ip: usize,
-    stack: [Value; MAX_STACK],
+    /// Operand stack. Boxed so each Frame is 8 bytes here (pointer)
+    /// instead of 2048 bytes inline — cuts per-frame-push memcpy cost.
+    stack: Box<[Value]>,
     sp: usize,
-    locals: [Value; MAX_LOCALS],
+    /// Local variable slots. Sized exactly to the code object's num_locals
+    /// at frame construction — typical functions use 4–16 locals, not 128.
+    locals: Box<[Value]>,
     /// Heap indices of cell objects for closures.
     cells: Vec<usize>,
     /// If this frame belongs to a generator, its heap index.
@@ -36,12 +43,23 @@ struct Frame {
 
 impl Frame {
     fn new(code_index: usize) -> Self {
+        // Fallback constructor used by tests and bootstrap before code
+        // objects are loaded. Real frames go through `new_sized` to right-size
+        // locals from the actual code object.
+        Self::new_sized(code_index, MAX_LOCALS_FALLBACK)
+    }
+
+    /// Construct a frame with locals sized to exactly `num_locals`. Stack
+    /// stays at the global MAX_STACK ceiling (computed-stack-depth is a
+    /// future optimization).
+    fn new_sized(code_index: usize, num_locals: usize) -> Self {
+        let locals_n = num_locals.max(1);
         Self {
             code_index,
             ip: 0,
-            stack: [Value::none(); MAX_STACK],
+            stack: vec![Value::none(); MAX_STACK].into_boxed_slice(),
             sp: 0,
-            locals: [Value::none(); MAX_LOCALS],
+            locals: vec![Value::none(); locals_n].into_boxed_slice(),
             cells: Vec::new(),
             generator_idx: None,
             init_instance: None,
@@ -49,11 +67,11 @@ impl Frame {
         }
     }
 
-    /// Construct a frame that runs in a specific module's namespace.
-    /// Used for module-body execution and function calls (where the
-    /// function carries its defining module).
-    fn new_in_module(code_index: usize, module_idx: Option<usize>) -> Self {
-        let mut f = Self::new(code_index);
+    /// Construct a frame for a function call or module body. `num_locals`
+    /// comes from the target code object so locals are right-sized.
+    /// `module_idx` is the function's defining module (None for top-level).
+    fn new_in_module(code_index: usize, num_locals: usize, module_idx: Option<usize>) -> Self {
+        let mut f = Self::new_sized(code_index, num_locals);
         f.module_idx = module_idx;
         f
     }
@@ -642,7 +660,7 @@ impl VM {
                                     });
                                     self.frames[frame_idx].push(Value::object_ref(gen_idx));
                                 } else {
-                                    let mut new_frame = Frame::new_in_module(func_code_index, func_module_idx);
+                                    let mut new_frame = Frame::new_in_module(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
                                     for (i, arg) in args.iter().enumerate() {
                                         new_frame.locals[i] = *arg;
                                     }
@@ -757,7 +775,7 @@ impl VM {
                                     format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
                                 ));
                             }
-                            let mut new_frame = Frame::new_in_module(func_code_index, func_module_idx);
+                            let mut new_frame = Frame::new_in_module(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
                             for (i, arg) in args.iter().enumerate() {
                                 new_frame.locals[i] = *arg;
                             }
@@ -1299,7 +1317,7 @@ impl VM {
                     // Execute class body to get attributes — class body runs in
                     // the same module as its enclosing scope.
                     let parent_module_idx = self.frames[frame_idx].module_idx;
-                    let class_frame = Frame::new_in_module(class_co_idx, parent_module_idx);
+                    let class_frame = Frame::new_in_module(class_co_idx, self.code_objects[class_co_idx].num_locals, parent_module_idx);
                     self.frames.push(class_frame);
 
                     // Run class body
@@ -1385,7 +1403,7 @@ impl VM {
                     let mut attrs = HashMap::new();
                     let local_names = &self.code_objects[class_co_idx].local_names;
                     for (i, name) in local_names.iter().enumerate() {
-                        if i < MAX_LOCALS {
+                        if i < class_frame.locals.len() {
                             let val = class_frame.locals[i];
                             if !val.is_none() || name == "__init__" {
                                 attrs.insert(name.clone(), val);
@@ -1431,7 +1449,7 @@ impl VM {
                         let sp = frame.sp;
                         let mut locals = vec![Value::none(); self.code_objects[frame.code_index].num_locals];
                         for (i, l) in locals.iter_mut().enumerate() {
-                            if i < MAX_LOCALS {
+                            if i < frame.locals.len() {
                                 *l = frame.locals[i];
                             }
                         }
@@ -1881,7 +1899,7 @@ impl VM {
                     format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
                 ));
             }
-            let mut new_frame = Frame::new_in_module(func_code_index, func_module_idx);
+            let mut new_frame = Frame::new_in_module(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
             for (i, arg) in args.iter().enumerate() {
                 new_frame.locals[i] = *arg;
             }
@@ -1915,7 +1933,7 @@ impl VM {
                     if argc != arity {
                         return Err(PythonError::runtime("wrong number of arguments", line));
                     }
-                    let mut new_frame = Frame::new_in_module(func_code_index, func_module_idx);
+                    let mut new_frame = Frame::new_in_module(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
                     for (i, arg) in args.iter().enumerate() {
                         new_frame.locals[i] = *arg;
                     }
@@ -1972,7 +1990,7 @@ impl VM {
 
         // Restore locals
         for (i, val) in locals.iter().enumerate() {
-            if i < MAX_LOCALS {
+            if i < gen_frame.locals.len() {
                 gen_frame.locals[i] = *val;
             }
         }
@@ -2295,7 +2313,7 @@ impl VM {
         // inside the body route through heap[module_idx].globals via the
         // Frame::module_idx mechanism — no globals swap needed.
         let target_depth = self.frames.len();
-        self.frames.push(Frame::new_in_module(body_code_idx, Some(module_idx)));
+        self.frames.push(Frame::new_in_module(body_code_idx, self.code_objects[body_code_idx].num_locals, Some(module_idx)));
         let exec_result = self.execute_until_depth(target_depth);
 
         // The compiler always terminates module bodies with HALT (see
