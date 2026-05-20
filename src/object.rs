@@ -952,6 +952,10 @@ pub enum HeapObject {
         name: String,
         code_index: usize,
         arity: u8,
+        /// Defining module's heap index — globals lookups inside the
+        /// function body route through this module. None for functions
+        /// defined in the top-level main script (use VM.globals).
+        module_idx: Option<usize>,
     },
     /// Range iterator state.
     RangeIter {
@@ -1009,6 +1013,8 @@ pub enum HeapObject {
         code_index: usize,
         arity: u8,
         cells: Vec<usize>,
+        /// Defining module's heap index — see Function::module_idx.
+        module_idx: Option<usize>,
     },
     /// Exception object.
     ExceptionObj {

@@ -24,6 +24,13 @@ struct Frame {
     generator_idx: Option<usize>,
     /// If this frame is an __init__ call, the instance to return to the caller.
     init_instance: Option<Value>,
+    /// Which module's globals this frame uses for LOAD_GLOBAL / STORE_GLOBAL.
+    /// None = use VM.globals (the top-level main namespace + builtins). For
+    /// imported-module bodies, this points to the loaded HeapObject::Module
+    /// so STORE_GLOBAL writes into the module's namespace, not the main one.
+    /// For function calls, this is inherited from the function's own
+    /// module_idx (functions remember their defining module per CPython).
+    module_idx: Option<usize>,
 }
 
 impl Frame {
@@ -37,7 +44,17 @@ impl Frame {
             cells: Vec::new(),
             generator_idx: None,
             init_instance: None,
+            module_idx: None,
         }
+    }
+
+    /// Construct a frame that runs in a specific module's namespace.
+    /// Used for module-body execution and function calls (where the
+    /// function carries its defining module).
+    fn new_in_module(code_index: usize, module_idx: Option<usize>) -> Self {
+        let mut f = Self::new(code_index);
+        f.module_idx = module_idx;
+        f
     }
 
     fn push(&mut self, val: Value) {
@@ -68,7 +85,15 @@ struct ExceptionHandler {
 pub struct VM {
     frames: Vec<Frame>,
     code_objects: Vec<CodeObject>,
+    /// The top-level main script's globals namespace. Imported modules
+    /// keep their own globals on the heap; the routing in `frame_globals_*`
+    /// chooses between this and the heap based on Frame::module_idx.
     globals: HashMap<String, Value>,
+    /// Builtin functions and exception types. Looked up as the FINAL
+    /// fallback in `frame_globals_get`, after the current module's
+    /// namespace. Separated from `globals` so user code in main can't
+    /// leak names into imported modules — only true builtins do.
+    builtins: HashMap<String, Value>,
     pub heap: Vec<HeapObject>,
     pub output: Vec<String>,
     exception_stack: Vec<ExceptionHandler>,
@@ -90,6 +115,7 @@ impl VM {
             frames: Vec::with_capacity(64),
             code_objects,
             globals: HashMap::new(),
+            builtins: HashMap::new(),
             heap,
             output: Vec::new(),
             exception_stack: Vec::new(),
@@ -97,7 +123,10 @@ impl VM {
             sys_modules: HashMap::new(),
             import_system: crate::import::ImportSystem::new(),
         };
-        builtins::register_builtins(&mut vm.globals, &mut vm.heap);
+        // Builtins live in their own namespace so imported modules see them
+        // (via frame_globals_get's fallback) but DON'T see user-defined main
+        // globals — module isolation per CPython semantics.
+        builtins::register_builtins(&mut vm.builtins, &mut vm.heap);
         vm.bootstrap_sys();
         vm
     }
@@ -106,6 +135,37 @@ impl VM {
     /// known directory and want imports to find them.
     pub fn set_sys_path(&mut self, path: Vec<std::path::PathBuf>) {
         self.import_system.set_sys_path(path);
+    }
+
+    /// Read a global name with the __builtins__-chain lookup order:
+    ///   1. Current module's globals (frame.module_idx → heap; OR main's
+    ///      VM.globals when module_idx is None).
+    ///   2. Builtins namespace (always — last fallback).
+    fn frame_globals_get(&self, frame_idx: usize, name: &str) -> Option<Value> {
+        if let Some(module_idx) = self.frames[frame_idx].module_idx {
+            if let HeapObject::Module { globals, .. } = &self.heap[module_idx]
+                && let Some(&v) = globals.get(name)
+            {
+                return Some(v);
+            }
+        } else if let Some(&v) = self.globals.get(name) {
+            return Some(v);
+        }
+        self.builtins.get(name).copied()
+    }
+
+    /// Write a global into the namespace appropriate for the given frame.
+    /// For frames running in a module, writes into the module's globals;
+    /// for the top-level main, writes into VM.globals. Builtins are never
+    /// written to from user code.
+    fn frame_globals_insert(&mut self, frame_idx: usize, name: String, value: Value) {
+        if let Some(module_idx) = self.frames[frame_idx].module_idx
+            && let HeapObject::Module { globals, .. } = &mut self.heap[module_idx]
+        {
+            globals.insert(name, value);
+        } else {
+            self.globals.insert(name, value);
+        }
     }
 
     /// Eagerly load the `sys` cmodule into sys.modules before user code
@@ -250,20 +310,22 @@ impl VM {
                     unsafe { *self.frames[frame_idx].locals.get_unchecked_mut(operand as usize) = val; }
                 }
                 op::LOAD_GLOBAL => {
-                    let name = &self.code_objects[code_index].names[operand as usize];
-                    if let Some(&val) = self.globals.get(name) {
-                        self.frames[frame_idx].push(val);
-                    } else {
-                        let msg = format!("name '{name}' is not defined");
-                        let err = PythonError::runtime(msg, line);
-                        self.try_handle_error(err, line)?;
-                        continue;
+                    let name = self.code_objects[code_index].names[operand as usize].clone();
+                    let result = self.frame_globals_get(frame_idx, &name);
+                    match result {
+                        Some(val) => self.frames[frame_idx].push(val),
+                        None => {
+                            let msg = format!("name '{name}' is not defined");
+                            let err = PythonError::runtime(msg, line);
+                            self.try_handle_error(err, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::STORE_GLOBAL => {
                     let val = self.frames[frame_idx].pop();
                     let name = self.code_objects[code_index].names[operand as usize].clone();
-                    self.globals.insert(name, val);
+                    self.frame_globals_insert(frame_idx, name, val);
                 }
                 op::LOAD_DEREF => {
                     let cell_idx = self.frames[frame_idx].cells.get(operand as usize).copied();
@@ -546,10 +608,11 @@ impl VM {
                                     Err(e) => { self.try_handle_error(e, line)?; continue; }
                                 }
                             }
-                            HeapObject::Closure { code_index, arity, cells, .. } => {
+                            HeapObject::Closure { code_index, arity, cells, module_idx, .. } => {
                                 let func_code_index = *code_index;
                                 let arity = *arity as usize;
                                 let cells = cells.clone();
+                                let func_module_idx = *module_idx;
                                 if argc != arity {
                                     let name = if let HeapObject::Closure { name, .. } = &self.heap[heap_idx] {
                                         name.clone()
@@ -577,7 +640,7 @@ impl VM {
                                     });
                                     self.frames[frame_idx].push(Value::object_ref(gen_idx));
                                 } else {
-                                    let mut new_frame = Frame::new(func_code_index);
+                                    let mut new_frame = Frame::new_in_module(func_code_index, func_module_idx);
                                     for (i, arg) in args.iter().enumerate() {
                                         new_frame.locals[i] = *arg;
                                     }
@@ -652,8 +715,8 @@ impl VM {
                             }
                         }
                     } else if let Some(heap_idx) = func_val.as_func_ref() {
-                        let (func_code_index, arity) = if let HeapObject::Function { code_index, arity, .. } = &self.heap[heap_idx] {
-                            (*code_index, *arity as usize)
+                        let (func_code_index, arity, func_module_idx) = if let HeapObject::Function { code_index, arity, module_idx, .. } = &self.heap[heap_idx] {
+                            (*code_index, *arity as usize, *module_idx)
                         } else {
                             return Err(PythonError::runtime("not a callable", line));
                         };
@@ -692,7 +755,7 @@ impl VM {
                                     format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
                                 ));
                             }
-                            let mut new_frame = Frame::new(func_code_index);
+                            let mut new_frame = Frame::new_in_module(func_code_index, func_module_idx);
                             for (i, arg) in args.iter().enumerate() {
                                 new_frame.locals[i] = *arg;
                             }
@@ -765,12 +828,16 @@ impl VM {
                         as usize;
                     let func_name = self.code_objects[func_code_index].name.clone();
                     let arity = self.code_objects[func_code_index].num_params as u8;
+                    // Capture the defining module so the function's body resolves
+                    // globals against this module when called later.
+                    let module_idx = self.frames[frame_idx].module_idx;
 
                     let heap_idx = self.heap.len();
                     self.heap.push(HeapObject::Function {
                         name: func_name,
                         code_index: func_code_index,
                         arity,
+                        module_idx,
                     });
                     self.frames[frame_idx].push(Value::func_ref(heap_idx));
                 }
@@ -782,6 +849,7 @@ impl VM {
                     let func_name = self.code_objects[func_code_index].name.clone();
                     let arity = self.code_objects[func_code_index].num_params as u8;
                     let num_free = self.code_objects[func_code_index].free_var_names.len();
+                    let module_idx = self.frames[frame_idx].module_idx;
 
                     // Pop cell indices from stack (pushed by LOAD_CLOSURE)
                     let mut cells = Vec::with_capacity(num_free);
@@ -800,6 +868,7 @@ impl VM {
                         code_index: func_code_index,
                         arity,
                         cells,
+                        module_idx,
                     });
                     self.frames[frame_idx].push(Value::object_ref(heap_idx));
                 }
@@ -1225,8 +1294,10 @@ impl VM {
                     }
                     base_indices.reverse();
 
-                    // Execute class body to get attributes
-                    let class_frame = Frame::new(class_co_idx);
+                    // Execute class body to get attributes — class body runs in
+                    // the same module as its enclosing scope.
+                    let parent_module_idx = self.frames[frame_idx].module_idx;
+                    let class_frame = Frame::new_in_module(class_co_idx, parent_module_idx);
                     self.frames.push(class_frame);
 
                     // Run class body
@@ -1265,17 +1336,18 @@ impl VM {
                                 self.frames[cf_idx].push(val);
                             }
                             op::LOAD_GLOBAL => {
-                                let name = &self.code_objects[co_index].names[co_operand as usize];
-                                if let Some(&val) = self.globals.get(name) {
-                                    self.frames[cf_idx].push(val);
-                                } else {
-                                    return Err(PythonError::runtime(format!("name '{name}' is not defined"), cl));
+                                let name = self.code_objects[co_index].names[co_operand as usize].clone();
+                                match self.frame_globals_get(cf_idx, &name) {
+                                    Some(val) => self.frames[cf_idx].push(val),
+                                    None => return Err(PythonError::runtime(
+                                        format!("name '{name}' is not defined"), cl,
+                                    )),
                                 }
                             }
                             op::STORE_GLOBAL => {
                                 let val = self.frames[cf_idx].pop();
                                 let name = self.code_objects[co_index].names[co_operand as usize].clone();
-                                self.globals.insert(name, val);
+                                self.frame_globals_insert(cf_idx, name, val);
                             }
                             op::MAKE_FUNCTION => {
                                 let code_idx_v = self.code_objects[co_index].constants[co_operand as usize];
@@ -1284,8 +1356,14 @@ impl VM {
                                     as usize;
                                 let fname = self.code_objects[fci].name.clone();
                                 let farity = self.code_objects[fci].num_params as u8;
+                                let class_module_idx = self.frames[cf_idx].module_idx;
                                 let hi = self.heap.len();
-                                self.heap.push(HeapObject::Function { name: fname, code_index: fci, arity: farity });
+                                self.heap.push(HeapObject::Function {
+                                    name: fname,
+                                    code_index: fci,
+                                    arity: farity,
+                                    module_idx: class_module_idx,
+                                });
                                 self.frames[cf_idx].push(Value::func_ref(hi));
                             }
                             op::POP_TOP => {
@@ -1774,8 +1852,8 @@ impl VM {
         let argc = args.len();
 
         if let Some(heap_idx) = func_val.as_func_ref() {
-            let (func_code_index, arity) = if let HeapObject::Function { code_index, arity, .. } = &self.heap[heap_idx] {
-                (*code_index, *arity as usize)
+            let (func_code_index, arity, func_module_idx) = if let HeapObject::Function { code_index, arity, module_idx, .. } = &self.heap[heap_idx] {
+                (*code_index, *arity as usize, *module_idx)
             } else {
                 return Err(PythonError::runtime("not a callable", line));
             };
@@ -1787,7 +1865,7 @@ impl VM {
                     format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
                 ));
             }
-            let mut new_frame = Frame::new(func_code_index);
+            let mut new_frame = Frame::new_in_module(func_code_index, func_module_idx);
             for (i, arg) in args.iter().enumerate() {
                 new_frame.locals[i] = *arg;
             }
@@ -1813,14 +1891,15 @@ impl VM {
                     let result = builtins::call_builtin(id, args, &mut self.heap, &mut self.output, &self.globals)?;
                     self.frames[caller_frame_idx].push(result);
                 }
-                HeapObject::Closure { code_index, arity, cells, .. } => {
+                HeapObject::Closure { code_index, arity, cells, module_idx, .. } => {
                     let func_code_index = *code_index;
                     let arity = *arity as usize;
                     let cells = cells.clone();
+                    let func_module_idx = *module_idx;
                     if argc != arity {
                         return Err(PythonError::runtime("wrong number of arguments", line));
                     }
-                    let mut new_frame = Frame::new(func_code_index);
+                    let mut new_frame = Frame::new_in_module(func_code_index, func_module_idx);
                     for (i, arg) in args.iter().enumerate() {
                         new_frame.locals[i] = *arg;
                     }
@@ -2042,10 +2121,11 @@ impl VM {
         if level == 0 {
             return Ok(raw_name.to_string());
         }
-        // The current module's __package__ lives in self.globals during
-        // module-body execution (because of the globals swap). For top-level
-        // scripts, __package__ is missing → relative imports error.
-        let pkg_value = self.globals.get("__package__").copied().unwrap_or(Value::none());
+        // The current module's __package__ lives in heap[module_idx].globals
+        // via the Frame::module_idx routing. For top-level scripts,
+        // module_idx is None and __package__ doesn't exist → error.
+        let frame_idx = self.frames.len() - 1;
+        let pkg_value = self.frame_globals_get(frame_idx, "__package__").unwrap_or(Value::none());
         if pkg_value.is_none() {
             return Err(PythonError::runtime(
                 "attempted relative import with no known parent package", line,
@@ -2179,13 +2259,11 @@ impl VM {
             &mut self.heap,
         )?;
 
-        // Build the module's initial globals (with builtins copied in so
-        // module-level `print`, `range`, etc. work). Once the function-module
-        // binding refactor lands, builtins will be looked up via a __builtins__
-        // chain instead of being copied wholesale.
-        let mut globals: HashMap<String, Value> = self.globals.iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        // Module globals start empty (only the dunders below are populated).
+        // Builtin lookup is handled by `frame_globals_get`'s fallback to
+        // VM.globals — module-local names take precedence, builtins are the
+        // outer layer of the __builtins__ chain.
+        let mut globals: HashMap<String, Value> = HashMap::new();
         let name_value = {
             let idx = self.heap.len();
             self.heap.push(HeapObject::Str(name.into()));
@@ -2223,20 +2301,16 @@ impl VM {
         // (partial) module from cache rather than infinite-recursing.
         self.sys_modules.insert(name.to_string(), module_value);
 
-        // Swap module globals into VM.globals so the body's STORE_NAME lands
-        // in the module namespace. Save and restore around the body.
-        let saved_globals = std::mem::take(&mut self.globals);
-        if let HeapObject::Module { globals, .. } = &mut self.heap[module_idx] {
-            std::mem::swap(&mut self.globals, globals);
-        }
-
         // Snapshot caller stack depth so we can undo whatever the body
         // pushed to it (RETURN_VALUE pushes; HALT does not — handling both).
         let target_depth = self.frames.len();
         let caller_idx = target_depth - 1;
         let caller_sp_before = self.frames[caller_idx].sp;
 
-        self.frames.push(Frame::new(body_code_idx));
+        // Module body runs in a frame rooted at this module. LOAD/STORE_GLOBAL
+        // inside the body now route through heap[module_idx].globals via the
+        // Frame::module_idx mechanism — no globals swap needed.
+        self.frames.push(Frame::new_in_module(body_code_idx, Some(module_idx)));
         let exec_result = self.execute_until_depth(target_depth);
 
         // Module bodies end with HALT, which doesn't pop the body frame.
@@ -2248,12 +2322,10 @@ impl VM {
         // Undo any value RETURN_VALUE may have pushed to the caller.
         self.frames[caller_idx].sp = caller_sp_before;
 
-        // Restore the module's globals AND the saved main globals.
-        if let HeapObject::Module { globals, initialized, .. } = &mut self.heap[module_idx] {
-            std::mem::swap(&mut self.globals, globals);
+        // Mark the module as initialized.
+        if let HeapObject::Module { initialized, .. } = &mut self.heap[module_idx] {
             *initialized = exec_result.is_ok();
         }
-        self.globals = saved_globals;
 
         exec_result?;
         Ok(module_value)
@@ -2289,11 +2361,10 @@ impl VM {
         ))
     }
 
-    /// `from module import *` — bind public names into the VM's globals.
-    /// Honors `__all__` if present; otherwise binds every name not starting
-    /// with `_`. Per-frame-globals routing will land with the Frame::globals
-    /// refactor in commit 5; for now everything goes into VM.globals (the
-    /// main module namespace).
+    /// `from module import *` — bind public names into the current frame's
+    /// namespace. Honors `__all__` if present; otherwise binds every name
+    /// not starting with `_`. Routes through `frame_globals_insert` so the
+    /// bindings land in the right module's globals.
     fn import_star_into_globals(&mut self, module: Value, line: u32) -> Result<(), PythonError> {
         let idx = module.as_object_ref().ok_or_else(|| {
             PythonError::runtime("internal: IMPORT_STAR TOS is not an object ref", line)
@@ -2315,8 +2386,9 @@ impl VM {
                 .filter(|(k, _)| !k.starts_with('_'))
                 .collect(),
         };
+        let frame_idx = self.frames.len() - 1;
         for (k, v) in bindings_to_apply {
-            self.globals.insert(k, v);
+            self.frame_globals_insert(frame_idx, k, v);
         }
         Ok(())
     }
@@ -3255,15 +3327,8 @@ print(fib(10))
 
     #[test]
     fn circular_import_completes_without_infinite_loop() {
-        // a imports b which imports a. Both bodies complete because
-        // sys.modules is populated cache-before-execute. After both
-        // bodies finish, the main script can read attributes from either.
-        //
-        // Note: reading PARTIAL attributes during the cycle (e.g., b
-        // doing `a.x` while a's body is still running) needs the
-        // Frame::module_idx refactor to route attribute access through
-        // the current-module-being-executed's live globals. Test only
-        // post-cycle access for now.
+        // a imports b which imports a. Both bodies complete via cache-
+        // before-execute. Post-cycle attributes are readable.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.py"),
             "import b\nx = 1\n").unwrap();
@@ -3274,5 +3339,81 @@ print(fib(10))
             vec![dir.path().to_path_buf()],
         );
         assert_eq!(out, vec!["1", "2"]);
+    }
+
+    // ---------- M3 commit 7: Frame::module_idx — function-module binding ----------
+
+    #[test]
+    fn circular_import_partial_attribute_access() {
+        // b's body reads a.x while a's body is still running. The
+        // Frame::module_idx routing makes the live module's globals the
+        // single source of truth, so partial-attribute access works.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"),
+            "x = 1\nimport b\ny = 2\n").unwrap();
+        std::fs::write(dir.path().join("b.py"),
+            "import a\nobserved_x = a.x\n").unwrap();
+        let out = run_with_sys_path(
+            "import a\nimport b\nprint(a.x)\nprint(a.y)\nprint(b.observed_x)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["1", "2", "1"]);
+    }
+
+    #[test]
+    fn function_in_module_resolves_module_globals() {
+        // A function defined in mymod uses a module-level helper. When
+        // the function is called from main (after `import mymod`), its
+        // global-name lookup goes to mymod's namespace, NOT main's —
+        // proving Frame::module_idx threads the right namespace through
+        // call frames.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("helpers.py"),
+            "PREFIX = 'mod-says: '\n\
+             def greet(name):\n    \
+                 return PREFIX + name\n",
+        ).unwrap();
+        let out = run_with_sys_path(
+            "import helpers\nprint(helpers.greet('world'))\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["mod-says: world"]);
+    }
+
+    #[test]
+    fn function_in_module_does_not_see_main_globals() {
+        // Inverse test: main defines a global that's NOT in the module.
+        // The module's function must NOT see it (it's not module-local).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("isolated.py"),
+            "def fetch():\n    return main_secret\n",
+        ).unwrap();
+        let err = run_with_sys_path_expect_err(
+            "main_secret = 'leaked'\nimport isolated\nprint(isolated.fetch())\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert!(
+            err.contains("name 'main_secret' is not defined"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn builtins_still_visible_inside_module_functions() {
+        // Builtins (print, len, etc.) reach into the module's function via
+        // the __builtins__ fallback chain (frame_globals_get falls back to
+        // VM.globals where builtins are registered).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("uses_builtins.py"),
+            "def make_three():\n    return len('abc')\n",
+        ).unwrap();
+        let out = run_with_sys_path(
+            "import uses_builtins\nprint(uses_builtins.make_three())\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["3"]);
     }
 }
