@@ -55,6 +55,7 @@ pub fn register_builtins(globals: &mut HashMap<String, Value>, heap: &mut Vec<He
         ("NotImplementedError", ExceptionType::NotImplementedError),
         ("AssertionError", ExceptionType::AssertionError),
         ("OverflowError", ExceptionType::OverflowError),
+        ("ImportError", ExceptionType::ImportError),
     ];
 
     for (name, et) in exc_types {

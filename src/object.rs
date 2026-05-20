@@ -401,6 +401,10 @@ fn display_object(idx: usize, heap: &[HeapObject]) -> String {
             format!("{exc_type:?}({message})")
         }
         HeapObject::BigInt(b) => b.to_string(),
+        HeapObject::Module { name, file, .. } => match file {
+            Some(path) => format!("<module '{name}' from '{path}'>"),
+            None       => format!("<module '{name}' (built-in)>"),
+        },
         HeapObject::ListIter { .. } => "<list_iterator>".to_string(),
         HeapObject::Set(items) => {
             if items.is_empty() {
@@ -1036,6 +1040,31 @@ pub enum HeapObject {
     /// overflowed the i48 small-int range, or when a source literal
     /// exceeds i64. Reached via TAG_OBJECT.
     BigInt(BigInt),
+    /// A Python module — either loaded from a .py file or built by a
+    /// Rust cmodule. The single representation for both kinds.
+    ///
+    /// Reached via TAG_OBJECT. Inserted into VM.sys_modules under its
+    /// canonical dotted name as the import system loads it.
+    Module {
+        /// Canonical dotted name, e.g. "foo.bar". Used as sys.modules key.
+        name: String,
+        /// Module namespace. Also serves as __dict__. Pre-populated with
+        /// __name__, __file__, __package__, __doc__ at construction.
+        globals: HashMap<String, Value>,
+        /// Source path for .py-loaded modules; None for cmodules and
+        /// for `__future__` / similar pseudo-modules.
+        file: Option<String>,
+        /// Parent package's dotted name, used to resolve relative imports
+        /// (`from . import x`) from inside this module's body.
+        package: Option<String>,
+        /// false during module-body execution; true after the body
+        /// returns. A re-entrant import (circular case) returns the
+        /// partially-initialized module from cache regardless.
+        initialized: bool,
+        /// Lazy cache of __all__ for `from foo import *`. Populated on
+        /// first star-import; None means "not yet probed."
+        all: Option<Vec<String>>,
+    },
 }
 
 impl HeapObject {
@@ -1087,6 +1116,7 @@ pub enum ExceptionType {
     NotImplementedError,
     AssertionError,
     OverflowError,
+    ImportError,
 }
 
 impl ExceptionType {
@@ -1116,6 +1146,7 @@ impl ExceptionType {
             Self::NotImplementedError => "NotImplementedError",
             Self::AssertionError => "AssertionError",
             Self::OverflowError => "OverflowError",
+            Self::ImportError => "ImportError",
         }
     }
 
@@ -1136,6 +1167,7 @@ impl ExceptionType {
             "NotImplementedError" => Some(Self::NotImplementedError),
             "AssertionError" | "AssertError" => Some(Self::AssertionError),
             "OverflowError" => Some(Self::OverflowError),
+            "ImportError" | "ModuleNotFoundError" => Some(Self::ImportError),
             _ => None,
         }
     }
@@ -1449,6 +1481,54 @@ mod tests {
         assert!(!Value::bool_val(true).is_pyint(&heap));
         assert!(!Value::float(1.0).is_pyint(&heap));
         assert!(!Value::none().is_pyint(&heap));
+    }
+
+    // ---------- M3 commit 1: Module + ImportError ----------
+
+    #[test]
+    fn module_heap_variant_display_for_source_file() {
+        let m = HeapObject::Module {
+            name: "mymodule".into(),
+            globals: HashMap::new(),
+            file: Some("/tmp/mymodule.py".into()),
+            package: None,
+            initialized: true,
+            all: None,
+        };
+        let heap = vec![m];
+        let v = Value::object_ref(0);
+        assert_eq!(v.display(&heap), "<module 'mymodule' from '/tmp/mymodule.py'>");
+    }
+
+    #[test]
+    fn module_heap_variant_display_for_cmodule() {
+        let m = HeapObject::Module {
+            name: "sys".into(),
+            globals: HashMap::new(),
+            file: None,
+            package: None,
+            initialized: true,
+            all: None,
+        };
+        let heap = vec![m];
+        let v = Value::object_ref(0);
+        assert_eq!(v.display(&heap), "<module 'sys' (built-in)>");
+    }
+
+    #[test]
+    fn import_error_exception_type_round_trip() {
+        assert_eq!(ExceptionType::ImportError.name(), "ImportError");
+        assert_eq!(ExceptionType::from_name("ImportError"), Some(ExceptionType::ImportError));
+        // ModuleNotFoundError (3.6+) aliases to ImportError in our 3.0.1 target.
+        assert_eq!(ExceptionType::from_name("ModuleNotFoundError"), Some(ExceptionType::ImportError));
+        assert_eq!(ExceptionType::from_name("NotAnException"), None);
+    }
+
+    #[test]
+    fn import_error_is_subtype_of_exception() {
+        assert!(ExceptionType::ImportError.is_subtype(ExceptionType::Exception));
+        assert!(ExceptionType::ImportError.is_subtype(ExceptionType::BaseException));
+        assert!(!ExceptionType::ImportError.is_subtype(ExceptionType::ValueError));
     }
 
     // ---------- M2 commit 2: PyInt arithmetic ----------
