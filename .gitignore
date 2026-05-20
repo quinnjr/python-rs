@@ -1,2 +1,7 @@
 /target
 .claude/
+
+# Python artifacts (vendored stdlib is source-only; bytecode is generated)
+__pycache__/
+*.pyc
+*.pyo

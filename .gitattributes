@@ -1,0 +1,6 @@
+# Mark the vendored CPython 3.0.1 tree so GitHub's linguist treats it as
+# third-party vendored code, not part of our language statistics or diffs.
+vendor/cpython-3.0/** linguist-vendored
+
+# Patches we apply to the vendored tree are part of our project, not vendored.
+vendor/cpython-3.0/patches/** -linguist-vendored
