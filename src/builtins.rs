@@ -871,9 +871,15 @@ fn builtin_dict_get(args: &[Value], heap: &[HeapObject]) -> Result<Value, Python
     let default = if args.len() >= 3 { args[2] } else { Value::none() };
 
     if let Some(idx) = dict.as_object_ref()
-        && let HeapObject::Dict { keys, values, .. } = &heap[idx]
+        && let HeapObject::Dict { keys, values, index_map } = &heap[idx]
     {
         let h = value_hash(key, heap);
+        if let Some(&i) = index_map.get(&h)
+            && i < keys.len()
+        {
+            return Ok(values[i]);
+        }
+        // Hash-collision fallback: linear scan with full equality check.
         for (i, k) in keys.iter().enumerate() {
             if value_hash(*k, heap) == h {
                 return Ok(values[i]);

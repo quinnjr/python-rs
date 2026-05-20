@@ -1727,9 +1727,18 @@ impl VM {
                     }
                     return Err(PythonError::runtime("tuple indices must be integers", line));
                 }
-                HeapObject::Dict { keys, values, .. } => {
+                HeapObject::Dict { keys, values, index_map } => {
                     let h = value_hash(index, &self.heap);
-                    // Linear search for matching key
+                    // Fast path: hash → key-index via index_map. Verify the
+                    // key matches (the index_map only stores one entry per
+                    // hash, so a stored mismatch means hash collision).
+                    if let Some(&i) = index_map.get(&h)
+                        && values_equal(keys[i], index, &self.heap)
+                    {
+                        return Ok(values[i]);
+                    }
+                    // Collision fallback: linear scan. Rare with the Mersenne
+                    // hash for ints + DJB2 for strings; correctness backstop.
                     for (i, k) in keys.iter().enumerate() {
                         if value_hash(*k, &self.heap) == h && values_equal(*k, index, &self.heap) {
                             return Ok(values[i]);
@@ -2622,8 +2631,16 @@ fn contains(item: &Value, container: &Value, heap: &[HeapObject]) -> Result<bool
             HeapObject::Tuple(items) => {
                 return Ok(items.iter().any(|v| values_equal(*item, *v, heap)));
             }
-            HeapObject::Dict { keys, .. } => {
-                return Ok(keys.iter().any(|k| values_equal(*item, *k, heap)));
+            HeapObject::Dict { keys, index_map, .. } => {
+                let h = value_hash(*item, heap);
+                if let Some(&i) = index_map.get(&h)
+                    && i < keys.len()
+                    && values_equal(keys[i], *item, heap)
+                {
+                    return Ok(true);
+                }
+                // Hash-collision fallback.
+                return Ok(keys.iter().any(|k| value_hash(*k, heap) == h && values_equal(*item, *k, heap)));
             }
             HeapObject::Set(items) => {
                 return Ok(items.iter().any(|v| values_equal(*item, *v, heap)));
