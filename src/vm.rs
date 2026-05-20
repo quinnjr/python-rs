@@ -133,6 +133,7 @@ impl VM {
 
     /// Override sys.path. Useful for tests that drop temp files in a
     /// known directory and want imports to find them.
+    #[allow(dead_code)]
     pub fn set_sys_path(&mut self, path: Vec<std::path::PathBuf>) {
         self.import_system.set_sys_path(path);
     }
@@ -2089,11 +2090,11 @@ impl VM {
         let search: Option<&std::path::Path> = parent_dir.as_deref();
 
         // Top-level cmodule check (submodule cmodules out of M3 scope).
-        if parent_module.is_none() {
-            if let Some(module) = self.import_system.try_load_cmodule(name, &mut self.heap) {
-                self.sys_modules.insert(name.to_string(), module);
-                return Ok(module);
-            }
+        if parent_module.is_none()
+            && let Some(module) = self.import_system.try_load_cmodule(name, &mut self.heap)
+        {
+            self.sys_modules.insert(name.to_string(), module);
+            return Ok(module);
         }
 
         // Package finder: <dir>/<leaf>/__init__.py wins over <dir>/<leaf>.py.
@@ -2213,10 +2214,8 @@ impl VM {
         // module not in a package, __package__ is "" (or None — we pick "").
         let package_str: Option<String> = if is_package {
             Some(name.to_string())
-        } else if let Some(i) = name.rfind('.') {
-            Some(name[..i].to_string())
         } else {
-            None
+            name.rfind('.').map(|i| name[..i].to_string())
         };
 
         let value = self.load_source_module_inner(name, file_path, package_str, line)?;

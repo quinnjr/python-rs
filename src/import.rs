@@ -36,7 +36,9 @@ impl ImportSystem {
     }
 
     /// Replace sys.path with the given entries. Called by the VM at
-    /// bootstrap if the runner knows the script's directory.
+    /// bootstrap if the runner knows the script's directory; also used
+    /// by integration tests that drop fixture files in a tempdir.
+    #[allow(dead_code)]
     pub fn set_sys_path(&mut self, path: Vec<PathBuf>) {
         self.sys_path = path;
     }
@@ -63,7 +65,10 @@ impl ImportSystem {
         Some(Value::object_ref(module_idx))
     }
 
-    /// True if a cmodule with this name is registered.
+    /// True if a cmodule with this name is registered. Reserved for the
+    /// "is this name a Tier-1/Tier-3 cmodule?" check the harness will
+    /// want when triaging skip-list entries.
+    #[allow(dead_code)]
     pub fn has_cmodule(&self, name: &str) -> bool {
         self.cmodules.contains_key(name)
     }
@@ -102,12 +107,6 @@ impl ImportSystem {
         None
     }
 
-    /// Back-compat wrapper for the flat `find_source_file(name)` shape
-    /// used by call sites that don't have a parent directory.
-    pub fn find_source_file(&self, name: &str) -> Option<PathBuf> {
-        if name.contains('.') { return None; }
-        self.find_source_file_in(None, name)
-    }
 }
 
 #[cfg(test)]

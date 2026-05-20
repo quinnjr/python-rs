@@ -1060,8 +1060,13 @@ pub enum HeapObject {
         /// Source path for .py-loaded modules; None for cmodules and
         /// for `__future__` / similar pseudo-modules.
         file: Option<String>,
-        /// Parent package's dotted name, used to resolve relative imports
-        /// (`from . import x`) from inside this module's body.
+        /// Parent package's dotted name. Kept in sync with the module's
+        /// `__package__` global entry at construction time; the live
+        /// relative-import resolver reads `__package__` from globals via
+        /// `frame_globals_get`, but this struct field is retained for
+        /// future introspection APIs (e.g., a Python-visible `module.__package__`
+        /// that doesn't go through dict lookup).
+        #[allow(dead_code)]
         package: Option<String>,
         /// false during module-body execution; true after the body
         /// returns. A re-entrant import (circular case) returns the
