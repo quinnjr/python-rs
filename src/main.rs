@@ -53,3 +53,43 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_and_capture_returns_output_lines() {
+        let out = run_and_capture("print('hello')\nprint(42)\n").unwrap();
+        assert_eq!(out, vec!["hello", "42"]);
+    }
+
+    #[test]
+    fn run_and_capture_propagates_lex_error() {
+        let err = run_and_capture("x = $unsupported\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("LexError"), "got: {msg}");
+    }
+
+    #[test]
+    fn run_and_capture_propagates_parse_error() {
+        let err = run_and_capture("def\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("ParseError"), "got: {msg}");
+    }
+
+    #[test]
+    fn run_and_capture_propagates_runtime_error() {
+        let err = run_and_capture("print(undefined_name)\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("RuntimeError"), "got: {msg}");
+    }
+
+    #[test]
+    fn run_prints_to_stdout() {
+        // run() itself prints to stdout via println!; can't capture stdout
+        // in a stable cross-platform way from a unit test. Verify it
+        // succeeds without error for a simple program.
+        run("x = 1 + 1\nprint(x)\n").unwrap();
+    }
+}

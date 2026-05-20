@@ -331,3 +331,76 @@ pub enum BoolOpKind {
     And,
     Or,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expr_line_returns_stored_line() {
+        let cases: Vec<(Expr, u32)> = vec![
+            (Expr::IntLit { value: 1, line: 5 }, 5),
+            (Expr::FloatLit { value: 1.0, line: 7 }, 7),
+            (Expr::StringLit { value: "x".into(), line: 9 }, 9),
+            (Expr::BoolLit { value: true, line: 11 }, 11),
+            (Expr::NoneLit { line: 13 }, 13),
+            (Expr::Name { id: "x".into(), line: 15 }, 15),
+            (Expr::Starred { value: Box::new(Expr::Name { id: "x".into(), line: 17 }), line: 17 }, 17),
+        ];
+        for (expr, expected) in cases {
+            assert_eq!(expr.line(), expected, "wrong line for {expr:?}");
+        }
+    }
+
+    #[test]
+    fn binop_variants_constructible() {
+        // Smoke test for the operator enums — proves Debug + Clone + PartialEq impls exist.
+        let ops = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div];
+        for o in ops {
+            let cloned = o;
+            assert_eq!(o, cloned);
+            let _ = format!("{o:?}");
+        }
+    }
+
+    #[test]
+    fn cmp_and_boolop_variants_constructible() {
+        let cmps = [CmpOp::Eq, CmpOp::Lt, CmpOp::Gt, CmpOp::In, CmpOp::NotIn];
+        for c in cmps {
+            let _ = format!("{c:?}");
+            assert_eq!(c, c);
+        }
+        let bools = [BoolOpKind::And, BoolOpKind::Or];
+        for b in bools {
+            let _ = format!("{b:?}");
+            assert_eq!(b, b);
+        }
+    }
+
+    #[test]
+    fn module_struct_constructible() {
+        let m = Module { body: vec![] };
+        let cloned = m.clone();
+        assert_eq!(m, cloned);
+        let _ = format!("{m:?}");
+    }
+
+    #[test]
+    fn assign_target_variants() {
+        let targets = vec![
+            AssignTarget::Name("x".into()),
+            AssignTarget::Tuple(vec![AssignTarget::Name("a".into()), AssignTarget::Name("b".into())]),
+        ];
+        for t in &targets {
+            let _ = format!("{t:?}");
+            assert_eq!(*t, t.clone());
+        }
+    }
+
+    #[test]
+    fn import_alias_constructible() {
+        let a = ImportAlias { name: "foo.bar".into(), asname: Some("fb".into()) };
+        assert_eq!(a, a.clone());
+        let _ = format!("{a:?}");
+    }
+}

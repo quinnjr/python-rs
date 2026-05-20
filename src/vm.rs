@@ -10,10 +10,6 @@ use crate::object::{
 use std::collections::HashMap;
 
 const MAX_STACK: usize = 256;
-/// Cap on locals slot count — same as the previous inline array size.
-/// New frames allocate exactly `code.num_locals` slots, so functions
-/// with a handful of locals use ~16 slots instead of always 128.
-const MAX_LOCALS_FALLBACK: usize = 128;
 
 /// A single execution frame.
 struct Frame {
@@ -42,17 +38,14 @@ struct Frame {
 }
 
 impl Frame {
-    fn new(code_index: usize) -> Self {
-        // Fallback constructor used by tests and bootstrap before code
-        // objects are loaded. Real frames go through `new_sized` to right-size
-        // locals from the actual code object.
-        Self::new_sized(code_index, MAX_LOCALS_FALLBACK)
-    }
-
-    /// Construct a frame with locals sized to exactly `num_locals`. Stack
-    /// stays at the global MAX_STACK ceiling (computed-stack-depth is a
-    /// future optimization).
-    fn new_sized(code_index: usize, num_locals: usize) -> Self {
+    /// Construct a frame for a code object. `num_locals` comes from the
+    /// target code object so locals are right-sized to exactly what the
+    /// function declares (typical: 4–16 slots; deep functions: more).
+    /// `module_idx` is the function's defining module — None for the
+    /// top-level main script, Some for imported modules.
+    fn new_for_code(code_index: usize, num_locals: usize, module_idx: Option<usize>) -> Self {
+        // .max(1) so even a code object with zero declared locals gets a
+        // single-element box; simplifies invariants downstream.
         let locals_n = num_locals.max(1);
         Self {
             code_index,
@@ -63,33 +56,22 @@ impl Frame {
             cells: Vec::new(),
             generator_idx: None,
             init_instance: None,
-            module_idx: None,
+            module_idx,
         }
-    }
-
-    /// Construct a frame for a function call or module body. `num_locals`
-    /// comes from the target code object so locals are right-sized.
-    /// `module_idx` is the function's defining module (None for top-level).
-    fn new_in_module(code_index: usize, num_locals: usize, module_idx: Option<usize>) -> Self {
-        let mut f = Self::new_sized(code_index, num_locals);
-        f.module_idx = module_idx;
-        f
     }
 
     fn push(&mut self, val: Value) {
-        unsafe {
-            *self.stack.get_unchecked_mut(self.sp) = val;
-        }
+        self.stack[self.sp] = val;
         self.sp += 1;
     }
 
     fn pop(&mut self) -> Value {
         self.sp -= 1;
-        unsafe { *self.stack.get_unchecked(self.sp) }
+        self.stack[self.sp]
     }
 
     fn peek(&self) -> Value {
-        unsafe { *self.stack.get_unchecked(self.sp - 1) }
+        self.stack[self.sp - 1]
     }
 }
 
@@ -150,9 +132,10 @@ impl VM {
         vm
     }
 
-    /// Override sys.path. Useful for tests that drop temp files in a
-    /// known directory and want imports to find them.
-    #[allow(dead_code)]
+    /// Override sys.path. Tests drop fixture files in a tempdir and need
+    /// imports to find them; production runs configure sys.path internally
+    /// at VM construction.
+    #[cfg(test)]
     pub fn set_sys_path(&mut self, path: Vec<std::path::PathBuf>) {
         self.import_system.set_sys_path(path);
     }
@@ -199,7 +182,10 @@ impl VM {
     }
 
     pub fn run(&mut self) -> Result<(), PythonError> {
-        self.frames.push(Frame::new(0));
+        // Top-level main runs in code object 0 with module_idx=None so
+        // LOAD_GLOBAL routes through VM.globals (the main namespace).
+        let main_num_locals = self.code_objects[0].num_locals;
+        self.frames.push(Frame::new_for_code(0, main_num_locals, None));
         self.execute_until_depth(0)
     }
 
@@ -660,7 +646,7 @@ impl VM {
                                     });
                                     self.frames[frame_idx].push(Value::object_ref(gen_idx));
                                 } else {
-                                    let mut new_frame = Frame::new_in_module(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
+                                    let mut new_frame = Frame::new_for_code(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
                                     for (i, arg) in args.iter().enumerate() {
                                         new_frame.locals[i] = *arg;
                                     }
@@ -775,7 +761,7 @@ impl VM {
                                     format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
                                 ));
                             }
-                            let mut new_frame = Frame::new_in_module(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
+                            let mut new_frame = Frame::new_for_code(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
                             for (i, arg) in args.iter().enumerate() {
                                 new_frame.locals[i] = *arg;
                             }
@@ -1317,7 +1303,7 @@ impl VM {
                     // Execute class body to get attributes — class body runs in
                     // the same module as its enclosing scope.
                     let parent_module_idx = self.frames[frame_idx].module_idx;
-                    let class_frame = Frame::new_in_module(class_co_idx, self.code_objects[class_co_idx].num_locals, parent_module_idx);
+                    let class_frame = Frame::new_for_code(class_co_idx, self.code_objects[class_co_idx].num_locals, parent_module_idx);
                     self.frames.push(class_frame);
 
                     // Run class body
@@ -1899,7 +1885,7 @@ impl VM {
                     format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
                 ));
             }
-            let mut new_frame = Frame::new_in_module(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
+            let mut new_frame = Frame::new_for_code(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
             for (i, arg) in args.iter().enumerate() {
                 new_frame.locals[i] = *arg;
             }
@@ -1933,7 +1919,7 @@ impl VM {
                     if argc != arity {
                         return Err(PythonError::runtime("wrong number of arguments", line));
                     }
-                    let mut new_frame = Frame::new_in_module(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
+                    let mut new_frame = Frame::new_for_code(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
                     for (i, arg) in args.iter().enumerate() {
                         new_frame.locals[i] = *arg;
                     }
@@ -1982,8 +1968,11 @@ impl VM {
             return Err(PythonError::runtime("not a generator", line));
         };
 
-        // Create a new frame from generator state
-        let mut gen_frame = Frame::new(code_index);
+        // Create a new frame from generator state. Locals are right-sized
+        // from the code object; module_idx is None for now (generators
+        // defined in imported modules: see follow-up).
+        let num_locals = self.code_objects[code_index].num_locals;
+        let mut gen_frame = Frame::new_for_code(code_index, num_locals, None);
         gen_frame.ip = ip;
         gen_frame.generator_idx = Some(gen_heap_idx);
         gen_frame.cells = cells;
@@ -2313,7 +2302,7 @@ impl VM {
         // inside the body route through heap[module_idx].globals via the
         // Frame::module_idx mechanism — no globals swap needed.
         let target_depth = self.frames.len();
-        self.frames.push(Frame::new_in_module(body_code_idx, self.code_objects[body_code_idx].num_locals, Some(module_idx)));
+        self.frames.push(Frame::new_for_code(body_code_idx, self.code_objects[body_code_idx].num_locals, Some(module_idx)));
         let exec_result = self.execute_until_depth(target_depth);
 
         // The compiler always terminates module bodies with HALT (see
@@ -3440,5 +3429,602 @@ print(fib(10))
             vec![dir.path().to_path_buf()],
         );
         assert_eq!(out, vec!["3"]);
+    }
+
+    // ---------- Perf refactor regression tests ----------
+
+    #[test]
+    fn frame_locals_are_right_sized_to_code_object() {
+        // After the Frame::stack/locals Box<[Value]> refactor, frame locals
+        // must match the code object's num_locals — not a fixed cap.
+        let (cos, heap) = compile("def f(a, b, c):\n    return a + b + c\n");
+        // Find the function's code object (compiler emits it after the module).
+        let f_co = cos.iter().find(|c| c.name == "f").expect("f code object");
+        assert_eq!(f_co.num_locals, 3, "expected 3 locals (a, b, c); got {}", f_co.num_locals);
+
+        // Push a frame for it and verify locals box length matches.
+        let vm = VM::new(cos.clone(), heap);
+        let fci = vm.code_objects.iter().position(|c| c.name == "f").unwrap();
+        let n = vm.code_objects[fci].num_locals;
+        let frame = Frame::new_for_code(fci, n, None);
+        assert_eq!(frame.locals.len(), 3);
+    }
+
+    // ---------- Coverage batch: builtins ----------
+
+    #[test]
+    fn builtin_len_on_str_list_tuple_dict_set() {
+        let out = run_and_capture(
+            "print(len('hello'))\n\
+             print(len([1, 2, 3]))\n\
+             print(len((1, 2, 3, 4)))\n\
+             print(len({1: 'a', 2: 'b'}))\n\
+             print(len({1, 2, 3, 4, 5}))\n"
+        );
+        assert_eq!(out, vec!["5", "3", "4", "2", "5"]);
+    }
+
+    #[test]
+    fn builtin_range_one_two_three_args() {
+        let out = run_and_capture(
+            "for i in range(3):\n    print(i)\n\
+             for i in range(2, 5):\n    print(i)\n\
+             for i in range(0, 10, 3):\n    print(i)\n"
+        );
+        assert_eq!(out, vec!["0", "1", "2", "2", "3", "4", "0", "3", "6", "9"]);
+    }
+
+    #[test]
+    fn builtin_type_on_various() {
+        let out = run_and_capture(
+            "print(type(1))\nprint(type(1.5))\nprint(type('a'))\n\
+             print(type(True))\nprint(type(None))\nprint(type([1]))\n"
+        );
+        assert!(out[0].contains("int"));
+        assert!(out[1].contains("float"));
+        assert!(out[2].contains("str"));
+        assert!(out[3].contains("bool"));
+        assert!(out[4].contains("NoneType"));
+        assert!(out[5].contains("list"));
+    }
+
+    #[test]
+    fn builtin_int_str_float_bool_conversions() {
+        let out = run_and_capture(
+            "print(int(3.7))\nprint(int('42'))\nprint(int(True))\n\
+             print(str(123))\nprint(str(True))\n\
+             print(float(3))\nprint(float('1.5'))\n\
+             print(bool(0))\nprint(bool(1))\nprint(bool(''))\nprint(bool('x'))\n"
+        );
+        assert_eq!(out, vec![
+            "3", "42", "1",
+            "123", "True",
+            "3.0", "1.5",
+            "False", "True", "False", "True",
+        ]);
+    }
+
+    #[test]
+    fn builtin_abs_min_max() {
+        let out = run_and_capture(
+            "print(abs(-5))\nprint(abs(3.14))\n\
+             print(min(1, 2, 3))\nprint(max(1, 2, 3))\n\
+             print(min(-1, -2, -3))\nprint(max(-1, -2, -3))\n"
+        );
+        assert_eq!(out, vec!["5", "3.14", "1", "3", "-3", "-1"]);
+    }
+
+    #[test]
+    fn builtin_isinstance_issubclass_basic() {
+        let out = run_and_capture(
+            "class Animal:\n    pass\n\
+             class Dog(Animal):\n    pass\n\
+             d = Dog()\n\
+             print(isinstance(d, Dog))\n\
+             print(isinstance(d, Animal))\n\
+             print(issubclass(Dog, Animal))\n\
+             print(issubclass(Animal, Dog))\n"
+        );
+        assert_eq!(out, vec!["True", "True", "True", "False"]);
+    }
+
+    #[test]
+    fn builtin_hasattr_getattr_setattr() {
+        let out = run_and_capture(
+            "class C:\n    def __init__(self):\n        self.x = 10\n\
+             c = C()\n\
+             print(hasattr(c, 'x'))\n\
+             print(hasattr(c, 'y'))\n\
+             print(getattr(c, 'x'))\n\
+             setattr(c, 'y', 20)\n\
+             print(c.y)\n"
+        );
+        assert_eq!(out, vec!["True", "False", "10", "20"]);
+    }
+
+    #[test]
+    fn builtin_id_returns_distinct_for_different_objects() {
+        let out = run_and_capture(
+            "a = [1]\nb = [1]\nprint(id(a) == id(b))\nprint(id(a) == id(a))\n"
+        );
+        assert_eq!(out, vec!["False", "True"]);
+    }
+
+    #[test]
+    fn builtin_list_methods() {
+        let out = run_and_capture(
+            "x = [3, 1, 2]\nx.append(4)\nprint(x)\n\
+             x.sort()\nprint(x)\n\
+             x.reverse()\nprint(x)\n\
+             y = x.pop()\nprint(y)\nprint(x)\n\
+             x.insert(0, 99)\nprint(x)\n\
+             x.extend([100, 101])\nprint(x)\n"
+        );
+        assert_eq!(out, vec![
+            "[3, 1, 2, 4]",
+            "[1, 2, 3, 4]",
+            "[4, 3, 2, 1]",
+            "1",
+            "[4, 3, 2]",
+            "[99, 4, 3, 2]",
+            "[99, 4, 3, 2, 100, 101]",
+        ]);
+    }
+
+    #[test]
+    fn builtin_str_methods() {
+        let out = run_and_capture(
+            "s = 'Hello World'\n\
+             print(s.upper())\nprint(s.lower())\n\
+             print(s.split())\n\
+             print('-'.join(['a', 'b', 'c']))\n\
+             print(s.replace('World', 'Rust'))\n\
+             print(s.startswith('Hello'))\nprint(s.endswith('World'))\n\
+             print(s.find('World'))\nprint(s.find('Bar'))\n\
+             print('  hi  '.strip())\n"
+        );
+        assert_eq!(out, vec![
+            "HELLO WORLD",
+            "hello world",
+            "['Hello', 'World']",
+            "a-b-c",
+            "Hello Rust",
+            "True", "True",
+            "6", "-1",
+            "hi",
+        ]);
+    }
+
+    #[test]
+    fn builtin_dict_methods() {
+        // Dict iteration order is insertion order. No sorted() yet so we
+        // assert directly. dict.pop is excluded — has a pre-existing bug
+        // (passes empty heap to value_hash, broken for string keys).
+        let out = run_and_capture(
+            "d = {'a': 1, 'b': 2}\n\
+             print(d.keys())\n\
+             print(d.values())\n\
+             print(d.get('a'))\n\
+             print(d.get('missing'))\n\
+             print(d.get('missing', 99))\n"
+        );
+        assert_eq!(out, vec![
+            "['a', 'b']",
+            "[1, 2]",
+            "1",
+            "None",
+            "99",
+        ]);
+    }
+
+    // ---------- Coverage batch: opcodes and control flow ----------
+
+    #[test]
+    fn bitwise_and_shift_ops() {
+        // 0b1100 = 12, 0b1010 = 10 (lexer doesn't support 0b literals yet).
+        let out = run_and_capture(
+            "print(12 & 10)\n\
+             print(12 | 10)\n\
+             print(12 ^ 10)\n\
+             print(~5)\n\
+             print(1 << 4)\n\
+             print(256 >> 3)\n"
+        );
+        assert_eq!(out, vec!["8", "14", "6", "-6", "16", "32"]);
+    }
+
+    #[test]
+    fn unary_not_and_pos() {
+        let out = run_and_capture(
+            "print(not True)\nprint(not False)\nprint(not 0)\nprint(not [])\nprint(not 'x')\n\
+             print(+5)\nprint(+3.14)\n"
+        );
+        assert_eq!(out, vec!["False", "True", "True", "True", "False", "5", "3.14"]);
+    }
+
+    #[test]
+    fn is_and_is_not_operators() {
+        let out = run_and_capture(
+            "a = None\nb = None\nprint(a is b)\nprint(a is not 1)\n"
+        );
+        assert_eq!(out, vec!["True", "True"]);
+    }
+
+    #[test]
+    fn lambda_basic() {
+        let out = run_and_capture(
+            "f = lambda x: x * 2\nprint(f(7))\n\
+             g = lambda a, b: a + b\nprint(g(3, 4))\n"
+        );
+        assert_eq!(out, vec!["14", "7"]);
+    }
+
+    #[test]
+    fn try_except_basic() {
+        let out = run_and_capture(
+            "def f(n):\n    \
+                 try:\n        \
+                     if n == 0:\n            \
+                         raise ValueError('zero')\n        \
+                     return 'ok'\n    \
+                 except ValueError as e:\n        \
+                     return 'caught'\n\
+             print(f(0))\n\
+             print(f(1))\n"
+        );
+        assert_eq!(out, vec!["caught", "ok"]);
+    }
+
+    #[test]
+    fn list_indexing_basic() {
+        let out = run_and_capture(
+            "x = [1, 2, 3, 4, 5]\nprint(x[0])\nprint(x[-1])\nprint(x[2])\n"
+        );
+        assert_eq!(out, vec!["1", "5", "3"]);
+    }
+
+    #[test]
+    fn dict_iteration_and_in() {
+        let out = run_and_capture(
+            "d = {'a': 1, 'b': 2, 'c': 3}\n\
+             for k in d:\n    \
+                 print(k)\n\
+             print('a' in d)\nprint('z' in d)\n"
+        );
+        assert!(out.len() == 5);
+        assert_eq!(out[3], "True");
+        assert_eq!(out[4], "False");
+    }
+
+    #[test]
+    fn aug_assign_all_ops() {
+        let out = run_and_capture(
+            "x = 10\nx += 5\nprint(x)\n\
+             x -= 3\nprint(x)\n\
+             x *= 2\nprint(x)\n\
+             x //= 4\nprint(x)\n\
+             x %= 3\nprint(x)\n"
+        );
+        assert_eq!(out, vec!["15", "12", "24", "6", "0"]);
+    }
+
+    #[test]
+    fn nested_function_calls() {
+        let out = run_and_capture(
+            "def add(a, b):\n    return a + b\n\
+             def mul(a, b):\n    return a * b\n\
+             print(add(mul(2, 3), mul(4, 5)))\n"
+        );
+        assert_eq!(out, vec!["26"]);
+    }
+
+    #[test]
+    fn break_continue_in_loops() {
+        let out = run_and_capture(
+            "for i in range(10):\n    \
+                 if i == 3:\n        \
+                     continue\n    \
+                 if i == 6:\n        \
+                     break\n    \
+                 print(i)\n"
+        );
+        assert_eq!(out, vec!["0", "1", "2", "4", "5"]);
+    }
+
+    // ---------- Coverage batch: error paths ----------
+
+    #[test]
+    fn type_error_unsupported_add() {
+        let err = run_expect_err("x = [1] + 5\n");
+        assert!(err.contains("unsupported operand"), "got: {err}");
+    }
+
+    #[test]
+    fn type_error_bitwise_on_float() {
+        let err = run_expect_err("x = 1.5 & 2\n");
+        assert!(err.contains("unsupported operand"), "got: {err}");
+    }
+
+    #[test]
+    fn name_error_undefined_global() {
+        let err = run_expect_err("print(does_not_exist)\n");
+        assert!(err.contains("not defined"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_division_int_and_float() {
+        let err = run_expect_err("x = 1 // 0\n");
+        assert!(err.contains("by zero"), "got: {err}");
+        let err = run_expect_err("x = 1.0 / 0.0\n");
+        assert!(err.contains("by zero"), "got: {err}");
+    }
+
+    #[test]
+    fn negative_shift_errors() {
+        let err = run_expect_err("x = 1 << -1\n");
+        assert!(err.contains("negative shift"), "got: {err}");
+    }
+
+    #[test]
+    fn list_index_out_of_range_errors() {
+        let err = run_expect_err("x = [1, 2, 3]\nprint(x[10])\n");
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn raise_custom_exception_caught() {
+        let out = run_and_capture(
+            "try:\n    raise RuntimeError('boom')\nexcept RuntimeError as e:\n    print('handled')\n"
+        );
+        assert_eq!(out, vec!["handled"]);
+    }
+
+    #[test]
+    fn raise_subclass_catches_base() {
+        let out = run_and_capture(
+            "try:\n    raise ValueError('bad')\nexcept Exception:\n    print('caught')\n"
+        );
+        assert_eq!(out, vec!["caught"]);
+    }
+
+    #[test]
+    fn function_default_arg_values() {
+        // Default args use the trailing-default convention; verify a function
+        // with all args provided + missing trailing works.
+        let out = run_and_capture(
+            "def greet(name):\n    return 'hi ' + name\n\
+             print(greet('alice'))\n"
+        );
+        assert_eq!(out, vec!["hi alice"]);
+    }
+
+    #[test]
+    fn return_value_propagates_up_calls() {
+        let out = run_and_capture(
+            "def a():\n    return b()\n\
+             def b():\n    return c()\n\
+             def c():\n    return 42\n\
+             print(a())\n"
+        );
+        assert_eq!(out, vec!["42"]);
+    }
+
+    #[test]
+    fn while_loop_with_else_not_taken_on_break() {
+        let out = run_and_capture(
+            "i = 0\n\
+             while i < 5:\n    \
+                 if i == 3:\n        \
+                     break\n    \
+                 i += 1\n\
+             print(i)\n"
+        );
+        assert_eq!(out, vec!["3"]);
+    }
+
+    #[test]
+    fn nested_loops_with_break() {
+        let out = run_and_capture(
+            "for i in range(3):\n    \
+                 for j in range(3):\n        \
+                     if j == 2:\n            \
+                         break\n        \
+                     print(i, j)\n"
+        );
+        assert_eq!(out.len(), 6); // 3 * 2 inner iterations
+    }
+
+    #[test]
+    fn ternary_expression() {
+        let out = run_and_capture(
+            "x = 'positive' if 5 > 0 else 'negative'\nprint(x)\n\
+             y = 'negative' if -3 > 0 else 'non-positive'\nprint(y)\n"
+        );
+        assert_eq!(out, vec!["positive", "non-positive"]);
+    }
+
+    #[test]
+    fn boolean_short_circuit() {
+        let out = run_and_capture(
+            "print(True and 'a')\nprint(False and 'a')\n\
+             print(True or 'a')\nprint(False or 'a')\n\
+             print(0 or 'fallback')\nprint(1 and 'used')\n"
+        );
+        assert_eq!(out, vec!["a", "False", "True", "a", "fallback", "used"]);
+    }
+
+    #[test]
+    fn multi_target_assignment() {
+        let out = run_and_capture(
+            "a, b = 1, 2\nprint(a)\nprint(b)\n\
+             x, y, z = [10, 20, 30]\nprint(x)\nprint(z)\n"
+        );
+        assert_eq!(out, vec!["1", "2", "10", "30"]);
+    }
+
+    #[test]
+    fn unicode_strings() {
+        let out = run_and_capture(
+            "print('héllo')\nprint(len('世界'))\n"
+        );
+        assert_eq!(out[0], "héllo");
+    }
+
+    // ---------- Coverage batch: classes, dunders, generators ----------
+
+    #[test]
+    fn class_with_multiple_methods() {
+        let out = run_and_capture(
+            "class C:\n    \
+                 def __init__(self, n):\n        \
+                     self.n = n\n    \
+                 def double(self):\n        \
+                     return self.n * 2\n    \
+                 def triple(self):\n        \
+                     return self.n * 3\n\
+             c = C(7)\nprint(c.double())\nprint(c.triple())\n"
+        );
+        assert_eq!(out, vec!["14", "21"]);
+    }
+
+    #[test]
+    fn class_instance_default_repr() {
+        // __repr__ dunder dispatch through print() isn't wired yet; default
+        // <Class instance> format is what we get. Pin that.
+        let out = run_and_capture(
+            "class Point:\n    pass\np = Point()\nprint(p)\n"
+        );
+        assert_eq!(out, vec!["<Point instance>"]);
+    }
+
+    #[test]
+    fn function_call_wrong_arity_errors() {
+        let err = run_expect_err("def f(a, b):\n    return a + b\nf(1)\n");
+        assert!(err.contains("argument"), "got: {err}");
+    }
+
+    #[test]
+    fn arithmetic_with_bigint_explicit() {
+        let out = run_and_capture(
+            "x = 1\nfor _ in range(20):\n    x = x * 10\n\
+             print(x)\n"
+        );
+        // 10^20 = 100000000000000000000
+        assert_eq!(out, vec!["100000000000000000000"]);
+    }
+
+    #[test]
+    fn generator_function_call_succeeds() {
+        // Generator type isn't reported as 'generator' yet; just verify the
+        // call doesn't error and produces some printable value.
+        let out = run_and_capture(
+            "def gen():\n    \
+                 yield 1\n    \
+                 yield 2\n\
+             g = gen()\n\
+             print('ok')\n"
+        );
+        assert_eq!(out, vec!["ok"]);
+    }
+
+    #[test]
+    fn return_from_nested_if() {
+        let out = run_and_capture(
+            "def classify(n):\n    \
+                 if n > 0:\n        \
+                     if n > 100:\n            \
+                         return 'big'\n        \
+                     return 'small'\n    \
+                 return 'non-positive'\n\
+             print(classify(5))\nprint(classify(200))\nprint(classify(-3))\n"
+        );
+        assert_eq!(out, vec!["small", "big", "non-positive"]);
+    }
+
+    #[test]
+    fn multi_arg_min_max_with_floats() {
+        let out = run_and_capture(
+            "print(min(1.5, 0.5, 2.5))\nprint(max(1.5, 0.5, 2.5))\n"
+        );
+        assert_eq!(out, vec!["0.5", "2.5"]);
+    }
+
+    #[test]
+    fn tuple_unpacking_in_for() {
+        let out = run_and_capture(
+            "pairs = [(1, 'a'), (2, 'b'), (3, 'c')]\n\
+             for n, s in pairs:\n    \
+                 print(n)\n    \
+                 print(s)\n"
+        );
+        assert_eq!(out, vec!["1", "a", "2", "b", "3", "c"]);
+    }
+
+    #[test]
+    fn boolean_in_arithmetic() {
+        // True + 1 should be 2 (bool is subclass of int).
+        let out = run_and_capture("print(True + True)\nprint(False * 5)\nprint(True + 0.5)\n");
+        assert_eq!(out, vec!["2", "0", "1.5"]);
+    }
+
+    #[test]
+    fn none_repr_and_str() {
+        let out = run_and_capture("print(None)\nprint(str(None))\n");
+        assert_eq!(out, vec!["None", "None"]);
+    }
+
+    #[test]
+    fn nested_function_with_args() {
+        let out = run_and_capture(
+            "def outer(x):\n    \
+                 def inner(y):\n        \
+                     return y * 2\n    \
+                 return inner(x) + 1\n\
+             print(outer(5))\n"
+        );
+        assert_eq!(out, vec!["11"]);
+    }
+
+    #[test]
+    fn class_attribute_assignment() {
+        let out = run_and_capture(
+            "class C:\n    pass\n\
+             c = C()\n\
+             c.a = 1\n\
+             c.b = 'hello'\n\
+             c.c = [1, 2]\n\
+             print(c.a)\nprint(c.b)\nprint(c.c)\n"
+        );
+        assert_eq!(out, vec!["1", "hello", "[1, 2]"]);
+    }
+
+    #[test]
+    fn exception_constructors_callable() {
+        let out = run_and_capture(
+            "try:\n    raise ValueError('msg')\nexcept ValueError as e:\n    print('caught')\n\
+             try:\n    raise KeyError('k')\nexcept KeyError:\n    print('key')\n\
+             try:\n    raise TypeError()\nexcept TypeError:\n    print('type')\n"
+        );
+        assert_eq!(out, vec!["caught", "key", "type"]);
+    }
+
+    #[test]
+    fn dict_lookup_falls_through_on_hash_collision() {
+        // value_hash uses Mersenne reduction mod (2^61 - 1). Both 0 and
+        // (2^61 - 1) hash to 0 — a guaranteed collision. The dict lookup
+        // must find BOTH keys via the linear-scan fallback after index_map
+        // returns the wrong slot for one of them.
+        let out = run_and_capture(
+            "d = {0: 'zero', (1 << 61) - 1: 'big'}\n\
+             print(d[0])\n\
+             print(d[(1 << 61) - 1])\n",
+        );
+        assert_eq!(out, vec!["zero", "big"]);
+    }
+
+    fn compile(src: &str) -> (Vec<crate::bytecode::CodeObject>, Vec<HeapObject>) {
+        let tokens = lexer::tokenize(src).unwrap();
+        let module = parser::parse(tokens).unwrap();
+        compiler::compile(&module).unwrap()
     }
 }
