@@ -3,7 +3,7 @@ use crate::ast::*;
 use crate::bytecode::{self, CodeObject, encode, op};
 use crate::error::PythonError;
 use crate::object::{HeapObject, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Compile a module AST into code objects and initial heap objects.
 pub fn compile(module: &Module) -> Result<(Vec<CodeObject>, Vec<HeapObject>), PythonError> {
@@ -19,6 +19,10 @@ struct Compiler {
     loop_stack: Vec<LoopContext>,
     /// Scope info: (globals, nonlocals, cell_vars, free_vars) per code object index
     scope_info: Vec<ScopeInfo>,
+    /// Per-code-object constant dedup index, keyed on Value's bit pattern.
+    /// Parallels `code_objects`; the i-th map covers the i-th code object's
+    /// constants pool. Turns add_const from O(N) linear scan into O(1) lookup.
+    const_index: Vec<HashMap<u64, u32>>,
 }
 
 struct LoopContext {
@@ -43,6 +47,7 @@ impl Compiler {
             code_stack: Vec::new(),
             loop_stack: Vec::new(),
             scope_info: Vec::new(),
+            const_index: Vec::new(),
         }
     }
 
@@ -79,15 +84,16 @@ impl Compiler {
     }
 
     fn add_const(&mut self, val: Value) -> u32 {
-        let code = self.current_code();
-        for (i, c) in code.constants.iter().enumerate() {
-            if c.bits_eq(val) {
-                return i as u32;
-            }
+        let co_idx = self.current_code_index();
+        let key = val.display_bits();
+        if let Some(&existing) = self.const_index[co_idx].get(&key) {
+            return existing;
         }
-        let idx = code.constants.len();
+        let code = &mut self.code_objects[co_idx];
+        let idx = code.constants.len() as u32;
         code.constants.push(val);
-        idx as u32
+        self.const_index[co_idx].insert(key, idx);
+        idx
     }
 
     fn add_name(&mut self, name: &str) -> u32 {
@@ -199,6 +205,7 @@ impl Compiler {
 
         let co_idx = self.code_objects.len();
         self.code_objects.push(CodeObject::new("<module>"));
+        self.const_index.push(HashMap::new());
         self.code_stack.push(co_idx);
 
         for stmt in &module.body {
@@ -634,6 +641,7 @@ impl Compiler {
 
         self.prescan_locals(&mut func_co, body);
         self.code_objects.push(func_co);
+        self.const_index.push(HashMap::new());
         self.code_stack.push(func_co_idx);
 
         for stmt in body {
@@ -703,6 +711,7 @@ impl Compiler {
         let mut class_co = CodeObject::new(name);
         class_co.num_params = 0;
         self.code_objects.push(class_co);
+        self.const_index.push(HashMap::new());
         // Add scope info if needed
         while self.scope_info.len() <= class_co_idx {
             self.scope_info.push(ScopeInfo::default());
@@ -1042,6 +1051,7 @@ impl Compiler {
                 }
                 func_co.num_locals = params.len();
                 self.code_objects.push(func_co);
+                self.const_index.push(HashMap::new());
                 self.code_stack.push(func_co_idx);
 
                 self.compile_expr(body)?;

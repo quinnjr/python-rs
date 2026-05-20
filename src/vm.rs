@@ -4,7 +4,7 @@ use crate::bytecode::{self, CodeObject, op};
 use crate::error::PythonError;
 use crate::object::{
     ArithError, BuiltinId, ExceptionType, GeneratorState, HeapObject, PyInt, PyPowResult,
-    Value, heap_str, pyint_truediv, value_hash,
+    Value, heap_str, pyint_truediv, value_hash, value_to_f64,
 };
 use std::collections::HashMap;
 
@@ -1938,34 +1938,34 @@ fn arith_to_runtime(err: ArithError, op_msg: &str, line: u32) -> PythonError {
     PythonError::runtime(msg, line)
 }
 
-/// True if `v` carries a float — used to choose the int vs float path.
-fn is_numeric_float(v: Value) -> bool {
-    v.is_float()
+/// Try to view both operands as ints (small, big, or widened bool). Returns
+/// None if either side is a float — caller falls through to the float path.
+fn pyint_pair<'a>(
+    left: Value,
+    right: Value,
+    heap: &'a [HeapObject],
+) -> Option<(PyInt<'a>, PyInt<'a>)> {
+    if left.is_float() || right.is_float() { return None; }
+    Some((
+        PyInt::from_value_or_bool(left, heap)?,
+        PyInt::from_value_or_bool(right, heap)?,
+    ))
 }
 
 fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
-    // Int + int (small or big, bool widens).
-    if let (Some(a), Some(b)) = (
-        PyInt::from_value_or_bool(left, heap),
-        PyInt::from_value_or_bool(right, heap),
-    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+    if let Some((a, b)) = pyint_pair(left, right, heap) {
         return Ok(a.add(b).into_value(heap));
     }
-    // Float (or int↔float) — int side widens through PyInt::to_f64
-    // so even huge BigInts collapse to inf consistently with CPython.
-    if is_numeric_float(left) || is_numeric_float(right) {
-        let af = num_to_f64(left, heap);
-        let bf = num_to_f64(right, heap);
-        if let (Some(a), Some(b)) = (af, bf) {
-            return Ok(Value::float(a + b));
-        }
+    if (left.is_float() || right.is_float())
+        && let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap))
+    {
+        return Ok(Value::float(a + b));
     }
     if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
         let a = heap_str(heap, a_idx)?.to_string();
         let b = heap_str(heap, b_idx)?;
-        let result = format!("{a}{b}");
         let heap_idx = heap.len();
-        heap.push(HeapObject::Str(result.into()));
+        heap.push(HeapObject::Str(format!("{a}{b}").into()));
         return Ok(Value::str_ref(heap_idx));
     }
     if let (Some(a_idx), Some(b_idx)) = (left.as_list_ref(), right.as_list_ref()) {
@@ -1981,43 +1981,35 @@ fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
 }
 
 fn binary_sub(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (
-        PyInt::from_value_or_bool(left, heap),
-        PyInt::from_value_or_bool(right, heap),
-    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+    if let Some((a, b)) = pyint_pair(left, right, heap) {
         return Ok(a.sub(b).into_value(heap));
     }
-    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap))
-        && (is_numeric_float(left) || is_numeric_float(right)) {
+    if let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap)) {
         return Ok(Value::float(a - b));
     }
     Err(PythonError::runtime("unsupported operand type(s) for -", line))
 }
 
 fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (
-        PyInt::from_value_or_bool(left, heap),
-        PyInt::from_value_or_bool(right, heap),
-    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+    if let Some((a, b)) = pyint_pair(left, right, heap) {
         return Ok(a.mul(b).into_value(heap));
     }
-    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap))
-        && (is_numeric_float(left) || is_numeric_float(right)) {
+    if (left.is_float() || right.is_float())
+        && let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap))
+    {
         return Ok(Value::float(a * b));
     }
     // String repetition — count comes from the int side (small only for now).
     if let Some(s_idx) = left.as_str_ref() && let Some(n) = right.as_int() {
         let s = heap_str(heap, s_idx)?;
-        let result = s.repeat(n.max(0) as usize);
         let heap_idx = heap.len();
-        heap.push(HeapObject::Str(result.into()));
+        heap.push(HeapObject::Str(s.repeat(n.max(0) as usize).into()));
         return Ok(Value::str_ref(heap_idx));
     }
     if let Some(n) = left.as_int() && let Some(s_idx) = right.as_str_ref() {
         let s = heap_str(heap, s_idx)?;
-        let result = s.repeat(n.max(0) as usize);
         let heap_idx = heap.len();
-        heap.push(HeapObject::Str(result.into()));
+        heap.push(HeapObject::Str(s.repeat(n.max(0) as usize).into()));
         return Ok(Value::str_ref(heap_idx));
     }
     Err(PythonError::runtime("unsupported operand type(s) for *", line))
@@ -2025,16 +2017,13 @@ fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
 
 fn binary_div(left: Value, right: Value, heap: &[HeapObject], line: u32) -> Result<Value, PythonError> {
     // Python `/` is always true-division, returns float.
-    if let (Some(a), Some(b)) = (
-        PyInt::from_value_or_bool(left, heap),
-        PyInt::from_value_or_bool(right, heap),
-    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+    if let Some((a, b)) = pyint_pair(left, right, heap) {
         return pyint_truediv(a, b)
             .map(Value::float)
             .map_err(|e| arith_to_runtime(e, "division", line));
     }
-    let af = num_to_f64(left, heap).ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
-    let bf = num_to_f64(right, heap).ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
+    let af = value_to_f64(left, heap).ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
+    let bf = value_to_f64(right, heap).ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
     if bf == 0.0 {
         return Err(PythonError::runtime("division by zero", line));
     }
@@ -2042,15 +2031,12 @@ fn binary_div(left: Value, right: Value, heap: &[HeapObject], line: u32) -> Resu
 }
 
 fn binary_floor_div(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (
-        PyInt::from_value_or_bool(left, heap),
-        PyInt::from_value_or_bool(right, heap),
-    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+    if let Some((a, b)) = pyint_pair(left, right, heap) {
         return a.floordiv(b)
             .map(|r| r.into_value(heap))
             .map_err(|e| arith_to_runtime(e, "integer division or modulo", line));
     }
-    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap)) {
+    if let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap)) {
         if b == 0.0 {
             return Err(PythonError::runtime("float floor division by zero", line));
         }
@@ -2060,52 +2046,31 @@ fn binary_floor_div(left: Value, right: Value, heap: &mut Vec<HeapObject>, line:
 }
 
 fn binary_mod(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (
-        PyInt::from_value_or_bool(left, heap),
-        PyInt::from_value_or_bool(right, heap),
-    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+    if let Some((a, b)) = pyint_pair(left, right, heap) {
         return a.mod_(b)
             .map(|r| r.into_value(heap))
             .map_err(|e| arith_to_runtime(e, "integer division or modulo", line));
     }
-    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap)) {
+    if let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap)) {
         if b == 0.0 {
             return Err(PythonError::runtime("float modulo by zero", line));
         }
-        let result = ((a % b) + b) % b;
-        return Ok(Value::float(result));
-    }
-    // String formatting: "hello %s" % value — stub
-    if left.as_str_ref().is_some() {
-        let _ = right;
+        return Ok(Value::float(((a % b) + b) % b));
     }
     Err(PythonError::runtime("unsupported operand type(s) for %", line))
 }
 
 fn binary_pow(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (
-        PyInt::from_value_or_bool(left, heap),
-        PyInt::from_value_or_bool(right, heap),
-    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+    if let Some((a, b)) = pyint_pair(left, right, heap) {
         return Ok(match a.pow(b) {
             PyPowResult::Int(o)   => o.into_value(heap),
             PyPowResult::Float(f) => Value::float(f),
         });
     }
-    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap)) {
+    if let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap)) {
         return Ok(Value::float(a.powf(b)));
     }
     Err(PythonError::runtime("unsupported operand type(s) for **", line))
-}
-
-/// Numeric-to-f64: handles int (small/big), bool, and float. Used wherever
-/// an int↔float mixed op needs a unified f64 path.
-fn num_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
-    if let Some(f) = v.as_float() { return Some(f); }
-    if let Some(pi) = PyInt::from_value_or_bool(v, heap) {
-        return Some(pi.to_f64());
-    }
-    None
 }
 
 fn compare(
@@ -2115,32 +2080,22 @@ fn compare(
     int_cmp: impl Fn(i64, i64) -> bool,
     float_cmp: impl Fn(f64, f64) -> bool,
 ) -> bool {
-    // Int family (small, big, bool) ↔ int family: use PyInt::cmp for total
-    // ordering across representations.
-    if !is_numeric_float(left) && !is_numeric_float(right)
-        && let (Some(a), Some(b)) = (
-            PyInt::from_value_or_bool(left, heap),
-            PyInt::from_value_or_bool(right, heap),
-        )
-    {
-        let ord = a.cmp(b) as i64;
-        return int_cmp(ord, 0);
+    if let Some((a, b)) = pyint_pair(left, right, heap) {
+        return int_cmp(a.cmp(b) as i64, 0);
     }
-    // Mixed with float: widen everything to f64.
-    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap)) {
+    if let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap)) {
         return float_cmp(a, b);
     }
     if left.is_none() && right.is_none() {
         return true;
     }
     if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
-        // unwrap_or fallback keeps the bool-returning signature panic-free;
-        // a str_ref pointing at a non-Str heap entry is an internal invariant
-        // violation that compare can't surface, so we treat both as empty.
+        // unwrap_or keeps the bool-returning signature panic-free; a str_ref
+        // pointing at a non-Str heap entry is an internal invariant violation
+        // that compare can't surface, so we treat both sides as empty.
         let a = heap.get(a_idx).and_then(HeapObject::as_str).unwrap_or("");
         let b = heap.get(b_idx).and_then(HeapObject::as_str).unwrap_or("");
-        let ord = a.cmp(b) as i64;
-        return int_cmp(ord, 0);
+        return int_cmp(a.cmp(b) as i64, 0);
     }
     false
 }

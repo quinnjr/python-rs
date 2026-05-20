@@ -1,6 +1,6 @@
 /// Built-in functions: print, range, len, type, int, str, bool, isinstance, super, etc.
 use crate::error::PythonError;
-use crate::object::{BuiltinId, ExceptionType, HeapObject, PyInt, Value, value_hash};
+use crate::object::{BuiltinId, ExceptionType, HeapObject, PyInt, Value, heap_str, value_hash};
 use num_bigint::BigInt;
 use std::collections::HashMap;
 
@@ -170,8 +170,7 @@ fn builtin_len(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError
     }
     let val = args[0];
     if let Some(idx) = val.as_str_ref() {
-        let s = heap[idx].as_str()
-            .ok_or_else(|| PythonError::runtime("internal: str ref points to non-Str heap object", 0))?;
+        let s = heap_str(heap, idx)?;
         Ok(Value::small_int_unchecked(s.len() as i64))
     } else if let Some(idx) = val.as_list_ref() {
         if let HeapObject::List(items) = &heap[idx] {
@@ -243,13 +242,8 @@ fn builtin_int(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyth
         return Err(PythonError::runtime("int() takes at most one argument", 0));
     }
     let val = args[0];
-    // Already an int (small or big) or bool — pass through unchanged for ints,
-    // widen bool to small int.
-    if val.is_int() {
-        return Ok(val);
-    }
-    if let Some(idx) = val.as_object_ref()
-        && matches!(heap[idx], HeapObject::BigInt(_)) {
+    // Already an int (small or big) — pass through unchanged. Bool widens.
+    if val.is_pyint(heap) {
         return Ok(val);
     }
     if let Some(b) = val.as_bool() {
@@ -276,9 +270,7 @@ fn builtin_int(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyth
         return Ok(Value::from_bigint(b, heap));
     }
     if let Some(idx) = val.as_str_ref() {
-        let s = heap[idx].as_str()
-            .ok_or_else(|| PythonError::runtime("internal: str ref points to non-Str heap object", 0))?
-            .trim();
+        let s = heap_str(heap, idx)?.trim();
         // Try i64 first, fall back to BigInt — same dispatch pattern as the lexer.
         if let Ok(i) = s.parse::<i64>() {
             return Ok(Value::from_i64(i, heap));
@@ -341,8 +333,7 @@ fn builtin_float(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonErr
         return Ok(Value::float(pi.to_f64()));
     }
     if let Some(idx) = val.as_str_ref() {
-        let s = heap[idx].as_str()
-            .ok_or_else(|| PythonError::runtime("internal: str ref points to non-Str heap object", 0))?;
+        let s = heap_str(heap, idx)?;
         let f: f64 = s.trim().parse().map_err(|_| {
             PythonError::runtime(format!("could not convert string to float: '{s}'"), 0)
         })?;
@@ -386,41 +377,39 @@ fn builtin_divmod(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, P
 }
 
 fn builtin_min(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
-    if args.len() < 2 {
-        return Err(PythonError::runtime("min() requires at least 2 arguments", 0));
-    }
-    let mut result = args[0];
-    for arg in &args[1..] {
-        if let (Some(a), Some(b)) = (
-            PyInt::from_value_or_bool(*arg, heap),
-            PyInt::from_value_or_bool(result, heap),
-        ) {
-            if a.cmp(b) == std::cmp::Ordering::Less { result = *arg; }
-        } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64())
-            && a < b
-        {
-            result = *arg;
-        }
-    }
-    Ok(result)
+    minmax(args, heap, std::cmp::Ordering::Less, "min")
 }
 
 fn builtin_max(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
+    minmax(args, heap, std::cmp::Ordering::Greater, "max")
+}
+
+fn minmax(
+    args: &[Value],
+    heap: &[HeapObject],
+    want: std::cmp::Ordering,
+    name: &str,
+) -> Result<Value, PythonError> {
     if args.len() < 2 {
-        return Err(PythonError::runtime("max() requires at least 2 arguments", 0));
+        return Err(PythonError::runtime(format!("{name}() requires at least 2 arguments"), 0));
     }
     let mut result = args[0];
     for arg in &args[1..] {
-        if let (Some(a), Some(b)) = (
+        let replaces = if let (Some(a), Some(b)) = (
             PyInt::from_value_or_bool(*arg, heap),
             PyInt::from_value_or_bool(result, heap),
         ) {
-            if a.cmp(b) == std::cmp::Ordering::Greater { result = *arg; }
-        } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64())
-            && a > b
-        {
-            result = *arg;
-        }
+            a.cmp(b) == want
+        } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64()) {
+            match want {
+                std::cmp::Ordering::Less    => a < b,
+                std::cmp::Ordering::Greater => a > b,
+                std::cmp::Ordering::Equal   => false,
+            }
+        } else {
+            false
+        };
+        if replaces { result = *arg; }
     }
     Ok(result)
 }

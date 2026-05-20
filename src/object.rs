@@ -20,6 +20,7 @@ use std::fmt;
 
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
+use num_traits::{Signed, ToPrimitive};
 
 /// Quiet NaN with tag bits set — base for all tagged values.
 const QNAN: u64 = 0x7FFC_0000_0000_0000;
@@ -477,7 +478,10 @@ fn pyint_as_bigint_or_i64<'a>(v: Value, heap: &'a [HeapObject]) -> Option<Either
 }
 
 /// f64 view of a numeric value (int, bool, BigInt, or float). Used by `py_eq`.
-fn value_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
+/// f64 view of any numeric Value (int, bool, BigInt, or float). The single
+/// chokepoint for "give me an f64 for this thing" — int↔float coercion in
+/// arithmetic, hashing, and comparison all go through this.
+pub fn value_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
     if let Some(f) = v.as_float() { return Some(f); }
     if let Some(i) = v.as_int() { return Some(i as f64); }
     if let Some(b) = v.as_bool() { return Some(if b { 1.0 } else { 0.0 }); }
@@ -488,11 +492,13 @@ fn value_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
     None
 }
 
-/// Convert a BigInt to f64. For huge magnitudes this returns `inf` (Python's
+/// Convert a BigInt to f64. For huge magnitudes this returns `±inf` (Python's
 /// documented behavior for unrepresentable ints in float context). For ints
 /// outside f64's exact range it loses precision, consistent with CPython.
 fn bigint_to_f64(b: &BigInt) -> Option<f64> {
-    Some(b.to_string().parse::<f64>().unwrap_or(f64::INFINITY))
+    Some(b.to_f64().unwrap_or_else(|| {
+        if b.sign() == Sign::Minus { f64::NEG_INFINITY } else { f64::INFINITY }
+    }))
 }
 
 // =====================================================================
@@ -605,10 +611,7 @@ impl<'a> PyInt<'a> {
     }
 
     pub fn floordiv(self, other: Self) -> Result<PyIntOwned, ArithError> {
-        if let PyInt::Small(0) = other { return Err(ArithError::DivByZero); }
-        if let PyInt::Big(b) = other
-            && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
-
+        check_nonzero(other)?;
         // Avoid i64::MIN / -1 overflow by falling through to BigInt.
         if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
             && !(a == i64::MIN && b == -1)
@@ -621,10 +624,7 @@ impl<'a> PyInt<'a> {
     }
 
     pub fn mod_(self, other: Self) -> Result<PyIntOwned, ArithError> {
-        if let PyInt::Small(0) = other { return Err(ArithError::DivByZero); }
-        if let PyInt::Big(b) = other
-            && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
-
+        check_nonzero(other)?;
         if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
             && !(a == i64::MIN && b == -1)
         {
@@ -636,10 +636,7 @@ impl<'a> PyInt<'a> {
     }
 
     pub fn divmod(self, other: Self) -> Result<(PyIntOwned, PyIntOwned), ArithError> {
-        if let PyInt::Small(0) = other { return Err(ArithError::DivByZero); }
-        if let PyInt::Big(b) = other
-            && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
-
+        check_nonzero(other)?;
         if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
             && !(a == i64::MIN && b == -1)
         {
@@ -690,9 +687,7 @@ impl<'a> PyInt<'a> {
     /// Not yet wired into any opcode; reserved for the three-arg pow path.
     #[allow(dead_code)]
     pub fn pow_mod(self, exp: Self, modulus: Self) -> Result<PyIntOwned, ArithError> {
-        if matches!(modulus, PyInt::Small(0)) { return Err(ArithError::DivByZero); }
-        if let PyInt::Big(b) = modulus
-            && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
+        check_nonzero(modulus)?;
         if matches!(exp, PyInt::Small(e) if e < 0) {
             return Err(ArithError::NegativePower);
         }
@@ -720,16 +715,11 @@ impl<'a> PyInt<'a> {
 
     pub fn abs(self) -> PyIntOwned {
         match self {
-            PyInt::Small(i) => {
-                match i.checked_abs() {
-                    Some(r) => PyIntOwned::Small(r).demote(),
-                    None    => PyIntOwned::Big(BigInt::from(i).magnitude().clone().into()).demote(),
-                }
-            }
-            PyInt::Big(b) => {
-                let mag: BigInt = b.magnitude().clone().into();
-                PyIntOwned::Big(mag).demote()
-            }
+            PyInt::Small(i) => match i.checked_abs() {
+                Some(r) => PyIntOwned::Small(r).demote(),
+                None    => PyIntOwned::Big(BigInt::from(i).abs()).demote(),
+            },
+            PyInt::Big(b) => PyIntOwned::Big(b.abs()).demote(),
         }
     }
 
@@ -764,13 +754,16 @@ impl<'a> PyInt<'a> {
 
     pub fn shl(self, other: Self) -> Result<PyIntOwned, ArithError> {
         let shift = pyint_to_shift_amount(other)?;
+        // i128 fast path: avoids arithmetic-shift round-trip issues with
+        // negative i64 values near the sign bit, and demote() will catch
+        // anything that exceeds i48 and bounce it to BigInt.
         if let PyInt::Small(a) = self
-            && let Ok(s) = u32::try_from(shift)
-            && let Some(r) = a.checked_shl(s)
-            // Check the result also fits i64 (shl by 63 can blow up sign).
-            && (r >> s) == a
+            && shift <= 63
         {
-            return Ok(PyIntOwned::Small(r).demote());
+            let r: i128 = (a as i128) << shift;
+            if let Ok(small) = i64::try_from(r) {
+                return Ok(PyIntOwned::Small(small).demote());
+            }
         }
         Ok(PyIntOwned::Big(self.to_owned_bigint() << shift).demote())
     }
@@ -842,18 +835,19 @@ impl PyIntOwned {
         }
     }
 
-    /// View as a borrowed PyInt without allocating. Reserved for chained
-    /// arithmetic on an owned result without converting back through Value.
-    #[allow(dead_code)]
-    pub fn as_view(&self) -> PyInt<'_> {
-        match self {
-            PyIntOwned::Small(i) => PyInt::Small(*i),
-            PyIntOwned::Big(b)   => PyInt::Big(b),
-        }
-    }
 }
 
 // ---------- shared helpers ----------
+
+/// Returns `DivByZero` if `d` is zero. Used by floordiv/mod/divmod/pow_mod.
+#[inline]
+fn check_nonzero(d: PyInt<'_>) -> Result<(), ArithError> {
+    match d {
+        PyInt::Small(0) => Err(ArithError::DivByZero),
+        PyInt::Big(b) if b.sign() == Sign::NoSign => Err(ArithError::DivByZero),
+        _ => Ok(()),
+    }
+}
 
 #[inline]
 fn floor_div_i64(a: i64, b: i64) -> i64 {
@@ -882,7 +876,10 @@ fn pyint_to_shift_amount(p: PyInt<'_>) -> Result<usize, ArithError> {
 }
 
 /// Truediv lives outside PyInt because it always returns float.
+/// Zero is checked on the int representation first so a non-zero BigInt
+/// that underflows to 0.0 doesn't get reported as division-by-zero.
 pub fn pyint_truediv(a: PyInt<'_>, b: PyInt<'_>) -> Result<f64, ArithError> {
+    check_nonzero(b)?;
     let bf = b.to_f64();
     if bf == 0.0 { return Err(ArithError::DivByZero); }
     Ok(a.to_f64() / bf)
