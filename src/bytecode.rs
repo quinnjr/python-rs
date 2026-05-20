@@ -98,6 +98,17 @@ pub mod op {
     // Unpacking
     pub const UNPACK_SEQUENCE: u8 = 140;
 
+    // Imports
+    /// stack: [level, fromlist] → [module]
+    /// operand = index into code.names — the dotted module name.
+    pub const IMPORT_NAME: u8 = 150;
+    /// stack: [module] → [module, attr_or_submodule]
+    /// operand = index into code.names — name to fetch from TOS module.
+    pub const IMPORT_FROM: u8 = 151;
+    /// stack: [module] → []
+    /// operand unused. Binds public names from module into current globals.
+    pub const IMPORT_STAR: u8 = 152;
+
     pub const HALT: u8 = 255;
 }
 

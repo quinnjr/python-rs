@@ -1344,6 +1344,14 @@ impl VM {
                         return Err(PythonError::runtime("yield outside generator", line));
                     }
                 }
+                op::IMPORT_NAME | op::IMPORT_FROM | op::IMPORT_STAR => {
+                    // Wired in M3 commit 5; currently surfaces as a clear
+                    // runtime error if any program reaches an import opcode.
+                    return Err(PythonError::runtime(
+                        format!("internal: import opcode {opcode} not yet wired (M3 in progress)"),
+                        line,
+                    ));
+                }
                 op::HALT => {
                     return Ok(());
                 }

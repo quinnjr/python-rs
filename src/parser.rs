@@ -114,6 +114,8 @@ impl Parser {
             TokenKind::Del => self.parse_delete(),
             TokenKind::Global => self.parse_global(),
             TokenKind::Nonlocal => self.parse_nonlocal(),
+            TokenKind::Import => self.parse_import(),
+            TokenKind::From => self.parse_from_import(),
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -433,6 +435,141 @@ impl Parser {
             self.advance();
         }
         Ok(Stmt::NonlocalDecl { names, line })
+    }
+
+    /// Parse `import foo`, `import foo.bar`, `import a, b as c`.
+    fn parse_import(&mut self) -> Result<Stmt, PythonError> {
+        let line = self.peek_line();
+        self.advance(); // consume 'import'
+        let mut names = Vec::new();
+        loop {
+            let dotted = self.parse_dotted_name()?;
+            let asname = if self.peek() == &TokenKind::As {
+                self.advance();
+                Some(self.expect_ident("expected name after 'as'")?)
+            } else {
+                None
+            };
+            names.push(ImportAlias { name: dotted, asname });
+            if self.peek() != &TokenKind::Comma {
+                break;
+            }
+            self.advance();
+        }
+        if self.peek() == &TokenKind::Newline {
+            self.advance();
+        }
+        Ok(Stmt::Import { names, line })
+    }
+
+    /// Parse `from foo import bar`, `from foo.bar import baz, qux as q`,
+    /// `from . import x`, `from ..pkg import y`, `from foo import *`.
+    fn parse_from_import(&mut self) -> Result<Stmt, PythonError> {
+        let line = self.peek_line();
+        self.advance(); // consume 'from'
+
+        // Leading dots → relative-import level.
+        let mut level: u32 = 0;
+        while self.peek() == &TokenKind::Dot {
+            self.advance();
+            level += 1;
+        }
+        // Ellipsis (...) counts as three dots in Python's grammar.
+        while self.peek() == &TokenKind::Ellipsis {
+            self.advance();
+            level += 3;
+        }
+
+        // Module name (optional when level > 0: `from . import x`).
+        let module = match self.peek() {
+            TokenKind::Ident(_) => Some(self.parse_dotted_name()?),
+            _ if level > 0 => None,
+            other => return Err(PythonError::parse(
+                format!("expected module name after 'from', got {other:?}"), line,
+            )),
+        };
+
+        if self.peek() != &TokenKind::Import {
+            return Err(PythonError::parse("expected 'import' after 'from <module>'", self.peek_line()));
+        }
+        self.advance(); // consume 'import'
+
+        // Star import?
+        if self.peek() == &TokenKind::Star {
+            self.advance();
+            if self.peek() == &TokenKind::Newline {
+                self.advance();
+            }
+            return Ok(Stmt::ImportFrom { module, names: Vec::new(), level, is_star: true, line });
+        }
+
+        // Optional parenthesized name list — Python allows `from foo import (a, b, c,)`.
+        let parenthesized = self.peek() == &TokenKind::LParen;
+        if parenthesized {
+            self.advance();
+        }
+
+        let mut names = Vec::new();
+        loop {
+            let name = self.expect_ident("expected name in import list")?;
+            let asname = if self.peek() == &TokenKind::As {
+                self.advance();
+                Some(self.expect_ident("expected name after 'as'")?)
+            } else {
+                None
+            };
+            names.push(ImportAlias { name, asname });
+            if self.peek() != &TokenKind::Comma {
+                break;
+            }
+            self.advance();
+            // Trailing comma allowed inside parens.
+            if parenthesized && self.peek() == &TokenKind::RParen {
+                break;
+            }
+        }
+        if parenthesized {
+            if self.peek() != &TokenKind::RParen {
+                return Err(PythonError::parse("expected ')' closing import list", self.peek_line()));
+            }
+            self.advance();
+        }
+        if self.peek() == &TokenKind::Newline {
+            self.advance();
+        }
+        Ok(Stmt::ImportFrom { module, names, level, is_star: false, line })
+    }
+
+    /// Parse a dotted name like `foo` or `foo.bar.baz`. Caller must
+    /// know the first token is an Ident.
+    fn parse_dotted_name(&mut self) -> Result<String, PythonError> {
+        let mut parts = vec![self.expect_ident("expected name")?];
+        while self.peek() == &TokenKind::Dot {
+            // Look ahead: only consume the dot if an Ident follows. Stops at
+            // an import-list comma in cases like `from foo. import x` (which
+            // is actually invalid syntax — but the lookahead keeps us from
+            // greedily consuming a trailing dot in malformed input).
+            let saved_pos = self.pos;
+            self.advance(); // consume '.'
+            match self.peek() {
+                TokenKind::Ident(_) => parts.push(self.expect_ident("expected name after '.'")?),
+                _ => {
+                    self.pos = saved_pos;
+                    break;
+                }
+            }
+        }
+        Ok(parts.join("."))
+    }
+
+    fn expect_ident(&mut self, err_msg: &'static str) -> Result<String, PythonError> {
+        match self.peek().clone() {
+            TokenKind::Ident(n) => {
+                self.advance();
+                Ok(n)
+            }
+            _ => Err(PythonError::parse(err_msg, self.peek_line())),
+        }
     }
 
     fn parse_return(&mut self) -> Result<Stmt, PythonError> {
@@ -1223,6 +1360,130 @@ mod tests {
             // ok
         } else {
             panic!("expected IfExpr");
+        }
+    }
+
+    // ---------- M3 commit 3: import statement parsing ----------
+
+    #[test]
+    fn parse_import_single_name() {
+        let m = parse_str("import foo\n");
+        match &m.body[0] {
+            Stmt::Import { names, .. } => {
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].name, "foo");
+                assert_eq!(names[0].asname, None);
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_import_dotted_name() {
+        let m = parse_str("import foo.bar.baz\n");
+        match &m.body[0] {
+            Stmt::Import { names, .. } => assert_eq!(names[0].name, "foo.bar.baz"),
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_import_with_alias() {
+        let m = parse_str("import foo.bar as fb\n");
+        match &m.body[0] {
+            Stmt::Import { names, .. } => {
+                assert_eq!(names[0].name, "foo.bar");
+                assert_eq!(names[0].asname.as_deref(), Some("fb"));
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_import_multiple() {
+        let m = parse_str("import a, b.c, d as e\n");
+        match &m.body[0] {
+            Stmt::Import { names, .. } => {
+                assert_eq!(names.len(), 3);
+                assert_eq!(names[0].name, "a");
+                assert_eq!(names[1].name, "b.c");
+                assert_eq!(names[2].name, "d");
+                assert_eq!(names[2].asname.as_deref(), Some("e"));
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_from_import_single() {
+        let m = parse_str("from foo import bar\n");
+        match &m.body[0] {
+            Stmt::ImportFrom { module, names, level, is_star, .. } => {
+                assert_eq!(module.as_deref(), Some("foo"));
+                assert_eq!(*level, 0);
+                assert!(!is_star);
+                assert_eq!(names[0].name, "bar");
+            }
+            other => panic!("expected ImportFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_from_import_multiple_with_alias() {
+        let m = parse_str("from foo.bar import baz, qux as q\n");
+        match &m.body[0] {
+            Stmt::ImportFrom { module, names, .. } => {
+                assert_eq!(module.as_deref(), Some("foo.bar"));
+                assert_eq!(names.len(), 2);
+                assert_eq!(names[1].asname.as_deref(), Some("q"));
+            }
+            other => panic!("expected ImportFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_from_import_star() {
+        let m = parse_str("from foo import *\n");
+        match &m.body[0] {
+            Stmt::ImportFrom { module, names, is_star, .. } => {
+                assert_eq!(module.as_deref(), Some("foo"));
+                assert!(*is_star);
+                assert!(names.is_empty());
+            }
+            other => panic!("expected ImportFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_from_import_relative_single_dot() {
+        let m = parse_str("from . import x\n");
+        match &m.body[0] {
+            Stmt::ImportFrom { module, level, .. } => {
+                assert_eq!(*level, 1);
+                assert_eq!(module.as_deref(), None);
+            }
+            other => panic!("expected ImportFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_from_import_relative_double_dot_with_module() {
+        let m = parse_str("from ..pkg import y\n");
+        match &m.body[0] {
+            Stmt::ImportFrom { module, level, .. } => {
+                assert_eq!(*level, 2);
+                assert_eq!(module.as_deref(), Some("pkg"));
+            }
+            other => panic!("expected ImportFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_from_import_parenthesized() {
+        let m = parse_str("from foo import (a, b, c,)\n");
+        match &m.body[0] {
+            Stmt::ImportFrom { names, .. } => assert_eq!(names.len(), 3),
+            other => panic!("expected ImportFrom, got {other:?}"),
         }
     }
 }

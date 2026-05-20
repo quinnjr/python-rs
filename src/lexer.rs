@@ -50,6 +50,7 @@ pub enum TokenKind {
     Yield,
     Is,
     From,
+    Import,
 
     // Operators
     Plus,
@@ -350,6 +351,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 "yield" => TokenKind::Yield,
                 "is" => TokenKind::Is,
                 "from" => TokenKind::From,
+                "import" => TokenKind::Import,
                 _ => TokenKind::Ident(word),
             };
             tokens.push(Token { kind, line, col: start_col });

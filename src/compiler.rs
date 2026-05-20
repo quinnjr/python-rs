@@ -367,8 +367,102 @@ impl Compiler {
             Stmt::GlobalDecl { .. } | Stmt::NonlocalDecl { .. } => {
                 // Declarations are handled by scope analysis, no runtime code needed
             }
+            Stmt::Import { names, line } => self.compile_import(names, *line)?,
+            Stmt::ImportFrom { module, names, level, is_star, line } => {
+                self.compile_import_from(module.as_deref(), names, *level, *is_star, *line)?;
+            }
         }
         Ok(())
+    }
+
+    /// `import foo, bar.baz as bb` → per-alias IMPORT_NAME + STORE_NAME.
+    fn compile_import(&mut self, names: &[ImportAlias], line: u32) -> Result<(), PythonError> {
+        for alias in names {
+            // Stack: [level=0, fromlist=None]
+            let zero = self.add_const(Value::small_int_unchecked(0));
+            self.emit(op::LOAD_CONST, zero, line);
+            let none = self.add_const(Value::none());
+            self.emit(op::LOAD_CONST, none, line);
+            // IMPORT_NAME pushes the TOP of the dotted path (Python semantic):
+            // `import foo.bar` pushes `foo`, not `foo.bar`.
+            let name_idx = self.add_name(&alias.name);
+            self.emit(op::IMPORT_NAME, name_idx, line);
+            // Bind under `asname` if present, else under the top-level name.
+            let bind_as = match &alias.asname {
+                Some(a) => a.clone(),
+                None => alias.name.split('.').next().unwrap_or("").to_string(),
+            };
+            self.store_name(&bind_as, line);
+        }
+        Ok(())
+    }
+
+    /// `from foo.bar import baz, qux as q` / `from . import x` / `from foo import *`.
+    fn compile_import_from(
+        &mut self,
+        module: Option<&str>,
+        names: &[ImportAlias],
+        level: u32,
+        is_star: bool,
+        line: u32,
+    ) -> Result<(), PythonError> {
+        // Stack: [level, fromlist]
+        let level_idx = self.add_const(Value::small_int_unchecked(level as i64));
+        self.emit(op::LOAD_CONST, level_idx, line);
+
+        let fromlist = if is_star {
+            self.materialize_tuple_const(&["*"])
+        } else {
+            let strs: Vec<&str> = names.iter().map(|a| a.name.as_str()).collect();
+            self.materialize_tuple_const(&strs)
+        };
+        let fromlist_idx = self.add_const(fromlist);
+        self.emit(op::LOAD_CONST, fromlist_idx, line);
+
+        let module_name = module.unwrap_or("");
+        let module_name_idx = self.add_name(module_name);
+        self.emit(op::IMPORT_NAME, module_name_idx, line);
+
+        if is_star {
+            self.emit(op::IMPORT_STAR, 0, line);
+        } else {
+            for alias in names {
+                let attr_idx = self.add_name(&alias.name);
+                self.emit(op::IMPORT_FROM, attr_idx, line);
+                let bind_as = alias.asname.as_ref().unwrap_or(&alias.name);
+                self.store_name(bind_as, line);
+            }
+            // Discard the module Value still on TOS.
+            self.emit(op::POP_TOP, 0, line);
+        }
+        Ok(())
+    }
+
+    /// Emit STORE_FAST (in a function scope) or STORE_GLOBAL (at module
+    /// level) for a name. Shared between import statements and `import_from`.
+    fn store_name(&mut self, name: &str, line: u32) {
+        if self.is_module_level() {
+            let idx = self.add_name(name);
+            self.emit(op::STORE_GLOBAL, idx, line);
+        } else {
+            let idx = self.add_local(name);
+            self.emit(op::STORE_FAST, idx, line);
+        }
+    }
+
+    /// Materialize a tuple of strings as a constant Value, allocating the
+    /// strings + tuple into the compiler's heap. Returns the Value ready to
+    /// stash in the constants pool. Used by import_from for the fromlist.
+    fn materialize_tuple_const(&mut self, strs: &[&str]) -> Value {
+        let mut items = Vec::with_capacity(strs.len());
+        for s in strs {
+            let str_idx = self.heap.len();
+            self.heap.push(HeapObject::Str((*s).into()));
+            items.push(Value::str_ref(str_idx));
+        }
+        let tuple_idx = self.heap.len();
+        self.heap.push(HeapObject::Tuple(items));
+        Value::object_ref(tuple_idx)
     }
 
     fn binop_to_opcode(&self, binop: &BinOp) -> u8 {
@@ -1395,5 +1489,41 @@ mod tests {
     fn compile_generator() {
         let (cos, _) = compile_src("def gen():\n    yield 1\n");
         assert!(cos[1].is_generator);
+    }
+
+    // ---------- M3 commit 3: compile import statements ----------
+
+    #[test]
+    fn compile_import_emits_import_name_and_store() {
+        let (cos, _) = compile_src("import foo\n");
+        let ops: Vec<u8> = cos[0].instructions.iter().map(|i| bytecode::decode_op(*i)).collect();
+        assert!(ops.contains(&op::IMPORT_NAME));
+        assert!(ops.contains(&op::STORE_GLOBAL));
+    }
+
+    #[test]
+    fn compile_from_import_emits_from_and_pop() {
+        let (cos, _) = compile_src("from foo import a, b\n");
+        let ops: Vec<u8> = cos[0].instructions.iter().map(|i| bytecode::decode_op(*i)).collect();
+        assert!(ops.contains(&op::IMPORT_NAME));
+        assert_eq!(ops.iter().filter(|&&o| o == op::IMPORT_FROM).count(), 2);
+        assert!(ops.contains(&op::POP_TOP));
+    }
+
+    #[test]
+    fn compile_from_import_star_emits_import_star() {
+        let (cos, _) = compile_src("from foo import *\n");
+        let ops: Vec<u8> = cos[0].instructions.iter().map(|i| bytecode::decode_op(*i)).collect();
+        assert!(ops.contains(&op::IMPORT_STAR));
+        // Star imports do NOT emit a trailing POP_TOP — IMPORT_STAR consumes the module.
+        assert!(!ops.contains(&op::IMPORT_FROM));
+    }
+
+    #[test]
+    fn compile_import_dotted_binds_top_level() {
+        // `import foo.bar` should bind `foo`, not `foo.bar`, in the current scope.
+        let (cos, _) = compile_src("import foo.bar\n");
+        assert!(cos[0].names.contains(&"foo.bar".to_string()), "expected 'foo.bar' in names for IMPORT_NAME operand");
+        assert!(cos[0].names.contains(&"foo".to_string()), "expected 'foo' in names for STORE_GLOBAL bind");
     }
 }

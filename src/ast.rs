@@ -116,6 +116,32 @@ pub enum Stmt {
         names: Vec<String>,
         line: u32,
     },
+    /// `import foo, bar.baz as bb, qux`
+    Import {
+        names: Vec<ImportAlias>,
+        line: u32,
+    },
+    /// `from foo.bar import baz, qux as q`, `from . import x`, `from foo import *`
+    ImportFrom {
+        /// Module path after the leading dots. None for `from . import x`.
+        module: Option<String>,
+        /// Imported names. Empty when `is_star` is true.
+        names: Vec<ImportAlias>,
+        /// Leading-dot count: 0 absolute, 1 single `.`, 2 `..`, etc.
+        level: u32,
+        /// True for `from foo import *`.
+        is_star: bool,
+        line: u32,
+    },
+}
+
+/// `foo as bar` in an import list. `asname = None` for plain `import foo`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportAlias {
+    /// Dotted name for `Stmt::Import` (e.g. "foo.bar"); simple name for
+    /// `Stmt::ImportFrom` (e.g. "baz").
+    pub name: String,
+    pub asname: Option<String>,
 }
 
 /// An expression.
