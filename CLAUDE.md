@@ -63,7 +63,8 @@ A Python source string flows through `lexer::tokenize` → `parser::parse` (recu
 ## Architectural constraints (still load-bearing)
 
 - **Stackless is non-negotiable.** `CALL_FUNCTION` pushes a frame and continues the dispatch loop; `RETURN_VALUE` pops and continues. Anything that introduces Rust recursion through Python code paths is wrong.
-- **`unsafe` allowed only in:** `src/object.rs` (NaN-boxing), `src/vm.rs` (hot-loop stack access), and `src/cpyext/` once it exists. Every `unsafe` block needs a `// SAFETY:` comment. Nowhere else.
+- **Avoid `unsafe`.** Prefer safe Rust everywhere — including the previously-flagged "allowed" sites (`object.rs` NaN-boxing, `vm.rs` hot-loop stack access, future `cpyext/`). Existing `unsafe` blocks in `vm.rs` should be reviewed for safe replacements when touched. New `unsafe` is only acceptable when (a) there's no safe equivalent (FFI boundary, raw pointer requirement) and (b) the performance delta against the safe version is profiled and material. Every remaining `unsafe` block must carry a `// SAFETY:` comment explaining the invariant.
+- **No `.unwrap()` or `.expect()` in non-test code.** They panic, which crashes the interpreter rather than surfacing a Python-level error. Use `?` propagation, `ok_or_else(|| PythonError::runtime("...", line))`, or pattern-match with explicit handling. "This can never fail" cases still go through `Result` with an `"internal:"` error message — once "can never" turns into "did," a panic is unrecoverable. Tests (`#[cfg(test)]` modules) are exempt; `.unwrap()` is fine there.
 - **Bytecode independence.** Our bytecode is not CPython 3.0's. Tests that introspect bytecode (`dis`, `co_code`) go on the skip list under `cpython_internal`.
 - **Edition 2024**, Rust stable.
 

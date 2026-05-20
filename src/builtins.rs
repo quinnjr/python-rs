@@ -170,7 +170,8 @@ fn builtin_len(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError
     }
     let val = args[0];
     if let Some(idx) = val.as_str_ref() {
-        let s = heap[idx].as_str().unwrap();
+        let s = heap[idx].as_str()
+            .ok_or_else(|| PythonError::runtime("internal: str ref points to non-Str heap object", 0))?;
         Ok(Value::small_int_unchecked(s.len() as i64))
     } else if let Some(idx) = val.as_list_ref() {
         if let HeapObject::List(items) = &heap[idx] {
@@ -275,7 +276,9 @@ fn builtin_int(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyth
         return Ok(Value::from_bigint(b, heap));
     }
     if let Some(idx) = val.as_str_ref() {
-        let s = heap[idx].as_str().unwrap().trim();
+        let s = heap[idx].as_str()
+            .ok_or_else(|| PythonError::runtime("internal: str ref points to non-Str heap object", 0))?
+            .trim();
         // Try i64 first, fall back to BigInt — same dispatch pattern as the lexer.
         if let Ok(i) = s.parse::<i64>() {
             return Ok(Value::from_i64(i, heap));
@@ -338,7 +341,8 @@ fn builtin_float(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonErr
         return Ok(Value::float(pi.to_f64()));
     }
     if let Some(idx) = val.as_str_ref() {
-        let s = heap[idx].as_str().unwrap();
+        let s = heap[idx].as_str()
+            .ok_or_else(|| PythonError::runtime("internal: str ref points to non-Str heap object", 0))?;
         let f: f64 = s.trim().parse().map_err(|_| {
             PythonError::runtime(format!("could not convert string to float: '{s}'"), 0)
         })?;
@@ -605,10 +609,8 @@ fn builtin_list_pop(args: &[Value], heap: &mut [HeapObject]) -> Result<Value, Py
             }
             return Err(PythonError::runtime("pop index out of range", 0));
         }
-        if items.is_empty() {
-            return Err(PythonError::runtime("pop from empty list", 0));
-        }
-        return Ok(items.pop().unwrap());
+        return items.pop()
+            .ok_or_else(|| PythonError::runtime("pop from empty list", 0));
     }
     Err(PythonError::runtime("pop: not a list", 0))
 }

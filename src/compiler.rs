@@ -47,12 +47,16 @@ impl Compiler {
     }
 
     fn current_code(&mut self) -> &mut CodeObject {
-        let idx = *self.code_stack.last().unwrap();
+        // code_stack is initialized with [0] (module scope) and only
+        // shrinks back to that after function bodies finish; last() can't
+        // be None during compilation. unwrap_or(&0) falls back to module
+        // scope to keep the path panic-free if the invariant is ever broken.
+        let idx = *self.code_stack.last().unwrap_or(&0);
         &mut self.code_objects[idx]
     }
 
     fn current_code_index(&self) -> usize {
-        *self.code_stack.last().unwrap()
+        *self.code_stack.last().unwrap_or(&0)
     }
 
     fn emit(&mut self, opcode: u8, operand: u32, line: u32) {
@@ -62,7 +66,7 @@ impl Compiler {
     }
 
     fn current_offset(&self) -> usize {
-        let idx = *self.code_stack.last().unwrap();
+        let idx = *self.code_stack.last().unwrap_or(&0);
         self.code_objects[idx].instructions.len()
     }
 
@@ -112,7 +116,7 @@ impl Compiler {
     }
 
     fn find_local(&self, name: &str) -> Option<u32> {
-        let idx = *self.code_stack.last().unwrap();
+        let idx = *self.code_stack.last().unwrap_or(&0);
         let code = &self.code_objects[idx];
         code.local_names.iter().position(|n| n == name).map(|i| i as u32)
     }
@@ -535,7 +539,8 @@ impl Compiler {
         self.emit(op::JUMP, loop_start as u32, line);
         self.patch_jump(exit_jump);
 
-        let ctx = self.loop_stack.pop().unwrap();
+        let ctx = self.loop_stack.pop()
+            .ok_or_else(|| PythonError::compile("internal: while-loop context missing on pop", line))?;
         for bp in ctx.break_patches {
             self.patch_jump(bp);
         }
@@ -569,7 +574,10 @@ impl Compiler {
             let name_idx = self.add_name(&iter_name);
             self.emit(op::LOAD_GLOBAL, name_idx, line);
         } else {
-            let local_idx = self.find_local(&iter_name).unwrap();
+            let local_idx = self.find_local(&iter_name)
+                .ok_or_else(|| PythonError::compile(
+                    format!("internal: for-loop iterator local '{iter_name}' missing"), line,
+                ))?;
             self.emit(op::LOAD_FAST, local_idx, line);
         }
 
@@ -586,7 +594,8 @@ impl Compiler {
         self.emit(op::JUMP, loop_start as u32, line);
         self.patch_jump(for_iter);
 
-        let ctx = self.loop_stack.pop().unwrap();
+        let ctx = self.loop_stack.pop()
+            .ok_or_else(|| PythonError::compile("internal: for-loop context missing on pop", line))?;
         for bp in ctx.break_patches {
             self.patch_jump(bp);
         }

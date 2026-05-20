@@ -154,16 +154,20 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 break;
             }
 
-            let current_indent = *indent_stack.last().unwrap();
+            // indent_stack is initialized with [0] and the pop loop below
+            // never drains the bottom, so last() can't be None in practice —
+            // unwrap_or(&0) keeps the code panic-free if the invariant ever
+            // gets violated, treating an empty stack as zero indent.
+            let current_indent = *indent_stack.last().unwrap_or(&0);
             if indent > current_indent {
                 indent_stack.push(indent);
                 tokens.push(Token { kind: TokenKind::Indent, line, col: 1 });
             } else {
-                while indent < *indent_stack.last().unwrap() {
+                while indent < *indent_stack.last().unwrap_or(&0) {
                     indent_stack.pop();
                     tokens.push(Token { kind: TokenKind::Dedent, line, col: 1 });
                 }
-                if indent != *indent_stack.last().unwrap() {
+                if indent != *indent_stack.last().unwrap_or(&0) {
                     return Err(PythonError::lex("inconsistent indentation", line));
                 }
             }

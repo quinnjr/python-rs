@@ -4,7 +4,7 @@ use crate::bytecode::{self, CodeObject, op};
 use crate::error::PythonError;
 use crate::object::{
     ArithError, BuiltinId, ExceptionType, GeneratorState, HeapObject, PyInt, PyPowResult,
-    Value, pyint_truediv, value_hash,
+    Value, heap_str, pyint_truediv, value_hash,
 };
 use std::collections::HashMap;
 
@@ -698,7 +698,8 @@ impl VM {
                         // When FOR_ITER ran, it incremented IP past FOR_ITER, then called
                         // resume_generator + continue. So caller.ip is at FOR_ITER + 1.
                         // We go back 2 to re-run LOAD_FAST, FOR_ITER, which will now see Completed.
-                        let caller = self.frames.last_mut().unwrap();
+                        let caller = self.frames.last_mut().ok_or_else(||
+                            PythonError::runtime("internal: caller frame missing after generator return", line))?;
                         caller.ip = caller.ip.saturating_sub(2);
                         continue;
                     }
@@ -706,7 +707,8 @@ impl VM {
                     if self.frames.is_empty() {
                         return Ok(());
                     }
-                    let caller = self.frames.last_mut().unwrap();
+                    let caller = self.frames.last_mut().ok_or_else(||
+                        PythonError::runtime("internal: caller frame missing after RETURN_VALUE", line))?;
                     // If this was an __init__ frame, push the instance instead of None
                     if let Some(instance) = init_inst {
                         caller.push(instance);
@@ -717,7 +719,9 @@ impl VM {
                 }
                 op::MAKE_FUNCTION => {
                     let code_idx_val = self.code_objects[code_index].constants[operand as usize];
-                    let func_code_index = code_idx_val.as_int().unwrap() as usize;
+                    let func_code_index = code_idx_val.as_int().ok_or_else(||
+                        PythonError::runtime("internal: MAKE_FUNCTION operand isn't a small int", line))?
+                        as usize;
                     let func_name = self.code_objects[func_code_index].name.clone();
                     let arity = self.code_objects[func_code_index].num_params as u8;
 
@@ -731,7 +735,9 @@ impl VM {
                 }
                 op::MAKE_CLOSURE => {
                     let code_idx_val = self.code_objects[code_index].constants[operand as usize];
-                    let func_code_index = code_idx_val.as_int().unwrap() as usize;
+                    let func_code_index = code_idx_val.as_int().ok_or_else(||
+                        PythonError::runtime("internal: MAKE_CLOSURE operand isn't a small int", line))?
+                        as usize;
                     let func_name = self.code_objects[func_code_index].name.clone();
                     let arity = self.code_objects[func_code_index].num_params as u8;
                     let num_free = self.code_objects[func_code_index].free_var_names.len();
@@ -740,7 +746,10 @@ impl VM {
                     let mut cells = Vec::with_capacity(num_free);
                     for _ in 0..num_free {
                         let cell_val = self.frames[frame_idx].pop();
-                        cells.push(cell_val.as_int().unwrap() as usize);
+                        let cell_idx = cell_val.as_int().ok_or_else(||
+                            PythonError::runtime("internal: LOAD_CLOSURE pushed non-int cell index", line))?
+                            as usize;
+                        cells.push(cell_idx);
                     }
                     cells.reverse();
 
@@ -1161,7 +1170,9 @@ impl VM {
                     let num_bases = operand as usize;
                     let co_idx_val = self.frames[frame_idx].pop();
                     let name_val = self.frames[frame_idx].pop();
-                    let class_co_idx = co_idx_val.as_int().unwrap() as usize;
+                    let class_co_idx = co_idx_val.as_int().ok_or_else(||
+                        PythonError::runtime("internal: BUILD_CLASS code-object index isn't a small int", line))?
+                        as usize;
                     let class_name = name_val.display(&self.heap);
 
                     let mut base_indices = Vec::with_capacity(num_bases);
@@ -1227,7 +1238,9 @@ impl VM {
                             }
                             op::MAKE_FUNCTION => {
                                 let code_idx_v = self.code_objects[co_index].constants[co_operand as usize];
-                                let fci = code_idx_v.as_int().unwrap() as usize;
+                                let fci = code_idx_v.as_int().ok_or_else(||
+                                    PythonError::runtime("internal: class-body MAKE_FUNCTION operand isn't a small int", line))?
+                                    as usize;
                                 let fname = self.code_objects[fci].name.clone();
                                 let farity = self.code_objects[fci].num_params as u8;
                                 let hi = self.heap.len();
@@ -1246,7 +1259,8 @@ impl VM {
                     }
 
                     // Extract locals as class attributes
-                    let class_frame = self.frames.pop().unwrap();
+                    let class_frame = self.frames.pop().ok_or_else(||
+                        PythonError::runtime("internal: class-body frame missing on completion", line))?;
                     let mut attrs = HashMap::new();
                     let local_names = &self.code_objects[class_co_idx].local_names;
                     for (i, name) in local_names.iter().enumerate() {
@@ -1322,7 +1336,8 @@ impl VM {
                         }
 
                         // Push yielded value to caller
-                        let caller = self.frames.last_mut().unwrap();
+                        let caller = self.frames.last_mut().ok_or_else(||
+                            PythonError::runtime("internal: caller frame missing after yield", line))?;
                         caller.push(yielded);
                         continue;
                     } else {
@@ -1373,8 +1388,11 @@ impl VM {
                     }
                     // Check class MRO
                     if let Some(method) = self.lookup_attr_on_class(class_idx, attr) {
-                        // If it's a function, bind it
-                        if method.is_func() || (method.as_object_ref().is_some() && matches!(&self.heap[method.as_object_ref().unwrap()], HeapObject::Closure { .. } | HeapObject::Function { .. })) {
+                        // If it's a function (or closure/function on the heap), bind it.
+                        let is_callable = method.is_func()
+                            || matches!(method.as_object_ref().and_then(|i| self.heap.get(i)),
+                                Some(HeapObject::Closure { .. } | HeapObject::Function { .. }));
+                        if is_callable {
                             let bound_idx = self.heap.len();
                             self.heap.push(HeapObject::BoundMethod {
                                 instance: obj,
@@ -1501,7 +1519,7 @@ impl VM {
         }
         if let Some(heap_idx) = obj.as_str_ref() {
             if let Some(i) = index.as_int() {
-                let s = self.heap[heap_idx].as_str().unwrap();
+                let s = heap_str(&self.heap, heap_idx)?;
                 let chars: Vec<char> = s.chars().collect();
                 let idx = if i < 0 { chars.len() as i64 + i } else { i } as usize;
                 if idx < chars.len() {
@@ -1943,8 +1961,8 @@ fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
         }
     }
     if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
-        let a = heap[a_idx].as_str().unwrap().to_string();
-        let b = heap[b_idx].as_str().unwrap();
+        let a = heap_str(heap, a_idx)?.to_string();
+        let b = heap_str(heap, b_idx)?;
         let result = format!("{a}{b}");
         let heap_idx = heap.len();
         heap.push(HeapObject::Str(result.into()));
@@ -1989,14 +2007,14 @@ fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
     }
     // String repetition — count comes from the int side (small only for now).
     if let Some(s_idx) = left.as_str_ref() && let Some(n) = right.as_int() {
-        let s = heap[s_idx].as_str().unwrap();
+        let s = heap_str(heap, s_idx)?;
         let result = s.repeat(n.max(0) as usize);
         let heap_idx = heap.len();
         heap.push(HeapObject::Str(result.into()));
         return Ok(Value::str_ref(heap_idx));
     }
     if let Some(n) = left.as_int() && let Some(s_idx) = right.as_str_ref() {
-        let s = heap[s_idx].as_str().unwrap();
+        let s = heap_str(heap, s_idx)?;
         let result = s.repeat(n.max(0) as usize);
         let heap_idx = heap.len();
         heap.push(HeapObject::Str(result.into()));
@@ -2116,8 +2134,11 @@ fn compare(
         return true;
     }
     if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
-        let a = heap[a_idx].as_str().unwrap();
-        let b = heap[b_idx].as_str().unwrap();
+        // unwrap_or fallback keeps the bool-returning signature panic-free;
+        // a str_ref pointing at a non-Str heap entry is an internal invariant
+        // violation that compare can't surface, so we treat both as empty.
+        let a = heap.get(a_idx).and_then(HeapObject::as_str).unwrap_or("");
+        let b = heap.get(b_idx).and_then(HeapObject::as_str).unwrap_or("");
         let ord = a.cmp(b) as i64;
         return int_cmp(ord, 0);
     }

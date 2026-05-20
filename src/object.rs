@@ -49,12 +49,14 @@ pub struct Value(u64);
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_float() {
-            write!(f, "Value(float={})", self.as_float().unwrap())
-        } else if self.is_int() {
-            write!(f, "Value(int={})", self.as_int().unwrap())
-        } else if self.is_bool() {
-            write!(f, "Value(bool={})", self.as_bool().unwrap())
+        // Each branch's type predicate guarantees the matching accessor
+        // returns Some; pattern-match on the Option so we never unwrap.
+        if let Some(v) = self.as_float() {
+            write!(f, "Value(float={v})")
+        } else if let Some(v) = self.as_int() {
+            write!(f, "Value(int={v})")
+        } else if let Some(v) = self.as_bool() {
+            write!(f, "Value(bool={v})")
         } else if self.is_none() {
             write!(f, "Value(None)")
         } else {
@@ -530,7 +532,11 @@ pub enum PyPowResult {
 pub enum ArithError {
     DivByZero,
     NegativeShift,
-    NegativePower, // pow_mod with negative exponent and no modulus
+    /// pow_mod with negative exponent and no modulus. Not yet
+    /// constructible from any opcode; reserved for the three-arg
+    /// pow path that lands when the VM gets a fused opcode for it.
+    #[allow(dead_code)]
+    NegativePower,
 }
 
 impl<'a> PyInt<'a> {
@@ -572,28 +578,28 @@ impl<'a> PyInt<'a> {
     }
 
     pub fn add(self, other: Self) -> PyIntOwned {
-        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
-            if let Some(r) = a.checked_add(b) {
-                return PyIntOwned::Small(r).demote();
-            }
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
+            && let Some(r) = a.checked_add(b)
+        {
+            return PyIntOwned::Small(r).demote();
         }
         PyIntOwned::Big(self.to_owned_bigint() + other.to_owned_bigint()).demote()
     }
 
     pub fn sub(self, other: Self) -> PyIntOwned {
-        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
-            if let Some(r) = a.checked_sub(b) {
-                return PyIntOwned::Small(r).demote();
-            }
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
+            && let Some(r) = a.checked_sub(b)
+        {
+            return PyIntOwned::Small(r).demote();
         }
         PyIntOwned::Big(self.to_owned_bigint() - other.to_owned_bigint()).demote()
     }
 
     pub fn mul(self, other: Self) -> PyIntOwned {
-        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
-            if let Some(r) = a.checked_mul(b) {
-                return PyIntOwned::Small(r).demote();
-            }
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
+            && let Some(r) = a.checked_mul(b)
+        {
+            return PyIntOwned::Small(r).demote();
         }
         PyIntOwned::Big(self.to_owned_bigint() * other.to_owned_bigint()).demote()
     }
@@ -603,11 +609,11 @@ impl<'a> PyInt<'a> {
         if let PyInt::Big(b) = other
             && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
 
-        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
-            // Avoid i64::MIN / -1 overflow by falling through to BigInt.
-            if !(a == i64::MIN && b == -1) {
-                return Ok(PyIntOwned::Small(floor_div_i64(a, b)).demote());
-            }
+        // Avoid i64::MIN / -1 overflow by falling through to BigInt.
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
+            && !(a == i64::MIN && b == -1)
+        {
+            return Ok(PyIntOwned::Small(floor_div_i64(a, b)).demote());
         }
         let a = self.to_owned_bigint();
         let b = other.to_owned_bigint();
@@ -619,10 +625,10 @@ impl<'a> PyInt<'a> {
         if let PyInt::Big(b) = other
             && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
 
-        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
-            if !(a == i64::MIN && b == -1) {
-                return Ok(PyIntOwned::Small(floor_mod_i64(a, b)).demote());
-            }
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
+            && !(a == i64::MIN && b == -1)
+        {
+            return Ok(PyIntOwned::Small(floor_mod_i64(a, b)).demote());
         }
         let a = self.to_owned_bigint();
         let b = other.to_owned_bigint();
@@ -634,12 +640,12 @@ impl<'a> PyInt<'a> {
         if let PyInt::Big(b) = other
             && b.sign() == Sign::NoSign { return Err(ArithError::DivByZero); }
 
-        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other) {
-            if !(a == i64::MIN && b == -1) {
-                let q = floor_div_i64(a, b);
-                let r = floor_mod_i64(a, b);
-                return Ok((PyIntOwned::Small(q).demote(), PyIntOwned::Small(r).demote()));
-            }
+        if let (PyInt::Small(a), PyInt::Small(b)) = (self, other)
+            && !(a == i64::MIN && b == -1)
+        {
+            let q = floor_div_i64(a, b);
+            let r = floor_mod_i64(a, b);
+            return Ok((PyIntOwned::Small(q).demote(), PyIntOwned::Small(r).demote()));
         }
         let a = self.to_owned_bigint();
         let b = other.to_owned_bigint();
@@ -681,6 +687,8 @@ impl<'a> PyInt<'a> {
 
     /// Three-arg pow: `pow(self, exp, modulus)`. Negative `exp` requires a
     /// modular inverse which is out of M2 scope — we error on it.
+    /// Not yet wired into any opcode; reserved for the three-arg pow path.
+    #[allow(dead_code)]
     pub fn pow_mod(self, exp: Self, modulus: Self) -> Result<PyIntOwned, ArithError> {
         if matches!(modulus, PyInt::Small(0)) { return Err(ArithError::DivByZero); }
         if let PyInt::Big(b) = modulus
@@ -757,13 +765,12 @@ impl<'a> PyInt<'a> {
     pub fn shl(self, other: Self) -> Result<PyIntOwned, ArithError> {
         let shift = pyint_to_shift_amount(other)?;
         if let PyInt::Small(a) = self
-            && let Ok(s) = u32::try_from(shift) {
-            if let Some(r) = a.checked_shl(s) {
-                // Check the result also fits i64 (shl by 63 can blow up sign).
-                if (r >> s) == a {
-                    return Ok(PyIntOwned::Small(r).demote());
-                }
-            }
+            && let Ok(s) = u32::try_from(shift)
+            && let Some(r) = a.checked_shl(s)
+            // Check the result also fits i64 (shl by 63 can blow up sign).
+            && (r >> s) == a
+        {
+            return Ok(PyIntOwned::Small(r).demote());
         }
         Ok(PyIntOwned::Big(self.to_owned_bigint() << shift).demote())
     }
@@ -788,6 +795,11 @@ impl<'a> PyInt<'a> {
         }
     }
 
+    /// Convenience int-vs-int equality. Most call sites use
+    /// `Value::py_eq` directly because they don't pre-convert to PyInt;
+    /// this is here for completeness and for future builtins like
+    /// `operator.eq`.
+    #[allow(dead_code)]
     pub fn eq(self, other: Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Equal
     }
@@ -830,7 +842,9 @@ impl PyIntOwned {
         }
     }
 
-    /// View as a borrowed PyInt without allocating.
+    /// View as a borrowed PyInt without allocating. Reserved for chained
+    /// arithmetic on an owned result without converting back through Value.
+    #[allow(dead_code)]
     pub fn as_view(&self) -> PyInt<'_> {
         match self {
             PyIntOwned::Small(i) => PyInt::Small(*i),
@@ -1033,6 +1047,19 @@ impl HeapObject {
             _ => None,
         }
     }
+}
+
+/// Fetch a `&str` from heap at the given index. Used wherever we've
+/// already verified the Value carries a str ref via `as_str_ref()` and
+/// want the actual string content. Returns an internal RuntimeError if
+/// the heap entry isn't a Str (which should never happen with a valid
+/// str ref but we surface it as an error rather than panicking).
+pub fn heap_str(heap: &[HeapObject], idx: usize) -> Result<&str, crate::error::PythonError> {
+    heap.get(idx).and_then(HeapObject::as_str).ok_or_else(|| {
+        crate::error::PythonError::runtime(
+            format!("internal: heap index {idx} does not point to a Str"), 0,
+        )
+    })
 }
 
 /// Generator execution state.
