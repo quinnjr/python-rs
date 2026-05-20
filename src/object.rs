@@ -1168,23 +1168,25 @@ pub enum BuiltinId {
 
 /// Compute a hash for a Value, used in dict key lookup.
 pub fn value_hash(v: Value, heap: &[HeapObject]) -> u64 {
-    if let Some(i) = v.as_int() {
-        i as u64
-    } else if let Some(b) = v.as_bool() {
-        b as u64
-    } else if v.is_none() {
-        0x_DEAD_CAFE
-    } else if let Some(idx) = v.as_str_ref() {
+    // Int / bool / BigInt — go through PyInt::hash for CPython-compatible
+    // semantics (Mersenne reduction with -1 → -2 sentinel). Bool widens
+    // so `hash(True) == hash(1) == 1` as Python requires.
+    if let Some(pi) = PyInt::from_value_or_bool(v, heap) {
+        return pi.hash() as u64;
+    }
+    if v.is_none() {
+        return 0x_DEAD_CAFE;
+    }
+    if let Some(idx) = v.as_str_ref() {
         let s = heap[idx].as_str().unwrap_or("");
         let mut h: u64 = 5381;
         for b in s.bytes() {
             h = h.wrapping_mul(33).wrapping_add(b as u64);
         }
-        h
-    } else {
-        // Identity hash for other types
-        v.0
+        return h;
     }
+    // Identity hash for other types
+    v.0
 }
 
 #[cfg(test)]

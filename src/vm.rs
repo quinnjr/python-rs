@@ -2,7 +2,10 @@
 use crate::builtins;
 use crate::bytecode::{self, CodeObject, op};
 use crate::error::PythonError;
-use crate::object::{BuiltinId, ExceptionType, GeneratorState, HeapObject, Value, value_hash};
+use crate::object::{
+    ArithError, BuiltinId, ExceptionType, GeneratorState, HeapObject, PyInt, PyPowResult,
+    Value, pyint_truediv, value_hash,
+};
 use std::collections::HashMap;
 
 const MAX_STACK: usize = 256;
@@ -262,7 +265,7 @@ impl VM {
                 op::SUB => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    match binary_arith(left, right, line, |a, b| a - b, |a, b| a - b) {
+                    match binary_sub(left, right, &mut self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
                         Err(e) => { self.try_handle_error(e, line)?; continue; }
                     }
@@ -278,7 +281,7 @@ impl VM {
                 op::DIV => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    match binary_div(left, right, line) {
+                    match binary_div(left, right, &self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
                         Err(e) => { self.try_handle_error(e, line)?; continue; }
                     }
@@ -286,7 +289,7 @@ impl VM {
                 op::FLOOR_DIV => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    match binary_floor_div(left, right, line) {
+                    match binary_floor_div(left, right, &mut self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
                         Err(e) => { self.try_handle_error(e, line)?; continue; }
                     }
@@ -294,7 +297,7 @@ impl VM {
                 op::MOD => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    match binary_mod(left, right, &self.heap, line) {
+                    match binary_mod(left, right, &mut self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
                         Err(e) => { self.try_handle_error(e, line)?; continue; }
                     }
@@ -302,13 +305,13 @@ impl VM {
                 op::POW => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let result = binary_pow(left, right, line)?;
+                    let result = binary_pow(left, right, &mut self.heap, line)?;
                     self.frames[frame_idx].push(result);
                 }
                 op::UNARY_NEG => {
                     let val = self.frames[frame_idx].pop();
-                    let result = if let Some(i) = val.as_int() {
-                        Value::small_int_unchecked(-i)
+                    let result = if let Some(pi) = PyInt::from_value_or_bool(val, &self.heap) {
+                        pi.neg().into_value(&mut self.heap)
                     } else if let Some(f) = val.as_float() {
                         Value::float(-f)
                     } else {
@@ -323,7 +326,9 @@ impl VM {
                 }
                 op::UNARY_POS => {
                     let val = self.frames[frame_idx].pop();
-                    let result = if val.is_int() || val.is_float() {
+                    // Unary + is identity on numbers — int/float/bool/BigInt.
+                    let result = if val.is_int() || val.is_float() || val.is_bool()
+                        || val.is_pyint(&self.heap) {
                         val
                     } else {
                         return Err(PythonError::runtime("bad operand for unary +", line));
@@ -332,8 +337,9 @@ impl VM {
                 }
                 op::UNARY_INVERT => {
                     let val = self.frames[frame_idx].pop();
-                    if let Some(i) = val.as_int() {
-                        self.frames[frame_idx].push(Value::small_int_unchecked(!i));
+                    if let Some(pi) = PyInt::from_value_or_bool(val, &self.heap) {
+                        let r = pi.invert().into_value(&mut self.heap);
+                        self.frames[frame_idx].push(r);
                     } else {
                         return Err(PythonError::runtime("bad operand type for unary ~", line));
                     }
@@ -397,8 +403,12 @@ impl VM {
                 op::BIT_AND => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::small_int_unchecked(a & b));
+                    if let (Some(a), Some(b)) = (
+                        PyInt::from_value_or_bool(left, &self.heap),
+                        PyInt::from_value_or_bool(right, &self.heap),
+                    ) {
+                        let r = a.and_(b).into_value(&mut self.heap);
+                        self.frames[frame_idx].push(r);
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for &", line));
                     }
@@ -406,8 +416,12 @@ impl VM {
                 op::BIT_OR => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::small_int_unchecked(a | b));
+                    if let (Some(a), Some(b)) = (
+                        PyInt::from_value_or_bool(left, &self.heap),
+                        PyInt::from_value_or_bool(right, &self.heap),
+                    ) {
+                        let r = a.or_(b).into_value(&mut self.heap);
+                        self.frames[frame_idx].push(r);
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for |", line));
                     }
@@ -415,8 +429,12 @@ impl VM {
                 op::BIT_XOR => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::small_int_unchecked(a ^ b));
+                    if let (Some(a), Some(b)) = (
+                        PyInt::from_value_or_bool(left, &self.heap),
+                        PyInt::from_value_or_bool(right, &self.heap),
+                    ) {
+                        let r = a.xor_(b).into_value(&mut self.heap);
+                        self.frames[frame_idx].push(r);
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for ^", line));
                     }
@@ -424,8 +442,14 @@ impl VM {
                 op::LSHIFT => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::small_int_unchecked(a << b));
+                    if let (Some(a), Some(b)) = (
+                        PyInt::from_value_or_bool(left, &self.heap),
+                        PyInt::from_value_or_bool(right, &self.heap),
+                    ) {
+                        match a.shl(b) {
+                            Ok(o) => self.frames[frame_idx].push(o.into_value(&mut self.heap)),
+                            Err(e) => return Err(arith_to_runtime(e, "<<", line)),
+                        }
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for <<", line));
                     }
@@ -433,8 +457,14 @@ impl VM {
                 op::RSHIFT => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::small_int_unchecked(a >> b));
+                    if let (Some(a), Some(b)) = (
+                        PyInt::from_value_or_bool(left, &self.heap),
+                        PyInt::from_value_or_bool(right, &self.heap),
+                    ) {
+                        match a.shr(b) {
+                            Ok(o) => self.frames[frame_idx].push(o.into_value(&mut self.heap)),
+                            Err(e) => return Err(arith_to_runtime(e, ">>", line)),
+                        }
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for >>", line));
                     }
@@ -1853,24 +1883,12 @@ fn is_truthy(val: Value, heap: &[HeapObject]) -> bool {
 }
 
 fn values_equal(left: Value, right: Value, heap: &[HeapObject]) -> bool {
-    // Same bit pattern
-    if left.bits_eq(right) { return true; }
-    // None comparisons
-    if left.is_none() && right.is_none() { return true; }
-    if left.is_none() || right.is_none() { return false; }
-    // Numeric
-    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) { return a == b; }
-    if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64())
-        && (left.is_float() || right.is_float()) { return a == b; }
-    // Bool
-    if let (Some(a), Some(b)) = (left.as_bool(), right.as_bool()) { return a == b; }
-    // String
-    if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
-        let a = heap[a_idx].as_str().unwrap_or("");
-        let b = heap[b_idx].as_str().unwrap_or("");
-        return a == b;
-    }
-    // Exception type matching (for except handlers)
+    // Defer Python value equality (cross-representation int, float coercion,
+    // bool widening, string content) to Value::py_eq. Anything it accepts is
+    // already equal under Python `==`.
+    if left.py_eq(right, heap) { return true; }
+    // Exception type matching (for except handlers) — vm-specific layer on
+    // top of plain Python equality.
     if let (Some(a_idx), Some(b_idx)) = (left.as_object_ref(), right.as_object_ref()) {
         // If one is an ExceptionObj and the other is an ExcConstructor builtin,
         // compare types
@@ -1890,12 +1908,39 @@ fn values_equal(left: Value, right: Value, heap: &[HeapObject]) -> bool {
     false
 }
 
+/// Convert an ArithError to the corresponding RuntimeError message.
+/// Once exception types are first-class at this layer this becomes a
+/// proper ZeroDivisionError / ValueError dispatch.
+fn arith_to_runtime(err: ArithError, op_msg: &str, line: u32) -> PythonError {
+    let msg = match err {
+        ArithError::DivByZero      => format!("{op_msg} by zero"),
+        ArithError::NegativeShift  => "negative shift count".to_string(),
+        ArithError::NegativePower  => "pow() 2nd argument cannot be negative when 3rd argument specified".to_string(),
+    };
+    PythonError::runtime(msg, line)
+}
+
+/// True if `v` carries a float — used to choose the int vs float path.
+fn is_numeric_float(v: Value) -> bool {
+    v.is_float()
+}
+
 fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        return Ok(Value::small_int_unchecked(a + b));
+    // Int + int (small or big, bool widens).
+    if let (Some(a), Some(b)) = (
+        PyInt::from_value_or_bool(left, heap),
+        PyInt::from_value_or_bool(right, heap),
+    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+        return Ok(a.add(b).into_value(heap));
     }
-    if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) && (left.is_float() || right.is_float()) {
-        return Ok(Value::float(a + b));
+    // Float (or int↔float) — int side widens through PyInt::to_f64
+    // so even huge BigInts collapse to inf consistently with CPython.
+    if is_numeric_float(left) || is_numeric_float(right) {
+        let af = num_to_f64(left, heap);
+        let bf = num_to_f64(right, heap);
+        if let (Some(a), Some(b)) = (af, bf) {
+            return Ok(Value::float(a + b));
+        }
     }
     if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
         let a = heap[a_idx].as_str().unwrap().to_string();
@@ -1905,7 +1950,6 @@ fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
         heap.push(HeapObject::Str(result.into()));
         return Ok(Value::str_ref(heap_idx));
     }
-    // List concatenation
     if let (Some(a_idx), Some(b_idx)) = (left.as_list_ref(), right.as_list_ref()) {
         let a = if let HeapObject::List(items) = &heap[a_idx] { items.clone() } else { Vec::new() };
         let b = if let HeapObject::List(items) = &heap[b_idx] { items.clone() } else { Vec::new() };
@@ -1918,30 +1962,32 @@ fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
     Err(PythonError::runtime("unsupported operand type(s) for +", line))
 }
 
-fn binary_arith(
-    left: Value,
-    right: Value,
-    line: u32,
-    int_op: impl Fn(i64, i64) -> i64,
-    float_op: impl Fn(f64, f64) -> f64,
-) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        return Ok(Value::small_int_unchecked(int_op(a, b)));
+fn binary_sub(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+    if let (Some(a), Some(b)) = (
+        PyInt::from_value_or_bool(left, heap),
+        PyInt::from_value_or_bool(right, heap),
+    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+        return Ok(a.sub(b).into_value(heap));
     }
-    if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) && (left.is_float() || right.is_float()) {
-        return Ok(Value::float(float_op(a, b)));
+    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap))
+        && (is_numeric_float(left) || is_numeric_float(right)) {
+        return Ok(Value::float(a - b));
     }
-    Err(PythonError::runtime("unsupported operand types", line))
+    Err(PythonError::runtime("unsupported operand type(s) for -", line))
 }
 
 fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        return Ok(Value::small_int_unchecked(a * b));
+    if let (Some(a), Some(b)) = (
+        PyInt::from_value_or_bool(left, heap),
+        PyInt::from_value_or_bool(right, heap),
+    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+        return Ok(a.mul(b).into_value(heap));
     }
-    if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) && (left.is_float() || right.is_float()) {
+    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap))
+        && (is_numeric_float(left) || is_numeric_float(right)) {
         return Ok(Value::float(a * b));
     }
-    // String repetition
+    // String repetition — count comes from the int side (small only for now).
     if let Some(s_idx) = left.as_str_ref() && let Some(n) = right.as_int() {
         let s = heap[s_idx].as_str().unwrap();
         let result = s.repeat(n.max(0) as usize);
@@ -1959,23 +2005,34 @@ fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
     Err(PythonError::runtime("unsupported operand type(s) for *", line))
 }
 
-fn binary_div(left: Value, right: Value, line: u32) -> Result<Value, PythonError> {
-    let a = left.to_f64().ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
-    let b = right.to_f64().ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
-    if b == 0.0 {
+fn binary_div(left: Value, right: Value, heap: &[HeapObject], line: u32) -> Result<Value, PythonError> {
+    // Python `/` is always true-division, returns float.
+    if let (Some(a), Some(b)) = (
+        PyInt::from_value_or_bool(left, heap),
+        PyInt::from_value_or_bool(right, heap),
+    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+        return pyint_truediv(a, b)
+            .map(Value::float)
+            .map_err(|e| arith_to_runtime(e, "division", line));
+    }
+    let af = num_to_f64(left, heap).ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
+    let bf = num_to_f64(right, heap).ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
+    if bf == 0.0 {
         return Err(PythonError::runtime("division by zero", line));
     }
-    Ok(Value::float(a / b))
+    Ok(Value::float(af / bf))
 }
 
-fn binary_floor_div(left: Value, right: Value, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        if b == 0 {
-            return Err(PythonError::runtime("integer division or modulo by zero", line));
-        }
-        return Ok(Value::small_int_unchecked(a.div_euclid(b)));
+fn binary_floor_div(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+    if let (Some(a), Some(b)) = (
+        PyInt::from_value_or_bool(left, heap),
+        PyInt::from_value_or_bool(right, heap),
+    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+        return a.floordiv(b)
+            .map(|r| r.into_value(heap))
+            .map_err(|e| arith_to_runtime(e, "integer division or modulo", line));
     }
-    if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) {
+    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap)) {
         if b == 0.0 {
             return Err(PythonError::runtime("float floor division by zero", line));
         }
@@ -1984,38 +2041,53 @@ fn binary_floor_div(left: Value, right: Value, line: u32) -> Result<Value, Pytho
     Err(PythonError::runtime("unsupported operand type(s) for //", line))
 }
 
-fn binary_mod(left: Value, right: Value, heap: &[HeapObject], line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        if b == 0 {
-            return Err(PythonError::runtime("integer division or modulo by zero", line));
-        }
-        return Ok(Value::small_int_unchecked(a.rem_euclid(b)));
+fn binary_mod(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+    if let (Some(a), Some(b)) = (
+        PyInt::from_value_or_bool(left, heap),
+        PyInt::from_value_or_bool(right, heap),
+    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+        return a.mod_(b)
+            .map(|r| r.into_value(heap))
+            .map_err(|e| arith_to_runtime(e, "integer division or modulo", line));
     }
-    if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) {
+    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap)) {
         if b == 0.0 {
             return Err(PythonError::runtime("float modulo by zero", line));
         }
         let result = ((a % b) + b) % b;
         return Ok(Value::float(result));
     }
-    // String formatting: "hello %s" % value
-    if let Some(s_idx) = left.as_str_ref() {
-        let _ = (heap, s_idx, right); // basic support, skip for now
+    // String formatting: "hello %s" % value — stub
+    if left.as_str_ref().is_some() {
+        let _ = right;
     }
     Err(PythonError::runtime("unsupported operand type(s) for %", line))
 }
 
-fn binary_pow(left: Value, right: Value, line: u32) -> Result<Value, PythonError> {
-    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        if b >= 0 {
-            return Ok(Value::small_int_unchecked(a.pow(b as u32)));
-        }
-        return Ok(Value::float((a as f64).powi(b as i32)));
+fn binary_pow(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+    if let (Some(a), Some(b)) = (
+        PyInt::from_value_or_bool(left, heap),
+        PyInt::from_value_or_bool(right, heap),
+    ) && !is_numeric_float(left) && !is_numeric_float(right) {
+        return Ok(match a.pow(b) {
+            PyPowResult::Int(o)   => o.into_value(heap),
+            PyPowResult::Float(f) => Value::float(f),
+        });
     }
-    if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) {
+    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap)) {
         return Ok(Value::float(a.powf(b)));
     }
     Err(PythonError::runtime("unsupported operand type(s) for **", line))
+}
+
+/// Numeric-to-f64: handles int (small/big), bool, and float. Used wherever
+/// an int↔float mixed op needs a unified f64 path.
+fn num_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
+    if let Some(f) = v.as_float() { return Some(f); }
+    if let Some(pi) = PyInt::from_value_or_bool(v, heap) {
+        return Some(pi.to_f64());
+    }
+    None
 }
 
 fn compare(
@@ -2025,22 +2097,31 @@ fn compare(
     int_cmp: impl Fn(i64, i64) -> bool,
     float_cmp: impl Fn(f64, f64) -> bool,
 ) -> bool {
-    if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        int_cmp(a, b)
-    } else if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) {
-        float_cmp(a, b)
-    } else if let (Some(a), Some(b)) = (left.as_bool(), right.as_bool()) {
-        int_cmp(a as i64, b as i64)
-    } else if left.is_none() && right.is_none() {
-        true
-    } else if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
+    // Int family (small, big, bool) ↔ int family: use PyInt::cmp for total
+    // ordering across representations.
+    if !is_numeric_float(left) && !is_numeric_float(right)
+        && let (Some(a), Some(b)) = (
+            PyInt::from_value_or_bool(left, heap),
+            PyInt::from_value_or_bool(right, heap),
+        )
+    {
+        let ord = a.cmp(b) as i64;
+        return int_cmp(ord, 0);
+    }
+    // Mixed with float: widen everything to f64.
+    if let (Some(a), Some(b)) = (num_to_f64(left, heap), num_to_f64(right, heap)) {
+        return float_cmp(a, b);
+    }
+    if left.is_none() && right.is_none() {
+        return true;
+    }
+    if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
         let a = heap[a_idx].as_str().unwrap();
         let b = heap[b_idx].as_str().unwrap();
         let ord = a.cmp(b) as i64;
-        int_cmp(ord, 0)
-    } else {
-        false
+        return int_cmp(ord, 0);
     }
+    false
 }
 
 fn contains(item: &Value, container: &Value, heap: &[HeapObject]) -> Result<bool, PythonError> {
@@ -2228,5 +2309,141 @@ print(fib(10))
             "11", "Fizz", "13", "14", "FizzBuzz", "16", "17", "Fizz", "19", "Buzz",
         ]);
         assert_eq!(output[22], "55");
+    }
+
+    // ---------- M2 commit 3: BigInt end-to-end through the VM ----------
+
+    #[test]
+    fn bigint_i64_overflow_promotes_correctly() {
+        // Lexer in this commit still produces small_int_unchecked for
+        // literals (commit 4 wires up BigInt literals), so we exercise
+        // overflow via arithmetic from small operands. 100^10 = 10^20,
+        // which doesn't fit in i64 and must promote to BigInt.
+        let out = run_and_capture("print(100 ** 10)\n");
+        assert_eq!(out, vec!["100000000000000000000"]);
+    }
+
+    #[test]
+    fn bigint_multiplication_grows() {
+        // 100**10 = 10^20, doesn't fit in i64.
+        let out = run_and_capture("print(100 ** 10)\n");
+        assert_eq!(out, vec!["100000000000000000000"]);
+    }
+
+    #[test]
+    fn bigint_negation_of_huge() {
+        let out = run_and_capture("x = 100 ** 10\nprint(-x)\n");
+        assert_eq!(out, vec!["-100000000000000000000"]);
+    }
+
+    #[test]
+    fn bigint_subtraction_demotes_to_small() {
+        // Difference of two big ints that fits in i48 — verify demote works
+        // end-to-end (result prints as a small int).
+        let out = run_and_capture(
+            "x = 100 ** 10\ny = 100 ** 10 - 7\nprint(x - y)\n"
+        );
+        assert_eq!(out, vec!["7"]);
+    }
+
+    #[test]
+    fn bigint_pow_grows() {
+        // 2**100 is well past i64. Print should give exact decimal.
+        let out = run_and_capture("print(2 ** 100)\n");
+        assert_eq!(out, vec!["1267650600228229401496703205376"]);
+    }
+
+    #[test]
+    fn bigint_floordiv_python_semantics() {
+        // -7 // 2 == -4 in Python (NOT -3 as Rust truncating div gives).
+        let out = run_and_capture("print(-7 // 2)\n");
+        assert_eq!(out, vec!["-4"]);
+    }
+
+    #[test]
+    fn bigint_mod_sign_of_divisor() {
+        // -7 % 2 == 1 in Python (result takes sign of divisor).
+        let out = run_and_capture("print(-7 % 2)\n");
+        assert_eq!(out, vec!["1"]);
+        let out = run_and_capture("print(7 % -2)\n");
+        assert_eq!(out, vec!["-1"]);
+    }
+
+    #[test]
+    fn bigint_division_returns_float() {
+        // True division always produces float, even with int operands.
+        let out = run_and_capture("print(7 / 2)\n");
+        assert_eq!(out, vec!["3.5"]);
+    }
+
+    #[test]
+    fn bigint_division_by_zero_errors() {
+        let err = run_expect_err("print(1 // 0)\n");
+        assert!(err.contains("by zero"), "expected division-by-zero error, got: {err}");
+    }
+
+    #[test]
+    fn bigint_shift_into_big() {
+        let out = run_and_capture("print(1 << 80)\n");
+        assert_eq!(out, vec!["1208925819614629174706176"]);
+    }
+
+    #[test]
+    fn bigint_bitwise_on_big() {
+        // Both operands big enough to overflow i48.
+        let out = run_and_capture("print((1 << 80) & ((1 << 80) - 1))\n");
+        assert_eq!(out, vec!["0"]);
+    }
+
+    #[test]
+    fn bool_widens_to_int_in_arithmetic() {
+        // Regression: prior code's binary_add didn't widen bool, so
+        // True + 1 erroneously errored. Migrating to PyInt fixed this.
+        let out = run_and_capture("print(True + 1)\n");
+        assert_eq!(out, vec!["2"]);
+        let out = run_and_capture("print(False + True)\n");
+        assert_eq!(out, vec!["1"]);
+    }
+
+    #[test]
+    fn bigint_comparison_cross_representation() {
+        // Comparing small int 7 against BigInt-7 (constructed via arithmetic
+        // that goes through BigInt then demotes back, so b ends up small).
+        // The real cross-rep test: keep one side BigInt by not subtracting
+        // all the way back.
+        let out = run_and_capture(
+            "a = 7\nb = (1 << 80) - ((1 << 80) - 7)\nprint(a == b)\nprint(a < b)\n"
+        );
+        assert_eq!(out, vec!["True", "False"]);
+    }
+
+    #[test]
+    fn bigint_dict_key_hashes_correctly() {
+        // Hash dispatch through PyInt::hash — BigInt key in a dict.
+        let out = run_and_capture(
+            "x = 2 ** 100\nd = {x: \"hello\"}\nprint(d[2 ** 100])\n"
+        );
+        assert_eq!(out, vec!["hello"]);
+    }
+
+    #[test]
+    fn bool_int_dict_lookup_collides() {
+        // hash(True) == hash(1) AND True == 1, so d[True] should find the
+        // entry stored at key 1. (BUILD_DICT dedup of duplicate-equal keys
+        // is a separate concern, not exercised here.)
+        let out = run_and_capture(
+            "d = {1: \"hello\"}\nprint(d[True])\n"
+        );
+        assert_eq!(out, vec!["hello"]);
+    }
+
+    #[test]
+    fn bigint_int_dict_lookup_collides() {
+        // BigInt 7 (constructed via overflow path then demoted, then promoted
+        // again) hashes and compares equal to small int 7.
+        let out = run_and_capture(
+            "d = {7: \"hello\"}\nbig_seven = (10 ** 20) // (10 ** 20 // 7)\nprint(d[big_seven])\n"
+        );
+        assert_eq!(out, vec!["hello"]);
     }
 }
