@@ -4,6 +4,7 @@ mod bytecode;
 mod cmodules;
 mod compiler;
 mod error;
+mod import;
 mod lexer;
 mod object;
 mod parser;

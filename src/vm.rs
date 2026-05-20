@@ -73,6 +73,15 @@ pub struct VM {
     pub output: Vec<String>,
     exception_stack: Vec<ExceptionHandler>,
     current_exception: Option<Value>,
+    /// The import cache, keyed on canonical dotted module name. Maps the
+    /// Python `sys.modules` dict. Populated lazily by the import machinery;
+    /// `sys` itself is pre-loaded at VM construction time so user code's
+    /// `import sys` is a cache hit.
+    pub sys_modules: HashMap<String, Value>,
+    /// Rust-side import machinery — owns the cmodule registry. Immutable
+    /// after construction so split-borrows of vm.heap / vm.sys_modules work
+    /// alongside its methods.
+    pub import_system: crate::import::ImportSystem,
 }
 
 impl VM {
@@ -85,9 +94,22 @@ impl VM {
             output: Vec::new(),
             exception_stack: Vec::new(),
             current_exception: None,
+            sys_modules: HashMap::new(),
+            import_system: crate::import::ImportSystem::new(),
         };
         builtins::register_builtins(&mut vm.globals, &mut vm.heap);
+        vm.bootstrap_sys();
         vm
+    }
+
+    /// Eagerly load the `sys` cmodule into sys.modules before user code
+    /// runs. After this, `import sys` is just a cache lookup.
+    /// Dynamic fields (argv, path, modules itself) stay as None placeholders
+    /// in this commit; patching lands when the source-file finder arrives.
+    fn bootstrap_sys(&mut self) {
+        if let Some(sys_value) = self.import_system.try_load_cmodule("sys", &mut self.heap) {
+            self.sys_modules.insert("sys".to_string(), sys_value);
+        }
     }
 
     pub fn run(&mut self) -> Result<(), PythonError> {
@@ -1344,13 +1366,31 @@ impl VM {
                         return Err(PythonError::runtime("yield outside generator", line));
                     }
                 }
-                op::IMPORT_NAME | op::IMPORT_FROM | op::IMPORT_STAR => {
-                    // Wired in M3 commit 5; currently surfaces as a clear
-                    // runtime error if any program reaches an import opcode.
-                    return Err(PythonError::runtime(
-                        format!("internal: import opcode {opcode} not yet wired (M3 in progress)"),
-                        line,
-                    ));
+                op::IMPORT_NAME => {
+                    // Stack contract: [level, fromlist] → [module]
+                    // level + fromlist are unused by the cmodule-only path
+                    // in this commit; full relative-import handling lands in
+                    // commit 5 when source-file finders arrive.
+                    let _fromlist = self.frames[frame_idx].pop();
+                    let _level    = self.frames[frame_idx].pop();
+                    let name = self.code_objects[code_index].names[operand as usize].clone();
+                    let module = self.resolve_import(&name, line)?;
+                    self.frames[frame_idx].push(module);
+                }
+                op::IMPORT_FROM => {
+                    // Stack: [module] → [module, attr]. Module stays on stack
+                    // so subsequent IMPORT_FROM ops can fetch siblings; the
+                    // compiler emits a final POP_TOP to discard it.
+                    let module = self.frames[frame_idx].peek();
+                    let attr = self.code_objects[code_index].names[operand as usize].clone();
+                    let value = self.module_get_attr(module, &attr, line)?;
+                    self.frames[frame_idx].push(value);
+                }
+                op::IMPORT_STAR => {
+                    // Stack: [module] → []. Bind public names from module
+                    // into the current globals namespace.
+                    let module = self.frames[frame_idx].pop();
+                    self.import_star_into_globals(module, line)?;
                 }
                 op::HALT => {
                     return Ok(());
@@ -1473,6 +1513,14 @@ impl VM {
                         });
                         return Ok(Value::object_ref(bound_idx));
                     }
+                }
+                HeapObject::Module { name, globals, .. } => {
+                    if let Some(&val) = globals.get(attr) {
+                        return Ok(val);
+                    }
+                    return Err(PythonError::runtime(
+                        format!("module '{name}' has no attribute '{attr}'"), line,
+                    ));
                 }
                 _ => {}
             }
@@ -1885,6 +1933,86 @@ impl VM {
             method: method_val,
         });
         Ok(Value::object_ref(bm_idx))
+    }
+
+    // --- Import-machinery glue (M3 commit 4) ---
+
+    /// Resolve an `import name` request. M3 commit 4 supports only the
+    /// cmodule finder; the source-file and package finders land in commit 5.
+    /// Per Python semantics for a dotted name "foo.bar", IMPORT_NAME would
+    /// return the TOP of the path (`foo`); for now we only have flat cmodule
+    /// names so the dotted case errors clearly.
+    fn resolve_import(&mut self, name: &str, line: u32) -> Result<Value, PythonError> {
+        if let Some(&cached) = self.sys_modules.get(name) {
+            return Ok(cached);
+        }
+        if let Some(module) = self.import_system.try_load_cmodule(name, &mut self.heap) {
+            self.sys_modules.insert(name.to_string(), module);
+            return Ok(module);
+        }
+        // Dotted names will work in commit 5 once the source-file finder lands.
+        let msg = if name.contains('.') {
+            format!("No module named '{name}' (dotted imports land in M3 commit 5)")
+        } else {
+            format!("No module named '{name}'")
+        };
+        Err(PythonError::runtime(msg, line))
+    }
+
+    /// `from module import attr` lookup. Reads `module.globals[attr]`;
+    /// if absent, the spec says to fall back to `import module.attr` as
+    /// a sub-import. That fallback lands when the source-file finder
+    /// arrives in commit 5; for now we error.
+    fn module_get_attr(&self, module: Value, attr: &str, line: u32) -> Result<Value, PythonError> {
+        let idx = module.as_object_ref().ok_or_else(|| {
+            PythonError::runtime("internal: IMPORT_FROM TOS is not an object ref", line)
+        })?;
+        match &self.heap[idx] {
+            HeapObject::Module { name, globals, .. } => {
+                if let Some(&v) = globals.get(attr) {
+                    Ok(v)
+                } else {
+                    Err(PythonError::runtime(
+                        format!("cannot import name '{attr}' from '{name}'"), line,
+                    ))
+                }
+            }
+            other => Err(PythonError::runtime(
+                format!("internal: IMPORT_FROM TOS is not a Module (got {other:?})"), line,
+            )),
+        }
+    }
+
+    /// `from module import *` — bind public names into the VM's globals.
+    /// Honors `__all__` if present; otherwise binds every name not starting
+    /// with `_`. Per-frame-globals routing will land with the Frame::globals
+    /// refactor in commit 5; for now everything goes into VM.globals (the
+    /// main module namespace).
+    fn import_star_into_globals(&mut self, module: Value, line: u32) -> Result<(), PythonError> {
+        let idx = module.as_object_ref().ok_or_else(|| {
+            PythonError::runtime("internal: IMPORT_STAR TOS is not an object ref", line)
+        })?;
+        let (all_list, bindings): (Option<Vec<String>>, Vec<(String, Value)>) = match &self.heap[idx] {
+            HeapObject::Module { all, globals, .. } => {
+                (all.clone(),
+                 globals.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            }
+            other => return Err(PythonError::runtime(
+                format!("internal: IMPORT_STAR TOS is not a Module (got {other:?})"), line,
+            )),
+        };
+        let bindings_to_apply: Vec<(String, Value)> = match all_list {
+            Some(names) => bindings.into_iter()
+                .filter(|(k, _)| names.contains(k))
+                .collect(),
+            None => bindings.into_iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .collect(),
+        };
+        for (k, v) in bindings_to_apply {
+            self.globals.insert(k, v);
+        }
+        Ok(())
     }
 }
 
@@ -2552,5 +2680,64 @@ print(fib(10))
     fn str_builtin_renders_bigint_decimal() {
         let out = run_and_capture("print(str(2 ** 100))\n");
         assert_eq!(out, vec!["1267650600228229401496703205376"]);
+    }
+
+    // ---------- M3 commit 4: import sys (cmodule path) end-to-end ----------
+
+    #[test]
+    fn import_sys_then_attr_access() {
+        let out = run_and_capture("import sys\nprint(sys.version)\n");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].starts_with("3.0.1"), "got {:?}", out[0]);
+    }
+
+    #[test]
+    fn import_sys_maxsize_is_i48_max() {
+        let out = run_and_capture("import sys\nprint(sys.maxsize)\n");
+        assert_eq!(out, vec!["140737488355327"]); // (1 << 47) - 1
+    }
+
+    #[test]
+    fn from_sys_import_specific_name() {
+        let out = run_and_capture("from sys import version\nprint(version)\n");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].starts_with("3.0.1"));
+    }
+
+    #[test]
+    fn from_sys_import_as_alias() {
+        let out = run_and_capture("from sys import maxsize as ms\nprint(ms)\n");
+        assert_eq!(out, vec!["140737488355327"]);
+    }
+
+    #[test]
+    fn import_sys_twice_returns_same_module() {
+        // Both binds should refer to the same module Value (sys.modules cache hit).
+        let out = run_and_capture(
+            "import sys\na = sys\nimport sys\nprint(a is sys)\n"
+        );
+        assert_eq!(out, vec!["True"]);
+    }
+
+    #[test]
+    fn import_missing_module_errors_with_clear_message() {
+        let err = run_expect_err("import does_not_exist_module\n");
+        assert!(err.contains("No module named 'does_not_exist_module'"), "got: {err}");
+    }
+
+    #[test]
+    fn from_sys_import_missing_attribute_errors() {
+        let err = run_expect_err("from sys import nonexistent_attribute\n");
+        assert!(err.contains("cannot import name 'nonexistent_attribute' from 'sys'"), "got: {err}");
+    }
+
+    #[test]
+    fn from_sys_import_star_binds_public_names() {
+        // sys exports version, maxsize, platform, etc. — none start with _,
+        // so they all become bindings in the current globals.
+        let out = run_and_capture("from sys import *\nprint(platform)\nprint(maxsize)\n");
+        assert_eq!(out.len(), 2);
+        assert!(["linux", "darwin", "win32"].contains(&out[0].as_str()));
+        assert_eq!(out[1], "140737488355327");
     }
 }
