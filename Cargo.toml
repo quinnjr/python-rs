@@ -1,11 +1,25 @@
 [package]
 name = "python-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
-description = "A stackless Python 3 interpreter written in Rust — NaN-boxed values, zero dependencies"
+description = "A stackless Python 3 interpreter written in Rust — academic/hobby AI-assisted port of CPython. Pre-release; not usable yet."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pegasusheavy/python-rs"
+repository = "https://github.com/quinnjr/python-rs"
+homepage = "https://github.com/quinnjr/python-rs"
+readme = "README.md"
 keywords = ["python", "interpreter", "vm", "bytecode", "stackless"]
 categories = ["compilers", "command-line-utilities"]
+# Keep the published crate small: omit the vendored CPython 3.0.1 tree
+# (~22 MB, PSF-licensed, used only at development/test time) and other
+# files irrelevant to crate consumers.
+exclude = [
+    "vendor/**",
+    "docs/**",
+    "tests/cpython-3.0/**",
+    "scripts/**",
+    ".claude/**",
+    ".gitattributes",
+    "test_fizzbuzz.py",
+]
 
 [dependencies]
