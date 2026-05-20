@@ -102,6 +102,12 @@ impl VM {
         vm
     }
 
+    /// Override sys.path. Useful for tests that drop temp files in a
+    /// known directory and want imports to find them.
+    pub fn set_sys_path(&mut self, path: Vec<std::path::PathBuf>) {
+        self.import_system.set_sys_path(path);
+    }
+
     /// Eagerly load the `sys` cmodule into sys.modules before user code
     /// runs. After this, `import sys` is just a cache lookup.
     /// Dynamic fields (argv, path, modules itself) stay as None placeholders
@@ -114,7 +120,13 @@ impl VM {
 
     pub fn run(&mut self) -> Result<(), PythonError> {
         self.frames.push(Frame::new(0));
-        self.execute()
+        self.execute_until_depth(0)
+    }
+
+    /// Convenience wrapper: run all frames to completion.
+    #[allow(dead_code)]
+    fn execute(&mut self) -> Result<(), PythonError> {
+        self.execute_until_depth(0)
     }
 
     /// Raise an exception, unwinding to the nearest handler.
@@ -192,8 +204,15 @@ impl VM {
         Ok(true)
     }
 
-    fn execute(&mut self) -> Result<(), PythonError> {
+    fn execute_until_depth(&mut self, target_depth: usize) -> Result<(), PythonError> {
         loop {
+            // Stop when the frame stack drops back to (or below) the target.
+            // For top-level `run()` this is 0 (run until truly empty). The
+            // import machinery sets this to the caller's frame count so a
+            // module body can execute inline without flushing the whole VM.
+            if self.frames.len() <= target_depth {
+                return Ok(());
+            }
             let frame_idx = self.frames.len() - 1;
 
             let (instr, line, code_index) = {
@@ -1937,11 +1956,8 @@ impl VM {
 
     // --- Import-machinery glue (M3 commit 4) ---
 
-    /// Resolve an `import name` request. M3 commit 4 supports only the
-    /// cmodule finder; the source-file and package finders land in commit 5.
-    /// Per Python semantics for a dotted name "foo.bar", IMPORT_NAME would
-    /// return the TOP of the path (`foo`); for now we only have flat cmodule
-    /// names so the dotted case errors clearly.
+    /// Resolve an `import name` request. Tries cmodule, then source-file
+    /// finder. Dotted names (packages) land in M3 commit 6.
     fn resolve_import(&mut self, name: &str, line: u32) -> Result<Value, PythonError> {
         if let Some(&cached) = self.sys_modules.get(name) {
             return Ok(cached);
@@ -1950,13 +1966,117 @@ impl VM {
             self.sys_modules.insert(name.to_string(), module);
             return Ok(module);
         }
-        // Dotted names will work in commit 5 once the source-file finder lands.
+        if let Some(file_path) = self.import_system.find_source_file(name) {
+            return self.load_source_module(name, file_path, line);
+        }
         let msg = if name.contains('.') {
-            format!("No module named '{name}' (dotted imports land in M3 commit 5)")
+            format!("No module named '{name}' (packages land in M3 commit 6)")
         } else {
             format!("No module named '{name}'")
         };
         Err(PythonError::runtime(msg, line))
+    }
+
+    /// Compile and execute a `.py` file as a Python module. The body runs
+    /// inline against the live VM via `execute_until_depth`, with the
+    /// module's globals temporarily swapped into VM.globals so the body's
+    /// STORE_NAME / STORE_GLOBAL operations land in the module namespace.
+    ///
+    /// Limitations in M3 commit 5:
+    /// - Functions defined inside the imported module can use locals but
+    ///   not module-level globals from the same module (the function-module
+    ///   binding refactor is its own work).
+    /// - No package support (`__init__.py`), no relative imports, no
+    ///   circular-import partial-module return — those land in commit 6.
+    fn load_source_module(
+        &mut self,
+        name: &str,
+        file_path: std::path::PathBuf,
+        line: u32,
+    ) -> Result<Value, PythonError> {
+        let source = std::fs::read_to_string(&file_path).map_err(|e| {
+            PythonError::runtime(
+                format!("could not read '{}': {e}", file_path.display()), line,
+            )
+        })?;
+        let tokens = crate::lexer::tokenize(&source)?;
+        let module_ast = crate::parser::parse(tokens)?;
+        let body_code_idx = crate::compiler::compile_extending(
+            &module_ast,
+            &mut self.code_objects,
+            &mut self.heap,
+        )?;
+
+        // Build the module's initial globals (with builtins copied in so
+        // module-level `print`, `range`, etc. work). Once the function-module
+        // binding refactor lands, builtins will be looked up via a __builtins__
+        // chain instead of being copied wholesale.
+        let mut globals: HashMap<String, Value> = self.globals.iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let name_value = {
+            let idx = self.heap.len();
+            self.heap.push(HeapObject::Str(name.into()));
+            Value::str_ref(idx)
+        };
+        let file_value = {
+            let idx = self.heap.len();
+            self.heap.push(HeapObject::Str(file_path.to_string_lossy().into_owned().into()));
+            Value::str_ref(idx)
+        };
+        globals.insert("__name__".into(), name_value);
+        globals.insert("__file__".into(), file_value);
+        globals.insert("__doc__".into(), Value::none());
+        globals.insert("__package__".into(), Value::none());
+
+        let module_idx = self.heap.len();
+        self.heap.push(HeapObject::Module {
+            name: name.to_string(),
+            globals,
+            file: Some(file_path.to_string_lossy().into_owned()),
+            package: None,
+            initialized: false,
+            all: None,
+        });
+        let module_value = Value::object_ref(module_idx);
+        // Cache BEFORE execution so a circular self-import sees the
+        // (partial) module from cache rather than infinite-recursing.
+        self.sys_modules.insert(name.to_string(), module_value);
+
+        // Swap module globals into VM.globals so the body's STORE_NAME lands
+        // in the module namespace. Save and restore around the body.
+        let saved_globals = std::mem::take(&mut self.globals);
+        if let HeapObject::Module { globals, .. } = &mut self.heap[module_idx] {
+            std::mem::swap(&mut self.globals, globals);
+        }
+
+        // Snapshot caller stack depth so we can undo whatever the body
+        // pushed to it (RETURN_VALUE pushes; HALT does not — handling both).
+        let target_depth = self.frames.len();
+        let caller_idx = target_depth - 1;
+        let caller_sp_before = self.frames[caller_idx].sp;
+
+        self.frames.push(Frame::new(body_code_idx));
+        let exec_result = self.execute_until_depth(target_depth);
+
+        // Module bodies end with HALT, which doesn't pop the body frame.
+        // Drain anything at-or-above target_depth so the caller's stack
+        // structure is unchanged from the import statement's point of view.
+        while self.frames.len() > target_depth {
+            self.frames.pop();
+        }
+        // Undo any value RETURN_VALUE may have pushed to the caller.
+        self.frames[caller_idx].sp = caller_sp_before;
+
+        // Restore the module's globals AND the saved main globals.
+        if let HeapObject::Module { globals, initialized, .. } = &mut self.heap[module_idx] {
+            std::mem::swap(&mut self.globals, globals);
+            *initialized = exec_result.is_ok();
+        }
+        self.globals = saved_globals;
+
+        exec_result?;
+        Ok(module_value)
     }
 
     /// `from module import attr` lookup. Reads `module.globals[attr]`;
@@ -2739,5 +2859,110 @@ print(fib(10))
         assert_eq!(out.len(), 2);
         assert!(["linux", "darwin", "win32"].contains(&out[0].as_str()));
         assert_eq!(out[1], "140737488355327");
+    }
+
+    // ---------- M3 commit 5: source-file (.py) imports ----------
+
+    fn run_with_sys_path(src: &str, sys_path: Vec<std::path::PathBuf>) -> Vec<String> {
+        let tokens = lexer::tokenize(src).unwrap();
+        let module = parser::parse(tokens).unwrap();
+        let (code_objects, heap) = compiler::compile(&module).unwrap();
+        let mut vm = VM::new(code_objects, heap);
+        vm.set_sys_path(sys_path);
+        vm.run().unwrap();
+        vm.output
+    }
+
+    fn run_with_sys_path_expect_err(src: &str, sys_path: Vec<std::path::PathBuf>) -> String {
+        let tokens = lexer::tokenize(src).unwrap();
+        let module = parser::parse(tokens).unwrap();
+        let (code_objects, heap) = compiler::compile(&module).unwrap();
+        let mut vm = VM::new(code_objects, heap);
+        vm.set_sys_path(sys_path);
+        match vm.run() {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("expected error, got success"),
+        }
+    }
+
+    #[test]
+    fn import_source_file_with_data() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mymod.py"), "x = 42\ny = 'hello'\n").unwrap();
+        let out = run_with_sys_path(
+            "import mymod\nprint(mymod.x)\nprint(mymod.y)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["42", "hello"]);
+    }
+
+    #[test]
+    fn import_source_file_caches_in_sys_modules() {
+        // Second `import mymod` should hit cache, not re-execute the body.
+        // We verify this by having the body print something — only one
+        // line should appear in output.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("noisy.py"),
+            "print('body executed')\nv = 1\n",
+        ).unwrap();
+        let out = run_with_sys_path(
+            "import noisy\nimport noisy\nprint(noisy.v)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        // The body should have printed exactly once.
+        assert_eq!(out.iter().filter(|l| *l == "body executed").count(), 1);
+        assert!(out.contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn from_source_file_import_specific_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("strings.py"),
+            "GREETING = 'hello'\nFAREWELL = 'goodbye'\n",
+        ).unwrap();
+        let out = run_with_sys_path(
+            "from strings import GREETING, FAREWELL as bye\nprint(GREETING)\nprint(bye)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["hello", "goodbye"]);
+    }
+
+    #[test]
+    fn import_source_file_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_with_sys_path_expect_err(
+            "import not_a_real_module\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert!(err.contains("No module named 'not_a_real_module'"), "got: {err}");
+    }
+
+    #[test]
+    fn import_source_file_runs_module_level_statements() {
+        // Body has arithmetic + assignment chains — verifies that the body
+        // executes in the module's namespace via the swap mechanism.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("computed.py"),
+            "a = 1\nb = 2\nsum_ab = a + b\n",
+        ).unwrap();
+        let out = run_with_sys_path(
+            "import computed\nprint(computed.sum_ab)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["3"]);
+    }
+
+    #[test]
+    fn module_attr_lookup_for_missing_name_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("partial.py"), "defined = 1\n").unwrap();
+        let err = run_with_sys_path_expect_err(
+            "import partial\nprint(partial.undefined)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert!(err.contains("module 'partial' has no attribute 'undefined'"), "got: {err}");
     }
 }

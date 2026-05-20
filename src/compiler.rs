@@ -12,6 +12,31 @@ pub fn compile(module: &Module) -> Result<(Vec<CodeObject>, Vec<HeapObject>), Py
     Ok((compiler.code_objects, compiler.heap))
 }
 
+/// Compile a module AST and APPEND its code objects + heap entries to
+/// existing vectors. Used by the import system at runtime to compile
+/// `.py` files into an already-running VM's storage. Returns the
+/// `code_index` of the new module's top-level code object so the VM
+/// knows where to start executing the module body.
+pub fn compile_extending(
+    module: &Module,
+    code_objects: &mut Vec<CodeObject>,
+    heap: &mut Vec<HeapObject>,
+) -> Result<usize, PythonError> {
+    let existing_n = code_objects.len();
+    let mut compiler = Compiler {
+        code_objects: std::mem::take(code_objects),
+        heap: std::mem::take(heap),
+        code_stack: Vec::new(),
+        loop_stack: Vec::new(),
+        scope_info: Vec::new(),
+        const_index: (0..existing_n).map(|_| HashMap::new()).collect(),
+    };
+    compiler.compile_module(module)?;
+    *code_objects = compiler.code_objects;
+    *heap = compiler.heap;
+    Ok(existing_n)
+}
+
 struct Compiler {
     code_objects: Vec<CodeObject>,
     heap: Vec<HeapObject>,
