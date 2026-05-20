@@ -23,7 +23,7 @@ CPython is the most-used dynamic language runtime on Earth, and reimplementing i
 
 ## Current status
 
-See `AGENTS.md` for the full original design document and `docs/superpowers/specs/2026-05-19-cpython-3.0-compatibility-design.md` for the current roadmap. At time of writing:
+See `docs/superpowers/specs/2026-05-19-cpython-3.0-compatibility-design.md` for the current roadmap. At time of writing:
 
 - Phase 1 — core language, lexer/parser/compiler/VM — landed.
 - Phase 2 — object model (classes, dunders, closures, generators, exceptions) — in progress on `develop`.
@@ -75,6 +75,6 @@ The vendored CPython 3.0.1 tree under `vendor/cpython-3.0/` retains its original
 
 ## See also
 
-- `AGENTS.md` — full design document, architecture, phased plan, conventions, and future work (embedding API, `pyrs` package manager).
 - `docs/superpowers/specs/2026-05-19-cpython-3.0-compatibility-design.md` — design for the active CPython 3.0.1 compatibility milestone.
 - `docs/3.0-compat-progress.md` — current test-suite pass/fail headline.
+- `CLAUDE.md` — guidance for AI assistants working in this repo, including the clean-room implementation policy.
