@@ -168,18 +168,18 @@ fn builtin_len(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError
     let val = args[0];
     if let Some(idx) = val.as_str_ref() {
         let s = heap[idx].as_str().unwrap();
-        Ok(Value::int(s.len() as i64))
+        Ok(Value::small_int_unchecked(s.len() as i64))
     } else if let Some(idx) = val.as_list_ref() {
         if let HeapObject::List(items) = &heap[idx] {
-            Ok(Value::int(items.len() as i64))
+            Ok(Value::small_int_unchecked(items.len() as i64))
         } else {
             Err(PythonError::runtime("object has no len()", 0))
         }
     } else if let Some(idx) = val.as_object_ref() {
         match &heap[idx] {
-            HeapObject::Tuple(items) => Ok(Value::int(items.len() as i64)),
-            HeapObject::Dict { keys, .. } => Ok(Value::int(keys.len() as i64)),
-            HeapObject::Set(items) => Ok(Value::int(items.len() as i64)),
+            HeapObject::Tuple(items) => Ok(Value::small_int_unchecked(items.len() as i64)),
+            HeapObject::Dict { keys, .. } => Ok(Value::small_int_unchecked(keys.len() as i64)),
+            HeapObject::Set(items) => Ok(Value::small_int_unchecked(items.len() as i64)),
             _ => Err(PythonError::runtime("object has no len()", 0)),
         }
     } else {
@@ -233,24 +233,24 @@ fn builtin_type(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyt
 
 fn builtin_int(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
     if args.is_empty() {
-        return Ok(Value::int(0));
+        return Ok(Value::small_int_unchecked(0));
     }
     if args.len() != 1 {
         return Err(PythonError::runtime("int() takes at most one argument", 0));
     }
     let val = args[0];
     if let Some(i) = val.as_int() {
-        Ok(Value::int(i))
+        Ok(Value::small_int_unchecked(i))
     } else if let Some(f) = val.as_float() {
-        Ok(Value::int(f as i64))
+        Ok(Value::small_int_unchecked(f as i64))
     } else if let Some(b) = val.as_bool() {
-        Ok(Value::int(b as i64))
+        Ok(Value::small_int_unchecked(b as i64))
     } else if let Some(idx) = val.as_str_ref() {
         let s = heap[idx].as_str().unwrap();
         let i: i64 = s.trim().parse().map_err(|_| {
             PythonError::runtime(format!("invalid literal for int() with base 10: '{s}'"), 0)
         })?;
-        Ok(Value::int(i))
+        Ok(Value::small_int_unchecked(i))
     } else {
         Err(PythonError::runtime("int() argument must be a string or number", 0))
     }
@@ -318,7 +318,7 @@ fn builtin_abs(args: &[Value]) -> Result<Value, PythonError> {
     }
     let val = args[0];
     if let Some(i) = val.as_int() {
-        Ok(Value::int(i.abs()))
+        Ok(Value::small_int_unchecked(i.abs()))
     } else if let Some(f) = val.as_float() {
         Ok(Value::float(f.abs()))
     } else {
@@ -492,7 +492,7 @@ fn builtin_id(args: &[Value]) -> Result<Value, PythonError> {
         return Err(PythonError::runtime("id() takes exactly one argument", 0));
     }
     // Return the raw bit pattern as an int (unique id)
-    Ok(Value::int(args[0].display_bits() as i64))
+    Ok(Value::small_int_unchecked(args[0].display_bits() as i64))
 }
 
 fn builtin_exc_constructor(et: ExceptionType, args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
@@ -714,7 +714,7 @@ fn builtin_str_find(args: &[Value], heap: &[HeapObject]) -> Result<Value, Python
     }
     let sub = args[1].display(heap);
     let result = s.find(&sub).map(|i| i as i64).unwrap_or(-1);
-    Ok(Value::int(result))
+    Ok(Value::small_int_unchecked(result))
 }
 
 fn builtin_str_strip(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
@@ -871,7 +871,7 @@ mod tests {
     fn test_print() {
         let heap = vec![HeapObject::Str("hello".into())];
         let mut output = Vec::new();
-        let result = builtin_print(&[Value::int(42)], &heap, &mut output);
+        let result = builtin_print(&[Value::small_int_unchecked(42)], &heap, &mut output);
         assert!(result.is_ok());
         assert_eq!(output, vec!["42"]);
     }
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn test_range() {
         let mut heap = Vec::new();
-        let result = builtin_range(&[Value::int(5)], &mut heap).unwrap();
+        let result = builtin_range(&[Value::small_int_unchecked(5)], &mut heap).unwrap();
         assert!(result.is_range());
         if let HeapObject::RangeIter { current, stop, step } = &heap[result.as_range_ref().unwrap()] {
             assert_eq!(*current, 0);
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn test_range_with_start_stop() {
         let mut heap = Vec::new();
-        let result = builtin_range(&[Value::int(1), Value::int(10)], &mut heap).unwrap();
+        let result = builtin_range(&[Value::small_int_unchecked(1), Value::small_int_unchecked(10)], &mut heap).unwrap();
         assert!(result.is_range());
         if let HeapObject::RangeIter { current, stop, .. } = &heap[result.as_range_ref().unwrap()] {
             assert_eq!(*current, 1);

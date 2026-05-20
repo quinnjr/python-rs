@@ -18,6 +18,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use num_bigint::BigInt;
+
 /// Quiet NaN with tag bits set — base for all tagged values.
 const QNAN: u64 = 0x7FFC_0000_0000_0000;
 /// Mask for the 48-bit payload.
@@ -36,7 +38,12 @@ const TAG_RANGE: u64 = 6;     // sign=1, bits=10
 const TAG_OBJECT: u64 = 7;    // sign=1, bits=11 — generalized object tag
 
 /// A NaN-boxed Python value — 8 bytes, Copy.
-#[derive(Clone, Copy, PartialEq)]
+///
+/// `PartialEq` is intentionally not derived: bit equality is not Python
+/// equality. Use `bits_eq` for raw bit comparison or `py_eq` (or the
+/// `values_equal` helper in vm.rs, which layers exception-subtype
+/// semantics on top) for Python `==`.
+#[derive(Clone, Copy)]
 pub struct Value(u64);
 
 impl fmt::Debug for Value {
@@ -66,10 +73,38 @@ impl Value {
         }
     }
 
-    /// Create an integer value (i48 range).
-    pub fn int(v: i64) -> Self {
+    /// Construct a small int directly. Caller is responsible for keeping
+    /// `v` in the i48 range; values outside `[-2^47, 2^47)` will silently
+    /// wrap. Use `Value::from_i64` if overflow is possible.
+    pub fn small_int_unchecked(v: i64) -> Self {
         let payload = (v as u64) & PAYLOAD_MASK;
         Self(make_tagged(TAG_INT, payload))
+    }
+
+    /// Construct an int from i64. Stays a small int (TAG_INT, no
+    /// allocation) when the value fits in i48; promotes to a heap
+    /// BigInt otherwise. This is the canonical "I have an i64, give
+    /// me the right Value" entry point.
+    pub fn from_i64(v: i64, heap: &mut Vec<HeapObject>) -> Self {
+        if fits_in_i48(v) {
+            Self::small_int_unchecked(v)
+        } else {
+            let idx = heap.len();
+            heap.push(HeapObject::BigInt(BigInt::from(v)));
+            Self::object_ref(idx)
+        }
+    }
+
+    /// Construct an int from a BigInt. Demotes to a small int when the
+    /// magnitude fits in i48; otherwise allocates a HeapObject::BigInt.
+    pub fn from_bigint(v: BigInt, heap: &mut Vec<HeapObject>) -> Self {
+        if let Some(i) = bigint_to_i48(&v) {
+            Self::small_int_unchecked(i)
+        } else {
+            let idx = heap.len();
+            heap.push(HeapObject::BigInt(v));
+            Self::object_ref(idx)
+        }
     }
 
     /// Create a boolean value.
@@ -202,6 +237,68 @@ impl Value {
         self.0
     }
 
+    /// Bit-level equality — true iff the two Values have identical u64
+    /// representations. Replaces the dropped `PartialEq` derive for the
+    /// (rare) cases where bit equality is actually what's wanted.
+    pub fn bits_eq(self, other: Value) -> bool {
+        self.0 == other.0
+    }
+
+    /// True iff this Value represents a Python int (small or big).
+    /// Returns true for TAG_INT and for TAG_OBJECT pointing at a
+    /// `HeapObject::BigInt`. Returns false for bool (bool is its own
+    /// tag; callers that want bool widening go through PyInt's
+    /// `from_value_or_bool`).
+    pub fn is_pyint(&self, heap: &[HeapObject]) -> bool {
+        if self.is_int() { return true; }
+        if let Some(idx) = self.as_object_ref()
+            && matches!(heap[idx], HeapObject::BigInt(_)) {
+            return true;
+        }
+        false
+    }
+
+    /// Python value equality. Handles cross-representation int equality
+    /// (small `7` vs heap `BigInt::from(7)`), int↔float coercion, bool↔int
+    /// coercion (Python treats `True == 1`), and string-content equality.
+    /// Does NOT layer exception subtype semantics — vm.rs's `values_equal`
+    /// adds that on top for except-handler matching.
+    pub fn py_eq(self, other: Value, heap: &[HeapObject]) -> bool {
+        if self.bits_eq(other) { return true; }
+
+        // None — short-circuit; None equals only None.
+        if self.is_none() || other.is_none() {
+            return self.is_none() && other.is_none();
+        }
+
+        // Numeric (int, bool, BigInt) ↔ float coercion. If either side is a
+        // float, coerce both to f64 and compare. Loses precision for huge
+        // BigInts (collapses to inf), matching CPython's documented behavior.
+        if self.is_float() || other.is_float() {
+            if let (Some(a), Some(b)) = (value_to_f64(self, heap), value_to_f64(other, heap)) {
+                return a == b;
+            }
+            return false;
+        }
+
+        // Int family: small int, big int, or bool — all compare against each
+        // other as numbers. `True == 1` is required Python semantics.
+        let self_intish  = self.is_pyint(heap) || self.is_bool();
+        let other_intish = other.is_pyint(heap) || other.is_bool();
+        if self_intish && other_intish {
+            return pyint_values_eq(self, other, heap);
+        }
+
+        // String ↔ string (content).
+        if let (Some(a_idx), Some(b_idx)) = (self.as_str_ref(), other.as_str_ref()) {
+            let a = heap[a_idx].as_str().unwrap_or("");
+            let b = heap[b_idx].as_str().unwrap_or("");
+            return a == b;
+        }
+
+        false
+    }
+
     /// Get a numeric value as f64 (works for int and float).
     pub fn to_f64(self) -> Option<f64> {
         if let Some(f) = self.as_float() {
@@ -299,6 +396,7 @@ fn display_object(idx: usize, heap: &[HeapObject]) -> String {
         HeapObject::ExceptionObj { exc_type, message, .. } => {
             format!("{exc_type:?}({message})")
         }
+        HeapObject::BigInt(b) => b.to_string(),
         HeapObject::ListIter { .. } => "<list_iterator>".to_string(),
         HeapObject::Set(items) => {
             if items.is_empty() {
@@ -323,6 +421,75 @@ fn format_float(f: f64) -> String {
     } else {
         format!("{f}")
     }
+}
+
+/// Inclusive lower bound of the i48 small-int range.
+const I48_MIN: i64 = -(1 << 47);
+/// Exclusive upper bound of the i48 small-int range.
+const I48_MAX_PLUS_ONE: i64 = 1 << 47;
+
+/// True iff `v` fits in the sign-extended i48 small-int range.
+#[inline]
+pub fn fits_in_i48(v: i64) -> bool {
+    (I48_MIN..I48_MAX_PLUS_ONE).contains(&v)
+}
+
+/// If `v` fits in i48, return it as i64; otherwise None.
+pub fn bigint_to_i48(v: &BigInt) -> Option<i64> {
+    let i = i64::try_from(v).ok()?;
+    if fits_in_i48(i) { Some(i) } else { None }
+}
+
+/// Cross-representation int equality: handles small↔small (covered by
+/// bits already), small↔big, big↔small, big↔big. Bool widens to int 0/1.
+fn pyint_values_eq(a: Value, b: Value, heap: &[HeapObject]) -> bool {
+    let av = pyint_as_bigint_or_i64(a, heap);
+    let bv = pyint_as_bigint_or_i64(b, heap);
+    match (av, bv) {
+        (Some(Either3::Small(x)), Some(Either3::Small(y))) => x == y,
+        (Some(Either3::Big(x)),   Some(Either3::Big(y)))   => x == y,
+        (Some(Either3::Small(x)), Some(Either3::Big(y)))
+            | (Some(Either3::Big(y)),  Some(Either3::Small(x))) => &BigInt::from(x) == y,
+        _ => false,
+    }
+}
+
+enum Either3<'a> {
+    Small(i64),
+    Big(&'a BigInt),
+}
+
+fn pyint_as_bigint_or_i64<'a>(v: Value, heap: &'a [HeapObject]) -> Option<Either3<'a>> {
+    if let Some(i) = v.as_int() {
+        return Some(Either3::Small(i));
+    }
+    if let Some(b) = v.as_bool() {
+        return Some(Either3::Small(b as i64));
+    }
+    if let Some(idx) = v.as_object_ref()
+        && let HeapObject::BigInt(b) = &heap[idx] {
+        return Some(Either3::Big(b));
+    }
+    None
+}
+
+/// f64 view of a numeric value (int, bool, BigInt, or float). Used by `py_eq`.
+fn value_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
+    if let Some(f) = v.as_float() { return Some(f); }
+    if let Some(i) = v.as_int() { return Some(i as f64); }
+    if let Some(b) = v.as_bool() { return Some(if b { 1.0 } else { 0.0 }); }
+    if let Some(idx) = v.as_object_ref()
+        && let HeapObject::BigInt(big) = &heap[idx] {
+        return bigint_to_f64(big);
+    }
+    None
+}
+
+/// Convert a BigInt to f64. For huge magnitudes this returns `inf` (Python's
+/// documented behavior for unrepresentable ints in float context). For ints
+/// outside f64's exact range it loses precision, consistent with CPython.
+fn bigint_to_f64(b: &BigInt) -> Option<f64> {
+    Some(b.to_string().parse::<f64>().unwrap_or(f64::INFINITY))
 }
 
 /// Construct a tagged NaN-boxed value from a 3-bit tag and 48-bit payload.
@@ -428,6 +595,10 @@ pub enum HeapObject {
         dict_idx: usize,
         index: usize,
     },
+    /// Arbitrary-precision integer. Only present when a value has
+    /// overflowed the i48 small-int range, or when a source literal
+    /// exceeds i64. Reached via TAG_OBJECT.
+    BigInt(BigInt),
 }
 
 impl HeapObject {
@@ -599,7 +770,7 @@ mod tests {
     #[test]
     fn int_roundtrip() {
         for v in [0, 1, -1, 42, -42, 100_000, -100_000, (1 << 47) - 1, -(1 << 47)] {
-            let val = Value::int(v);
+            let val = Value::small_int_unchecked(v);
             assert!(val.is_int(), "expected int for {v}");
             assert_eq!(val.as_int(), Some(v), "roundtrip failed for {v}");
         }
@@ -655,8 +826,8 @@ mod tests {
     fn truthiness() {
         assert!(Value::bool_val(true).is_truthy());
         assert!(!Value::bool_val(false).is_truthy());
-        assert!(Value::int(1).is_truthy());
-        assert!(!Value::int(0).is_truthy());
+        assert!(Value::small_int_unchecked(1).is_truthy());
+        assert!(!Value::small_int_unchecked(0).is_truthy());
         assert!(Value::float(1.0).is_truthy());
         assert!(!Value::float(0.0).is_truthy());
         assert!(!Value::none().is_truthy());
@@ -665,7 +836,7 @@ mod tests {
     #[test]
     fn display_values() {
         let heap = vec![HeapObject::Str("hello".into())];
-        assert_eq!(Value::int(42).display(&heap), "42");
+        assert_eq!(Value::small_int_unchecked(42).display(&heap), "42");
         assert_eq!(Value::float(3.14).display(&heap), "3.14");
         assert_eq!(Value::bool_val(true).display(&heap), "True");
         assert_eq!(Value::none().display(&heap), "None");
@@ -675,7 +846,7 @@ mod tests {
     #[test]
     fn tags_dont_collide() {
         let values = vec![
-            Value::int(0),
+            Value::small_int_unchecked(0),
             Value::bool_val(false),
             Value::none(),
             Value::str_ref(0),
@@ -712,5 +883,118 @@ mod tests {
         assert!(v.is_builtin()); // alias
         assert_eq!(v.as_object_ref(), Some(5));
         assert_eq!(v.as_builtin_ref(), Some(5));
+    }
+
+    // ---------- M2 commit 1: BigInt scaffolding ----------
+
+    #[test]
+    fn fits_in_i48_boundaries() {
+        assert!(fits_in_i48(0));
+        assert!(fits_in_i48(1));
+        assert!(fits_in_i48(-1));
+        assert!(fits_in_i48((1 << 47) - 1));
+        assert!(fits_in_i48(-(1 << 47)));
+        assert!(!fits_in_i48(1 << 47));
+        assert!(!fits_in_i48(-(1 << 47) - 1));
+        assert!(!fits_in_i48(i64::MAX));
+        assert!(!fits_in_i48(i64::MIN));
+    }
+
+    #[test]
+    fn from_i64_stays_small_for_i48_range() {
+        let mut heap = Vec::new();
+        let before_len = heap.len();
+        let v = Value::from_i64(42, &mut heap);
+        assert!(v.is_int(), "small int should use TAG_INT");
+        assert_eq!(v.as_int(), Some(42));
+        assert_eq!(heap.len(), before_len, "no heap allocation for small int");
+    }
+
+    #[test]
+    fn from_i64_promotes_to_bigint_for_overflow() {
+        let mut heap = Vec::new();
+        let v = Value::from_i64(i64::MAX, &mut heap);
+        assert!(!v.is_int(), "i64::MAX does not fit in i48, must not be TAG_INT");
+        assert!(v.is_object());
+        assert_eq!(heap.len(), 1, "one BigInt allocated");
+        assert!(matches!(heap[0], HeapObject::BigInt(_)));
+        assert!(v.is_pyint(&heap));
+    }
+
+    #[test]
+    fn from_bigint_demotes_when_fits() {
+        let mut heap = Vec::new();
+        let v = Value::from_bigint(BigInt::from(7), &mut heap);
+        assert!(v.is_int(), "small magnitude must demote to TAG_INT");
+        assert_eq!(v.as_int(), Some(7));
+        assert!(heap.is_empty(), "no heap allocation when demoted");
+    }
+
+    #[test]
+    fn from_bigint_keeps_big_when_outside_i48() {
+        let mut heap = Vec::new();
+        let big = BigInt::from(1u64) << 80;
+        let v = Value::from_bigint(big, &mut heap);
+        assert!(v.is_object());
+        assert_eq!(heap.len(), 1);
+        assert!(matches!(&heap[0], HeapObject::BigInt(b) if b == &(BigInt::from(1u64) << 80)));
+    }
+
+    #[test]
+    fn bits_eq_distinguishes_representations() {
+        let mut heap = Vec::new();
+        let small_7 = Value::from_i64(7, &mut heap);
+        // Manually fabricate a BigInt(7) Value to test cross-representation eq.
+        let idx = heap.len();
+        heap.push(HeapObject::BigInt(BigInt::from(7)));
+        let big_7 = Value::object_ref(idx);
+
+        // bits differ: small int 7 has TAG_INT, big_7 has TAG_OBJECT + idx
+        assert!(!small_7.bits_eq(big_7));
+        // but Python value equality holds
+        assert!(small_7.py_eq(big_7, &heap));
+        assert!(big_7.py_eq(small_7, &heap));
+    }
+
+    #[test]
+    fn py_eq_handles_int_float_coercion() {
+        let heap: Vec<HeapObject> = Vec::new();
+        let int_3 = Value::small_int_unchecked(3);
+        let float_3 = Value::float(3.0);
+        assert!(int_3.py_eq(float_3, &heap));
+        assert!(float_3.py_eq(int_3, &heap));
+
+        let float_3_5 = Value::float(3.5);
+        assert!(!int_3.py_eq(float_3_5, &heap));
+    }
+
+    #[test]
+    fn py_eq_handles_bool_int_equality() {
+        let heap: Vec<HeapObject> = Vec::new();
+        // Python: True == 1, False == 0
+        assert!(Value::bool_val(true).py_eq(Value::small_int_unchecked(1), &heap));
+        assert!(Value::bool_val(false).py_eq(Value::small_int_unchecked(0), &heap));
+        assert!(!Value::bool_val(true).py_eq(Value::small_int_unchecked(2), &heap));
+    }
+
+    #[test]
+    fn bigint_displays_decimal() {
+        let big: BigInt = BigInt::from(1u64) << 100;
+        let expected = big.to_string();
+        let mut heap = Vec::new();
+        let v = Value::from_bigint(big, &mut heap);
+        assert_eq!(v.display(&heap), expected);
+    }
+
+    #[test]
+    fn is_pyint_recognizes_both_forms() {
+        let mut heap = Vec::new();
+        let small = Value::small_int_unchecked(42);
+        let big = Value::from_bigint(BigInt::from(1u64) << 100, &mut heap);
+        assert!(small.is_pyint(&heap));
+        assert!(big.is_pyint(&heap));
+        assert!(!Value::bool_val(true).is_pyint(&heap));
+        assert!(!Value::float(1.0).is_pyint(&heap));
+        assert!(!Value::none().is_pyint(&heap));
     }
 }

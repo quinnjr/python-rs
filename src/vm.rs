@@ -246,7 +246,7 @@ impl VM {
                     let cell_idx = self.frames[frame_idx].cells.get(operand as usize).copied();
                     if let Some(ci) = cell_idx {
                         // Push the cell heap index as an int (used by MAKE_CLOSURE)
-                        self.frames[frame_idx].push(Value::int(ci as i64));
+                        self.frames[frame_idx].push(Value::small_int_unchecked(ci as i64));
                     } else {
                         return Err(PythonError::runtime("LOAD_CLOSURE: invalid cell index", line));
                     }
@@ -308,7 +308,7 @@ impl VM {
                 op::UNARY_NEG => {
                     let val = self.frames[frame_idx].pop();
                     let result = if let Some(i) = val.as_int() {
-                        Value::int(-i)
+                        Value::small_int_unchecked(-i)
                     } else if let Some(f) = val.as_float() {
                         Value::float(-f)
                     } else {
@@ -333,7 +333,7 @@ impl VM {
                 op::UNARY_INVERT => {
                     let val = self.frames[frame_idx].pop();
                     if let Some(i) = val.as_int() {
-                        self.frames[frame_idx].push(Value::int(!i));
+                        self.frames[frame_idx].push(Value::small_int_unchecked(!i));
                     } else {
                         return Err(PythonError::runtime("bad operand type for unary ~", line));
                     }
@@ -378,13 +378,13 @@ impl VM {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
                     // Identity comparison: same bit pattern
-                    let r = left == right;
+                    let r = left.bits_eq(right);
                     self.frames[frame_idx].push(Value::bool_val(r));
                 }
                 op::COMPARE_IS_NOT => {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
-                    let r = left != right;
+                    let r = !left.bits_eq(right);
                     self.frames[frame_idx].push(Value::bool_val(r));
                 }
                 op::CONTAINS_OP => {
@@ -398,7 +398,7 @@ impl VM {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
                     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::int(a & b));
+                        self.frames[frame_idx].push(Value::small_int_unchecked(a & b));
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for &", line));
                     }
@@ -407,7 +407,7 @@ impl VM {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
                     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::int(a | b));
+                        self.frames[frame_idx].push(Value::small_int_unchecked(a | b));
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for |", line));
                     }
@@ -416,7 +416,7 @@ impl VM {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
                     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::int(a ^ b));
+                        self.frames[frame_idx].push(Value::small_int_unchecked(a ^ b));
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for ^", line));
                     }
@@ -425,7 +425,7 @@ impl VM {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
                     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::int(a << b));
+                        self.frames[frame_idx].push(Value::small_int_unchecked(a << b));
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for <<", line));
                     }
@@ -434,7 +434,7 @@ impl VM {
                     let right = self.frames[frame_idx].pop();
                     let left = self.frames[frame_idx].pop();
                     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-                        self.frames[frame_idx].push(Value::int(a >> b));
+                        self.frames[frame_idx].push(Value::small_int_unchecked(a >> b));
                     } else {
                         return Err(PythonError::runtime("unsupported operand type(s) for >>", line));
                     }
@@ -808,7 +808,7 @@ impl VM {
                         if exhausted {
                             self.frames[frame_idx].ip = operand as usize;
                         } else {
-                            self.frames[frame_idx].push(Value::int(current));
+                            self.frames[frame_idx].push(Value::small_int_unchecked(current));
                             if let HeapObject::RangeIter { current: c, .. } = &mut self.heap[heap_idx] {
                                 *c = current + step;
                             }
@@ -1404,7 +1404,7 @@ impl VM {
                 }
                 HeapObject::Tuple(items) => {
                     if attr == "__len__" {
-                        return Ok(Value::int(items.len() as i64));
+                        return Ok(Value::small_int_unchecked(items.len() as i64));
                     }
                 }
                 HeapObject::Generator { .. } => {
@@ -1854,7 +1854,7 @@ fn is_truthy(val: Value, heap: &[HeapObject]) -> bool {
 
 fn values_equal(left: Value, right: Value, heap: &[HeapObject]) -> bool {
     // Same bit pattern
-    if left == right { return true; }
+    if left.bits_eq(right) { return true; }
     // None comparisons
     if left.is_none() && right.is_none() { return true; }
     if left.is_none() || right.is_none() { return false; }
@@ -1892,7 +1892,7 @@ fn values_equal(left: Value, right: Value, heap: &[HeapObject]) -> bool {
 
 fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        return Ok(Value::int(a + b));
+        return Ok(Value::small_int_unchecked(a + b));
     }
     if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) && (left.is_float() || right.is_float()) {
         return Ok(Value::float(a + b));
@@ -1926,7 +1926,7 @@ fn binary_arith(
     float_op: impl Fn(f64, f64) -> f64,
 ) -> Result<Value, PythonError> {
     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        return Ok(Value::int(int_op(a, b)));
+        return Ok(Value::small_int_unchecked(int_op(a, b)));
     }
     if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) && (left.is_float() || right.is_float()) {
         return Ok(Value::float(float_op(a, b)));
@@ -1936,7 +1936,7 @@ fn binary_arith(
 
 fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-        return Ok(Value::int(a * b));
+        return Ok(Value::small_int_unchecked(a * b));
     }
     if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) && (left.is_float() || right.is_float()) {
         return Ok(Value::float(a * b));
@@ -1973,7 +1973,7 @@ fn binary_floor_div(left: Value, right: Value, line: u32) -> Result<Value, Pytho
         if b == 0 {
             return Err(PythonError::runtime("integer division or modulo by zero", line));
         }
-        return Ok(Value::int(a.div_euclid(b)));
+        return Ok(Value::small_int_unchecked(a.div_euclid(b)));
     }
     if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) {
         if b == 0.0 {
@@ -1989,7 +1989,7 @@ fn binary_mod(left: Value, right: Value, heap: &[HeapObject], line: u32) -> Resu
         if b == 0 {
             return Err(PythonError::runtime("integer division or modulo by zero", line));
         }
-        return Ok(Value::int(a.rem_euclid(b)));
+        return Ok(Value::small_int_unchecked(a.rem_euclid(b)));
     }
     if let (Some(a), Some(b)) = (left.to_f64(), right.to_f64()) {
         if b == 0.0 {
@@ -2008,7 +2008,7 @@ fn binary_mod(left: Value, right: Value, heap: &[HeapObject], line: u32) -> Resu
 fn binary_pow(left: Value, right: Value, line: u32) -> Result<Value, PythonError> {
     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
         if b >= 0 {
-            return Ok(Value::int(a.pow(b as u32)));
+            return Ok(Value::small_int_unchecked(a.pow(b as u32)));
         }
         return Ok(Value::float((a as f64).powi(b as i32)));
     }

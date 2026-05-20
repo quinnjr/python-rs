@@ -77,7 +77,7 @@ impl Compiler {
     fn add_const(&mut self, val: Value) -> u32 {
         let code = self.current_code();
         for (i, c) in code.constants.iter().enumerate() {
-            if *c == val {
+            if c.bits_eq(val) {
                 return i as u32;
             }
         }
@@ -656,7 +656,7 @@ impl Compiler {
                     self.emit(op::LOAD_GLOBAL, name_idx, line);
                 }
             }
-            let func_idx_const = self.add_const(Value::int(func_co_idx as i64));
+            let func_idx_const = self.add_const(Value::small_int_unchecked(func_co_idx as i64));
             self.emit(op::MAKE_CLOSURE, func_idx_const, line);
             // Operand tells how many free vars were pushed
             // Actually we encode num_free in a second way: use BUILD_TUPLE first
@@ -666,7 +666,7 @@ impl Compiler {
             // But we need to emit the count... let's put it as a separate const
             let _count = num_free; // VM reads from code object
         } else {
-            let func_idx_const = self.add_const(Value::int(func_co_idx as i64));
+            let func_idx_const = self.add_const(Value::small_int_unchecked(func_co_idx as i64));
             self.emit(op::MAKE_FUNCTION, func_idx_const, line);
         }
 
@@ -722,7 +722,7 @@ impl Compiler {
         self.emit(op::LOAD_CONST, name_const, line);
 
         // Push code index
-        let co_idx_const = self.add_const(Value::int(class_co_idx as i64));
+        let co_idx_const = self.add_const(Value::small_int_unchecked(class_co_idx as i64));
         self.emit(op::LOAD_CONST, co_idx_const, line);
 
         // BUILD_CLASS: operand = number of bases
@@ -907,7 +907,7 @@ impl Compiler {
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), PythonError> {
         match expr {
             Expr::IntLit { value, line } => {
-                let idx = self.add_const(Value::int(*value));
+                let idx = self.add_const(Value::small_int_unchecked(*value));
                 self.emit(op::LOAD_CONST, idx, *line);
             }
             Expr::FloatLit { value, line } => {
@@ -1030,7 +1030,7 @@ impl Compiler {
 
                 self.code_stack.pop();
 
-                let func_idx_const = self.add_const(Value::int(func_co_idx as i64));
+                let func_idx_const = self.add_const(Value::small_int_unchecked(func_co_idx as i64));
                 self.emit(op::MAKE_FUNCTION, func_idx_const, *line);
             }
             Expr::IfExpr { body, test, orelse, line } => {

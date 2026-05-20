@@ -23,3 +23,6 @@ exclude = [
 ]
 
 [dependencies]
+# Arbitrary-precision integers backing HeapObject::BigInt and the PyInt
+# overflow path. Required for Python 3 int semantics — see M2 design spec.
+num-bigint = "0.4"
