@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::object::{CModule, HeapObject, Value};
+use crate::object::{CModule, HeapObject, Value, alloc_str, alloc_tuple};
 
 pub struct Sys;
 
@@ -57,18 +57,6 @@ impl CModule for Sys {
 
         g
     }
-}
-
-fn alloc_str(heap: &mut Vec<HeapObject>, s: &str) -> Value {
-    let idx = heap.len();
-    heap.push(HeapObject::Str(s.into()));
-    Value::str_ref(idx)
-}
-
-fn alloc_tuple(heap: &mut Vec<HeapObject>, items: Vec<Value>) -> Value {
-    let idx = heap.len();
-    heap.push(HeapObject::Tuple(items));
-    Value::object_ref(idx)
 }
 
 fn platform_string() -> &'static str {

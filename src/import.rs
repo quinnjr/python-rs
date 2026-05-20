@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::cmodules;
-use crate::object::{CModule, HeapObject, Value};
+use crate::object::{CModule, HeapObject, Value, alloc_module};
 
 pub struct ImportSystem {
     /// Registered Rust-backed cmodules, keyed by `cmod.name()`.
@@ -22,7 +22,7 @@ pub struct ImportSystem {
     /// Search path for `.py` source modules. Iterated in order; first hit
     /// wins. Initialized at VM construction to `[cwd]` plus (in a future
     /// commit) the vendored CPython 3.0.1 stdlib directory.
-    pub sys_path: Vec<PathBuf>,
+    sys_path: Vec<PathBuf>,
 }
 
 impl ImportSystem {
@@ -53,16 +53,7 @@ impl ImportSystem {
     ) -> Option<Value> {
         let cmod = self.cmodules.get(name)?;
         let globals = cmod.build_globals(heap);
-        let module_idx = heap.len();
-        heap.push(HeapObject::Module {
-            name: name.to_string(),
-            globals,
-            file: None,
-            package: None,
-            initialized: true,
-            all: None,
-        });
-        Some(Value::object_ref(module_idx))
+        Some(alloc_module(heap, name.to_string(), globals, None, None, true))
     }
 
     /// True if a cmodule with this name is registered. Reserved for the

@@ -1120,6 +1120,53 @@ pub fn heap_str(heap: &[HeapObject], idx: usize) -> Result<&str, crate::error::P
     })
 }
 
+/// Allocate a `Str` into `heap` and return the `Value::str_ref` to it.
+/// Centralizes the `idx = heap.len(); push(Str); str_ref(idx)` pattern
+/// that appears in ~12 call sites across vm/cmodules/compiler/builtins.
+pub fn alloc_str(heap: &mut Vec<HeapObject>, s: impl Into<Box<str>>) -> Value {
+    let idx = heap.len();
+    heap.push(HeapObject::Str(s.into()));
+    Value::str_ref(idx)
+}
+
+/// Allocate a `Tuple` into `heap` and return the `Value::object_ref` to it.
+pub fn alloc_tuple(heap: &mut Vec<HeapObject>, items: Vec<Value>) -> Value {
+    let idx = heap.len();
+    heap.push(HeapObject::Tuple(items));
+    Value::object_ref(idx)
+}
+
+/// Allocate a `Module` heap entry and return the `Value::object_ref`.
+/// Single source of truth for the variant's field shape — adding a future
+/// field (e.g., `__spec__`) becomes one edit instead of three.
+pub fn alloc_module(
+    heap: &mut Vec<HeapObject>,
+    name: String,
+    globals: HashMap<String, Value>,
+    file: Option<String>,
+    package: Option<String>,
+    initialized: bool,
+) -> Value {
+    let idx = heap.len();
+    heap.push(HeapObject::Module { name, globals, file, package, initialized, all: None });
+    Value::object_ref(idx)
+}
+
+/// Split a dotted module name into (parent, leaf).
+/// "foo.bar.baz" → (Some("foo.bar"), "baz")
+/// "foo"         → (None, "foo")
+pub fn split_module_name(name: &str) -> (Option<&str>, &str) {
+    match name.rfind('.') {
+        Some(i) => (Some(&name[..i]), &name[i + 1..]),
+        None    => (None, name),
+    }
+}
+
+/// Top-level segment of a dotted name. "foo.bar.baz" → "foo".
+pub fn dotted_top(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
+}
+
 /// Generator execution state.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GeneratorState {

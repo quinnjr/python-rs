@@ -4,7 +4,8 @@ use crate::bytecode::{self, CodeObject, op};
 use crate::error::PythonError;
 use crate::object::{
     ArithError, BuiltinId, ExceptionType, GeneratorState, HeapObject, PyInt, PyPowResult,
-    Value, heap_str, pyint_truediv, value_hash, value_to_f64,
+    Value, alloc_module, alloc_str, dotted_top, heap_str, pyint_truediv, split_module_name,
+    value_hash, value_to_f64,
 };
 use std::collections::HashMap;
 
@@ -102,11 +103,11 @@ pub struct VM {
     /// Python `sys.modules` dict. Populated lazily by the import machinery;
     /// `sys` itself is pre-loaded at VM construction time so user code's
     /// `import sys` is a cache hit.
-    pub sys_modules: HashMap<String, Value>,
+    sys_modules: HashMap<String, Value>,
     /// Rust-side import machinery — owns the cmodule registry. Immutable
     /// after construction so split-borrows of vm.heap / vm.sys_modules work
     /// alongside its methods.
-    pub import_system: crate::import::ImportSystem,
+    import_system: crate::import::ImportSystem,
 }
 
 impl VM {
@@ -311,13 +312,18 @@ impl VM {
                     unsafe { *self.frames[frame_idx].locals.get_unchecked_mut(operand as usize) = val; }
                 }
                 op::LOAD_GLOBAL => {
-                    let name = self.code_objects[code_index].names[operand as usize].clone();
-                    let result = self.frame_globals_get(frame_idx, &name);
-                    match result {
+                    // Borrow the name briefly for the lookup; clone only on
+                    // the error path. Saves one String alloc per successful
+                    // LOAD_GLOBAL — significant on every function call.
+                    let lookup = {
+                        let name = &self.code_objects[code_index].names[operand as usize];
+                        self.frame_globals_get(frame_idx, name)
+                    };
+                    match lookup {
                         Some(val) => self.frames[frame_idx].push(val),
                         None => {
-                            let msg = format!("name '{name}' is not defined");
-                            let err = PythonError::runtime(msg, line);
+                            let name = self.code_objects[code_index].names[operand as usize].clone();
+                            let err = PythonError::runtime(format!("name '{name}' is not defined"), line);
                             self.try_handle_error(err, line)?;
                             continue;
                         }
@@ -1476,25 +1482,24 @@ impl VM {
                     let raw_name = self.code_objects[code_index].names[operand as usize].clone();
                     let level_u32 = level.as_int().unwrap_or(0).max(0) as u32;
                     let abs_name = self.resolve_relative_name(&raw_name, level_u32, line)?;
-                    let _ = self.resolve_import(&abs_name, line)?;
-                    // Choose top vs leaf based on fromlist.
+                    let leaf_module = self.resolve_import(&abs_name, line)?;
+                    // For `import a.b.c` (no fromlist) Python pushes the TOP
+                    // segment, not the leaf. resolve_import already cached
+                    // every level on the way in, so the lookup is free.
                     let result = if fromlist.is_none() {
-                        // `import a.b.c` → push `a` (top).
-                        let top = abs_name.split('.').next().unwrap_or(&abs_name);
-                        self.sys_modules.get(top).copied().ok_or_else(|| {
-                            PythonError::runtime(
-                                format!("internal: top module '{top}' missing from sys.modules"),
-                                line,
-                            )
-                        })?
+                        let top = dotted_top(&abs_name);
+                        if top == abs_name {
+                            leaf_module
+                        } else {
+                            self.sys_modules.get(top).copied().ok_or_else(|| {
+                                PythonError::runtime(
+                                    format!("internal: top module '{top}' missing from sys.modules"),
+                                    line,
+                                )
+                            })?
+                        }
                     } else {
-                        // `from a.b.c import x` → push `a.b.c` (leaf).
-                        self.sys_modules.get(&abs_name).copied().ok_or_else(|| {
-                            PythonError::runtime(
-                                format!("internal: leaf module '{abs_name}' missing from sys.modules"),
-                                line,
-                            )
-                        })?
+                        leaf_module
                     };
                     self.frames[frame_idx].push(result);
                 }
@@ -2057,7 +2062,7 @@ impl VM {
         Ok(Value::object_ref(bm_idx))
     }
 
-    // --- Import-machinery glue (M3 commit 4) ---
+    // --- Import-machinery glue ---
 
     /// Resolve an `import name` request. Handles cmodules, source files,
     /// packages (directories with __init__.py), and dotted names. Recurses
@@ -2068,23 +2073,18 @@ impl VM {
             return Ok(cached);
         }
 
-        // Split dotted name: "foo.bar.baz" → parent="foo.bar", leaf="baz".
-        let (parent_name, leaf) = match name.rfind('.') {
-            Some(i) => (Some(name[..i].to_string()), &name[i + 1..]),
-            None    => (None, name),
-        };
+        let (parent_name, leaf) = split_module_name(name);
 
         // Ensure parent package is loaded first (recursive).
-        let parent_module = match &parent_name {
+        let parent_module = match parent_name {
             Some(p) => Some(self.resolve_import(p, line)?),
             None    => None,
         };
 
-        // Determine search directory for this name.
-        // - Top-level: search sys.path (handled by find_*_in passing None).
-        // - Submodule: search ONLY the parent package's directory.
+        // Submodule lookup is restricted to the parent package's directory;
+        // top-level lookup searches sys.path (None signals "use sys.path").
         let parent_dir: Option<std::path::PathBuf> = match parent_module {
-            Some(parent) => Some(self.package_dir_of(parent, &parent_name.clone().unwrap_or_default(), line)?),
+            Some(parent) => Some(self.package_dir_of(parent, parent_name.unwrap_or(""), line)?),
             None => None,
         };
         let search: Option<&std::path::Path> = parent_dir.as_deref();
@@ -2099,11 +2099,11 @@ impl VM {
 
         // Package finder: <dir>/<leaf>/__init__.py wins over <dir>/<leaf>.py.
         if let Some(init_path) = self.import_system.find_package_in(search, leaf) {
-            return self.load_source_module_v2(name, init_path, true, parent_module, line);
+            return self.load_source_module(name, init_path, true, parent_module, line);
         }
         // Source-file finder: <dir>/<leaf>.py.
         if let Some(file_path) = self.import_system.find_source_file_in(search, leaf) {
-            return self.load_source_module_v2(name, file_path, false, parent_module, line);
+            return self.load_source_module(name, file_path, false, parent_module, line);
         }
 
         Err(PythonError::runtime(format!("No module named '{name}'"), line))
@@ -2135,9 +2135,7 @@ impl VM {
         let pkg_str_idx = pkg_value.as_str_ref().ok_or_else(|| {
             PythonError::runtime("internal: __package__ is not a string", line)
         })?;
-        let pkg = self.heap[pkg_str_idx].as_str().ok_or_else(|| {
-            PythonError::runtime("internal: __package__ str-ref is broken", line)
-        })?;
+        let pkg = heap_str(&self.heap, pkg_str_idx)?;
         // Walk `level - 1` segments up from `pkg`. (A single dot means
         // "current package", so we drop level-1 segments, not level.)
         // Actually: `from . import x` with level=1 means current package,
@@ -2201,7 +2199,7 @@ impl VM {
     /// `is_package`: true when loading `<dir>/<leaf>/__init__.py`. The
     /// module's __package__ then equals its own name (it IS the package).
     /// `parent`: the loaded parent package's module Value, if any.
-    fn load_source_module_v2(
+    fn load_source_module(
         &mut self,
         name: &str,
         file_path: std::path::PathBuf,
@@ -2218,7 +2216,7 @@ impl VM {
             name.rfind('.').map(|i| name[..i].to_string())
         };
 
-        let value = self.load_source_module_inner(name, file_path, package_str, line)?;
+        let value = self.compile_and_execute_module(name, file_path, package_str, line)?;
 
         // Bind the new module as an attribute of its parent package, so
         // `pkg.sub` attribute access works after `import pkg.sub`.
@@ -2238,7 +2236,7 @@ impl VM {
     /// Inner module loader — does the file-read + compile + execute. Used
     /// by both flat modules and packages; the only difference between them
     /// is the __package__ value, computed by the caller.
-    fn load_source_module_inner(
+    fn compile_and_execute_module(
         &mut self,
         name: &str,
         file_path: std::path::PathBuf,
@@ -2259,67 +2257,45 @@ impl VM {
         )?;
 
         // Module globals start empty (only the dunders below are populated).
-        // Builtin lookup is handled by `frame_globals_get`'s fallback to
-        // VM.globals — module-local names take precedence, builtins are the
-        // outer layer of the __builtins__ chain.
-        let mut globals: HashMap<String, Value> = HashMap::new();
-        let name_value = {
-            let idx = self.heap.len();
-            self.heap.push(HeapObject::Str(name.into()));
-            Value::str_ref(idx)
-        };
-        let file_value = {
-            let idx = self.heap.len();
-            self.heap.push(HeapObject::Str(file_path.to_string_lossy().into_owned().into()));
-            Value::str_ref(idx)
-        };
+        // Builtin lookup is handled by `frame_globals_get`'s fallback chain.
+        let file_str: String = file_path.to_string_lossy().into_owned();
+        let name_value = alloc_str(&mut self.heap, name);
+        let file_value = alloc_str(&mut self.heap, file_str.as_str());
         let package_value = match package.as_deref() {
-            Some(p) => {
-                let idx = self.heap.len();
-                self.heap.push(HeapObject::Str(p.into()));
-                Value::str_ref(idx)
-            }
-            None => Value::none(),
+            Some(p) => alloc_str(&mut self.heap, p),
+            None    => Value::none(),
         };
-        globals.insert("__name__".into(), name_value);
-        globals.insert("__file__".into(), file_value);
-        globals.insert("__doc__".into(), Value::none());
+        let mut globals: HashMap<String, Value> = HashMap::new();
+        globals.insert("__name__".into(),    name_value);
+        globals.insert("__file__".into(),    file_value);
+        globals.insert("__doc__".into(),     Value::none());
         globals.insert("__package__".into(), package_value);
 
+        // Capture the heap idx before alloc_module's push so we don't need to
+        // round-trip through Value::as_object_ref afterwards.
         let module_idx = self.heap.len();
-        self.heap.push(HeapObject::Module {
-            name: name.to_string(),
-            globals,
-            file: Some(file_path.to_string_lossy().into_owned()),
-            package,
-            initialized: false,
-            all: None,
-        });
-        let module_value = Value::object_ref(module_idx);
+        let module_value = alloc_module(
+            &mut self.heap, name.to_string(), globals, Some(file_str), package, false,
+        );
         // Cache BEFORE execution so a circular self-import sees the
         // (partial) module from cache rather than infinite-recursing.
         self.sys_modules.insert(name.to_string(), module_value);
 
-        // Snapshot caller stack depth so we can undo whatever the body
-        // pushed to it (RETURN_VALUE pushes; HALT does not — handling both).
-        let target_depth = self.frames.len();
-        let caller_idx = target_depth - 1;
-        let caller_sp_before = self.frames[caller_idx].sp;
-
         // Module body runs in a frame rooted at this module. LOAD/STORE_GLOBAL
-        // inside the body now route through heap[module_idx].globals via the
+        // inside the body route through heap[module_idx].globals via the
         // Frame::module_idx mechanism — no globals swap needed.
+        let target_depth = self.frames.len();
         self.frames.push(Frame::new_in_module(body_code_idx, Some(module_idx)));
         let exec_result = self.execute_until_depth(target_depth);
 
-        // Module bodies end with HALT, which doesn't pop the body frame.
-        // Drain anything at-or-above target_depth so the caller's stack
-        // structure is unchanged from the import statement's point of view.
+        // The compiler always terminates module bodies with HALT (see
+        // compile_module). HALT returns from execute_until_depth without
+        // popping the body frame, so we drain it here. (If the compiler
+        // ever switches to RETURN_VALUE for module bodies, that pops the
+        // frame itself and this drain becomes a no-op — still correct.)
         while self.frames.len() > target_depth {
             self.frames.pop();
         }
-        // Undo any value RETURN_VALUE may have pushed to the caller.
-        self.frames[caller_idx].sp = caller_sp_before;
 
         // Mark the module as initialized.
         if let HeapObject::Module { initialized, .. } = &mut self.heap[module_idx] {
