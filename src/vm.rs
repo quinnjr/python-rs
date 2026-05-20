@@ -293,11 +293,6 @@ impl VM {
             let opcode = bytecode::decode_op(instr);
             let operand = bytecode::decode_operand(instr);
 
-            eprintln!("[TRACE] frame={} code={} ip={} op={} operand={} sp={} gen={:?}",
-                frame_idx, code_index, self.frames[frame_idx].ip - 1,
-                opcode, operand, self.frames[frame_idx].sp,
-                self.frames[frame_idx].generator_idx);
-
             match opcode {
                 op::LOAD_CONST => {
                     let val = self.code_objects[code_index].constants[operand as usize];
@@ -1479,9 +1474,15 @@ impl VM {
                     //   the leaf module. Matches Python semantics.
                     let fromlist = self.frames[frame_idx].pop();
                     let level    = self.frames[frame_idx].pop();
-                    let raw_name = self.code_objects[code_index].names[operand as usize].clone();
                     let level_u32 = level.as_int().unwrap_or(0).max(0) as u32;
-                    let abs_name = self.resolve_relative_name(&raw_name, level_u32, line)?;
+                    // Borrow the raw name; resolve_relative_name takes &self, so
+                    // we don't need to clone. The returned `abs_name` is an
+                    // owned String, breaking the borrow before the &mut self
+                    // call to resolve_import below.
+                    let abs_name = {
+                        let raw_name = &self.code_objects[code_index].names[operand as usize];
+                        self.resolve_relative_name(raw_name, level_u32, line)?
+                    };
                     let leaf_module = self.resolve_import(&abs_name, line)?;
                     // For `import a.b.c` (no fromlist) Python pushes the TOP
                     // segment, not the leaf. resolve_import already cached
@@ -2451,17 +2452,31 @@ fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
         return Ok(Value::float(a + b));
     }
     if let (Some(a_idx), Some(b_idx)) = (left.as_str_ref(), right.as_str_ref()) {
-        let a = heap_str(heap, a_idx)?.to_string();
-        let b = heap_str(heap, b_idx)?;
+        // Pre-size a single String, push both halves into it. Avoids the
+        // intermediate `.to_string()` clone of `a` and the format! buffer.
+        let result = {
+            let a = heap_str(heap, a_idx)?;
+            let b = heap_str(heap, b_idx)?;
+            let mut out = String::with_capacity(a.len() + b.len());
+            out.push_str(a);
+            out.push_str(b);
+            out
+        };
         let heap_idx = heap.len();
-        heap.push(HeapObject::Str(format!("{a}{b}").into()));
+        heap.push(HeapObject::Str(result.into()));
         return Ok(Value::str_ref(heap_idx));
     }
     if let (Some(a_idx), Some(b_idx)) = (left.as_list_ref(), right.as_list_ref()) {
-        let a = if let HeapObject::List(items) = &heap[a_idx] { items.clone() } else { Vec::new() };
-        let b = if let HeapObject::List(items) = &heap[b_idx] { items.clone() } else { Vec::new() };
-        let mut result = a;
-        result.extend(b);
+        // Single allocation sized for both halves; extend_from_slice avoids
+        // the previous double-clone of both source lists.
+        let result = {
+            let a = if let HeapObject::List(items) = &heap[a_idx] { items.as_slice() } else { &[] };
+            let b = if let HeapObject::List(items) = &heap[b_idx] { items.as_slice() } else { &[] };
+            let mut out = Vec::with_capacity(a.len() + b.len());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b);
+            out
+        };
         let heap_idx = heap.len();
         heap.push(HeapObject::List(result));
         return Ok(Value::list_ref(heap_idx));

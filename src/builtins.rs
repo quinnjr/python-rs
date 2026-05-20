@@ -127,8 +127,13 @@ pub fn call_builtin(
 }
 
 fn builtin_print(args: &[Value], heap: &[HeapObject], output: &mut Vec<String>) -> Result<Value, PythonError> {
-    let parts: Vec<String> = args.iter().map(|v| v.display(heap)).collect();
-    let line = parts.join(" ");
+    // Build the line directly instead of collecting into Vec<String> + join;
+    // saves one Vec allocation per print() call.
+    let mut line = String::new();
+    for (i, v) in args.iter().enumerate() {
+        if i > 0 { line.push(' '); }
+        line.push_str(&v.display(heap));
+    }
     output.push(line);
     Ok(Value::none())
 }
