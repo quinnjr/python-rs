@@ -126,6 +126,12 @@ pub enum Expr {
         value: i64,
         line: u32,
     },
+    /// Integer literal that overflowed i64 at lex time. Boxed to keep
+    /// the Expr enum compact; only constructed when actually needed.
+    BigIntLit {
+        value: Box<num_bigint::BigInt>,
+        line: u32,
+    },
     FloatLit {
         value: f64,
         line: u32,
@@ -227,6 +233,7 @@ impl Expr {
     pub fn line(&self) -> u32 {
         match self {
             Self::IntLit { line, .. }
+            | Self::BigIntLit { line, .. }
             | Self::FloatLit { line, .. }
             | Self::StringLit { line, .. }
             | Self::BoolLit { line, .. }

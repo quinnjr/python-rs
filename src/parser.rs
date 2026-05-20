@@ -964,6 +964,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::IntLit { value: v, line })
             }
+            TokenKind::BigIntLit(b) => {
+                self.advance();
+                Ok(Expr::BigIntLit { value: b, line })
+            }
             TokenKind::FloatLit(v) => {
                 self.advance();
                 Ok(Expr::FloatLit { value: v, line })

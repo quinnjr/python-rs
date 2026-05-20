@@ -2446,4 +2446,53 @@ print(fib(10))
         );
         assert_eq!(out, vec!["hello"]);
     }
+
+    // ---------- M2 commit 4: source-level BigInt literals ----------
+
+    #[test]
+    fn bigint_literal_just_past_i64() {
+        // 9223372036854775808 == i64::MAX + 1. Lexer must dispatch to BigInt
+        // rather than parsing as i64 (which would fail).
+        let out = run_and_capture("print(9223372036854775808)\n");
+        assert_eq!(out, vec!["9223372036854775808"]);
+    }
+
+    #[test]
+    fn bigint_literal_twenty_digits() {
+        let out = run_and_capture("print(99999999999999999999)\n");
+        assert_eq!(out, vec!["99999999999999999999"]);
+    }
+
+    #[test]
+    fn bigint_literal_huge() {
+        // 100-digit literal — well past anything i64 can express.
+        let huge = "1".to_owned() + &"0".repeat(99);
+        let src  = format!("print({huge})\n");
+        let out  = run_and_capture(&src);
+        assert_eq!(out, vec![huge]);
+    }
+
+    #[test]
+    fn bigint_literal_arithmetic_chain() {
+        // Mix small and big literals in one expression.
+        let out = run_and_capture("print(99999999999999999999 + 1)\n");
+        assert_eq!(out, vec!["100000000000000000000"]);
+    }
+
+    #[test]
+    fn bigint_negative_literal() {
+        // Python parses -X as unary-neg on X; the literal itself is positive,
+        // then UNARY_NEG runs through PyInt::neg. End-to-end this must
+        // produce the right negative BigInt.
+        let out = run_and_capture("print(-99999999999999999999)\n");
+        assert_eq!(out, vec!["-99999999999999999999"]);
+    }
+
+    #[test]
+    fn i48_overflow_literal_promotes_at_compile_time() {
+        // 2^47 == 140737488355328. Doesn't fit in i48 but fits in i64.
+        // Compiler's Value::from_i64 should promote at constant-creation time.
+        let out = run_and_capture("print(140737488355328)\n");
+        assert_eq!(out, vec!["140737488355328"]);
+    }
 }

@@ -1,11 +1,16 @@
 /// Python tokenizer with INDENT/DEDENT tracking.
 use crate::error::PythonError;
+use num_bigint::BigInt;
 
 /// Token kind.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Literals
     IntLit(i64),
+    /// Integer literal that exceeded i64 range at lex time. Boxed so the
+    /// TokenKind enum stays small; only constructed for genuinely huge
+    /// literals, so the box allocation is rare.
+    BigIntLit(Box<BigInt>),
     FloatLit(f64),
     StringLit(String),
 
@@ -275,8 +280,27 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 let f: f64 = text.parse().map_err(|_| PythonError::lex("invalid float", line))?;
                 tokens.push(Token { kind: TokenKind::FloatLit(f), line, col: start_col });
             } else {
-                let i: i64 = text.parse().map_err(|_| PythonError::lex("invalid integer", line))?;
-                tokens.push(Token { kind: TokenKind::IntLit(i), line, col: start_col });
+                // Digit-count dispatch — 19 decimal digits is the i64 boundary.
+                // Up to 18 digits always fits in i64. 19 digits is the boundary
+                // case (i64::MAX has 19). 20+ digits never fit.
+                let digits = text.len();
+                let kind = if digits < 19 {
+                    TokenKind::IntLit(text.parse().map_err(|_| PythonError::lex("invalid integer", line))?)
+                } else if digits == 19 {
+                    match text.parse::<i64>() {
+                        Ok(i)  => TokenKind::IntLit(i),
+                        Err(_) => {
+                            let b = text.parse::<BigInt>()
+                                .map_err(|_| PythonError::lex("invalid integer", line))?;
+                            TokenKind::BigIntLit(Box::new(b))
+                        }
+                    }
+                } else {
+                    let b = text.parse::<BigInt>()
+                        .map_err(|_| PythonError::lex("invalid integer", line))?;
+                    TokenKind::BigIntLit(Box::new(b))
+                };
+                tokens.push(Token { kind, line, col: start_col });
             }
             continue;
         }

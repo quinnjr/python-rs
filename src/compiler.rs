@@ -907,7 +907,17 @@ impl Compiler {
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), PythonError> {
         match expr {
             Expr::IntLit { value, line } => {
-                let idx = self.add_const(Value::small_int_unchecked(*value));
+                // Source-level i64 literal — promote to BigInt if outside i48.
+                let v = Value::from_i64(*value, &mut self.heap);
+                let idx = self.add_const(v);
+                self.emit(op::LOAD_CONST, idx, *line);
+            }
+            Expr::BigIntLit { value, line } => {
+                // Materialize the BigInt into the heap once at compile time.
+                // Value::from_bigint demotes to a small int if (after lex/parse
+                // simplification) the value somehow fits in i48 — defensive.
+                let v = Value::from_bigint((**value).clone(), &mut self.heap);
+                let idx = self.add_const(v);
                 self.emit(op::LOAD_CONST, idx, *line);
             }
             Expr::FloatLit { value, line } => {
