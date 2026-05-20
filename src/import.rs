@@ -68,21 +68,45 @@ impl ImportSystem {
         self.cmodules.contains_key(name)
     }
 
-    /// Locate `<name>.py` on sys.path. Returns the file path on the first
-    /// hit; None if no entry contains a matching file. Flat-modules-only:
-    /// dotted names ("foo.bar") are not yet resolved (packages land in
-    /// commit 6).
-    pub fn find_source_file(&self, name: &str) -> Option<PathBuf> {
-        if name.contains('.') {
-            return None; // dotted names need package support
-        }
-        for dir in &self.sys_path {
-            let candidate = dir.join(format!("{name}.py"));
+    /// Locate `<leaf>.py` in `dir` (or in any sys.path entry if `dir` is
+    /// None). Used by both the flat-module case (sys.path search) and the
+    /// submodule case (where the parent package's directory is passed).
+    pub fn find_source_file_in(&self, dir: Option<&std::path::Path>, leaf: &str) -> Option<PathBuf> {
+        let dirs: Vec<&std::path::Path> = match dir {
+            Some(d) => vec![d],
+            None    => self.sys_path.iter().map(std::path::PathBuf::as_path).collect(),
+        };
+        for d in dirs {
+            let candidate = d.join(format!("{leaf}.py"));
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
         None
+    }
+
+    /// Locate `<leaf>/__init__.py` in `dir` (or any sys.path entry if None).
+    /// Returns the path to the __init__.py, NOT the package directory —
+    /// the caller derives the package dir from the init path.
+    pub fn find_package_in(&self, dir: Option<&std::path::Path>, leaf: &str) -> Option<PathBuf> {
+        let dirs: Vec<&std::path::Path> = match dir {
+            Some(d) => vec![d],
+            None    => self.sys_path.iter().map(std::path::PathBuf::as_path).collect(),
+        };
+        for d in dirs {
+            let init = d.join(leaf).join("__init__.py");
+            if init.is_file() {
+                return Some(init);
+            }
+        }
+        None
+    }
+
+    /// Back-compat wrapper for the flat `find_source_file(name)` shape
+    /// used by call sites that don't have a parent directory.
+    pub fn find_source_file(&self, name: &str) -> Option<PathBuf> {
+        if name.contains('.') { return None; }
+        self.find_source_file_in(None, name)
     }
 }
 

@@ -408,16 +408,28 @@ impl Compiler {
             self.emit(op::LOAD_CONST, zero, line);
             let none = self.add_const(Value::none());
             self.emit(op::LOAD_CONST, none, line);
-            // IMPORT_NAME pushes the TOP of the dotted path (Python semantic):
-            // `import foo.bar` pushes `foo`, not `foo.bar`.
+            // IMPORT_NAME with fromlist=None pushes the TOP of the dotted
+            // path: `import foo.bar` pushes `foo`.
             let name_idx = self.add_name(&alias.name);
             self.emit(op::IMPORT_NAME, name_idx, line);
-            // Bind under `asname` if present, else under the top-level name.
-            let bind_as = match &alias.asname {
-                Some(a) => a.clone(),
-                None => alias.name.split('.').next().unwrap_or("").to_string(),
-            };
-            self.store_name(&bind_as, line);
+            match &alias.asname {
+                None => {
+                    // `import foo.bar` — bind the top-level name (`foo`).
+                    let top = alias.name.split('.').next().unwrap_or("");
+                    self.store_name(top, line);
+                }
+                Some(asname) => {
+                    // `import foo.bar.baz as fbb` — walk from the top down
+                    // via LOAD_ATTR for each segment after the first, then
+                    // bind the deepest as the alias.
+                    let parts: Vec<&str> = alias.name.split('.').collect();
+                    for part in parts.iter().skip(1) {
+                        let part_idx = self.add_name(part);
+                        self.emit(op::LOAD_ATTR, part_idx, line);
+                    }
+                    self.store_name(asname, line);
+                }
+            }
         }
         Ok(())
     }

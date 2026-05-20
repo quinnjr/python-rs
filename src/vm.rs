@@ -1387,14 +1387,37 @@ impl VM {
                 }
                 op::IMPORT_NAME => {
                     // Stack contract: [level, fromlist] → [module]
-                    // level + fromlist are unused by the cmodule-only path
-                    // in this commit; full relative-import handling lands in
-                    // commit 5 when source-file finders arrive.
-                    let _fromlist = self.frames[frame_idx].pop();
-                    let _level    = self.frames[frame_idx].pop();
-                    let name = self.code_objects[code_index].names[operand as usize].clone();
-                    let module = self.resolve_import(&name, line)?;
-                    self.frames[frame_idx].push(module);
+                    // - `level` > 0 = relative import; resolve absolute name
+                    //   from the current module's __package__ before lookup.
+                    // - When fromlist is None, return the TOP of the dotted
+                    //   path; when fromlist is non-None (a tuple), return
+                    //   the leaf module. Matches Python semantics.
+                    let fromlist = self.frames[frame_idx].pop();
+                    let level    = self.frames[frame_idx].pop();
+                    let raw_name = self.code_objects[code_index].names[operand as usize].clone();
+                    let level_u32 = level.as_int().unwrap_or(0).max(0) as u32;
+                    let abs_name = self.resolve_relative_name(&raw_name, level_u32, line)?;
+                    let _ = self.resolve_import(&abs_name, line)?;
+                    // Choose top vs leaf based on fromlist.
+                    let result = if fromlist.is_none() {
+                        // `import a.b.c` → push `a` (top).
+                        let top = abs_name.split('.').next().unwrap_or(&abs_name);
+                        self.sys_modules.get(top).copied().ok_or_else(|| {
+                            PythonError::runtime(
+                                format!("internal: top module '{top}' missing from sys.modules"),
+                                line,
+                            )
+                        })?
+                    } else {
+                        // `from a.b.c import x` → push `a.b.c` (leaf).
+                        self.sys_modules.get(&abs_name).copied().ok_or_else(|| {
+                            PythonError::runtime(
+                                format!("internal: leaf module '{abs_name}' missing from sys.modules"),
+                                line,
+                            )
+                        })?
+                    };
+                    self.frames[frame_idx].push(result);
                 }
                 op::IMPORT_FROM => {
                     // Stack: [module] → [module, attr]. Module stays on stack
@@ -1956,42 +1979,191 @@ impl VM {
 
     // --- Import-machinery glue (M3 commit 4) ---
 
-    /// Resolve an `import name` request. Tries cmodule, then source-file
-    /// finder. Dotted names (packages) land in M3 commit 6.
+    /// Resolve an `import name` request. Handles cmodules, source files,
+    /// packages (directories with __init__.py), and dotted names. Recurses
+    /// to load parent packages before submodules so `import foo.bar.baz`
+    /// loads foo, then foo.bar, then foo.bar.baz in order.
     fn resolve_import(&mut self, name: &str, line: u32) -> Result<Value, PythonError> {
         if let Some(&cached) = self.sys_modules.get(name) {
             return Ok(cached);
         }
-        if let Some(module) = self.import_system.try_load_cmodule(name, &mut self.heap) {
-            self.sys_modules.insert(name.to_string(), module);
-            return Ok(module);
-        }
-        if let Some(file_path) = self.import_system.find_source_file(name) {
-            return self.load_source_module(name, file_path, line);
-        }
-        let msg = if name.contains('.') {
-            format!("No module named '{name}' (packages land in M3 commit 6)")
-        } else {
-            format!("No module named '{name}'")
+
+        // Split dotted name: "foo.bar.baz" → parent="foo.bar", leaf="baz".
+        let (parent_name, leaf) = match name.rfind('.') {
+            Some(i) => (Some(name[..i].to_string()), &name[i + 1..]),
+            None    => (None, name),
         };
-        Err(PythonError::runtime(msg, line))
+
+        // Ensure parent package is loaded first (recursive).
+        let parent_module = match &parent_name {
+            Some(p) => Some(self.resolve_import(p, line)?),
+            None    => None,
+        };
+
+        // Determine search directory for this name.
+        // - Top-level: search sys.path (handled by find_*_in passing None).
+        // - Submodule: search ONLY the parent package's directory.
+        let parent_dir: Option<std::path::PathBuf> = match parent_module {
+            Some(parent) => Some(self.package_dir_of(parent, &parent_name.clone().unwrap_or_default(), line)?),
+            None => None,
+        };
+        let search: Option<&std::path::Path> = parent_dir.as_deref();
+
+        // Top-level cmodule check (submodule cmodules out of M3 scope).
+        if parent_module.is_none() {
+            if let Some(module) = self.import_system.try_load_cmodule(name, &mut self.heap) {
+                self.sys_modules.insert(name.to_string(), module);
+                return Ok(module);
+            }
+        }
+
+        // Package finder: <dir>/<leaf>/__init__.py wins over <dir>/<leaf>.py.
+        if let Some(init_path) = self.import_system.find_package_in(search, leaf) {
+            return self.load_source_module_v2(name, init_path, true, parent_module, line);
+        }
+        // Source-file finder: <dir>/<leaf>.py.
+        if let Some(file_path) = self.import_system.find_source_file_in(search, leaf) {
+            return self.load_source_module_v2(name, file_path, false, parent_module, line);
+        }
+
+        Err(PythonError::runtime(format!("No module named '{name}'"), line))
     }
 
-    /// Compile and execute a `.py` file as a Python module. The body runs
-    /// inline against the live VM via `execute_until_depth`, with the
-    /// module's globals temporarily swapped into VM.globals so the body's
-    /// STORE_NAME / STORE_GLOBAL operations land in the module namespace.
+    /// Resolve a relative-import name into an absolute one.
+    /// `level=0` means absolute (returns `raw_name` unchanged).
+    /// `level=1` (single dot) walks one segment up from the current module's
+    /// __package__; `level=2` walks two; etc.
+    fn resolve_relative_name(
+        &self,
+        raw_name: &str,
+        level: u32,
+        line: u32,
+    ) -> Result<String, PythonError> {
+        if level == 0 {
+            return Ok(raw_name.to_string());
+        }
+        // The current module's __package__ lives in self.globals during
+        // module-body execution (because of the globals swap). For top-level
+        // scripts, __package__ is missing → relative imports error.
+        let pkg_value = self.globals.get("__package__").copied().unwrap_or(Value::none());
+        if pkg_value.is_none() {
+            return Err(PythonError::runtime(
+                "attempted relative import with no known parent package", line,
+            ));
+        }
+        let pkg_str_idx = pkg_value.as_str_ref().ok_or_else(|| {
+            PythonError::runtime("internal: __package__ is not a string", line)
+        })?;
+        let pkg = self.heap[pkg_str_idx].as_str().ok_or_else(|| {
+            PythonError::runtime("internal: __package__ str-ref is broken", line)
+        })?;
+        // Walk `level - 1` segments up from `pkg`. (A single dot means
+        // "current package", so we drop level-1 segments, not level.)
+        // Actually: `from . import x` with level=1 means current package,
+        // so we keep all of pkg.
+        let mut parts: Vec<&str> = pkg.split('.').filter(|s| !s.is_empty()).collect();
+        for _ in 1..level {
+            if parts.is_empty() {
+                return Err(PythonError::runtime(
+                    "attempted relative import beyond top-level package", line,
+                ));
+            }
+            parts.pop();
+        }
+        let base = parts.join(".");
+        let absolute = if raw_name.is_empty() {
+            base
+        } else if base.is_empty() {
+            raw_name.to_string()
+        } else {
+            format!("{base}.{raw_name}")
+        };
+        Ok(absolute)
+    }
+
+    /// Derive the directory of a loaded package from its module Value.
+    /// For a package, `file` is `<dir>/__init__.py`, so the package dir
+    /// is the parent of `file`.
+    fn package_dir_of(
+        &self,
+        module: Value,
+        module_name: &str,
+        line: u32,
+    ) -> Result<std::path::PathBuf, PythonError> {
+        let idx = module.as_object_ref().ok_or_else(|| {
+            PythonError::runtime(format!("internal: '{module_name}' module is not a heap ref"), line)
+        })?;
+        match &self.heap[idx] {
+            HeapObject::Module { file: Some(f), .. } => {
+                std::path::Path::new(f).parent()
+                    .map(|p| p.to_path_buf())
+                    .ok_or_else(|| PythonError::runtime(
+                        format!("internal: '{module_name}' has no parent dir"), line,
+                    ))
+            }
+            HeapObject::Module { file: None, .. } => {
+                Err(PythonError::runtime(
+                    format!("module '{module_name}' is not a package — cannot resolve submodule"),
+                    line,
+                ))
+            }
+            _ => Err(PythonError::runtime(
+                format!("internal: '{module_name}' is not a Module"), line,
+            )),
+        }
+    }
+
+    /// Compile and execute a `.py` file as a Python module — package- and
+    /// parent-aware version. Wires the module's `__package__` for relative
+    /// imports and sets the new module as an attribute of its parent package.
     ///
-    /// Limitations in M3 commit 5:
-    /// - Functions defined inside the imported module can use locals but
-    ///   not module-level globals from the same module (the function-module
-    ///   binding refactor is its own work).
-    /// - No package support (`__init__.py`), no relative imports, no
-    ///   circular-import partial-module return — those land in commit 6.
-    fn load_source_module(
+    /// `is_package`: true when loading `<dir>/<leaf>/__init__.py`. The
+    /// module's __package__ then equals its own name (it IS the package).
+    /// `parent`: the loaded parent package's module Value, if any.
+    fn load_source_module_v2(
         &mut self,
         name: &str,
         file_path: std::path::PathBuf,
+        is_package: bool,
+        parent: Option<Value>,
+        line: u32,
+    ) -> Result<Value, PythonError> {
+        // __package__ rule (PEP 328): for a package, __package__ == name;
+        // for a submodule, __package__ == name-without-leaf; for a top-level
+        // module not in a package, __package__ is "" (or None — we pick "").
+        let package_str: Option<String> = if is_package {
+            Some(name.to_string())
+        } else if let Some(i) = name.rfind('.') {
+            Some(name[..i].to_string())
+        } else {
+            None
+        };
+
+        let value = self.load_source_module_inner(name, file_path, package_str, line)?;
+
+        // Bind the new module as an attribute of its parent package, so
+        // `pkg.sub` attribute access works after `import pkg.sub`.
+        if let Some(parent_value) = parent
+            && let Some(leaf) = name.rsplit('.').next()
+        {
+            let parent_idx = parent_value.as_object_ref().ok_or_else(|| {
+                PythonError::runtime("internal: parent package is not a heap ref", line)
+            })?;
+            if let HeapObject::Module { globals, .. } = &mut self.heap[parent_idx] {
+                globals.insert(leaf.to_string(), value);
+            }
+        }
+        Ok(value)
+    }
+
+    /// Inner module loader — does the file-read + compile + execute. Used
+    /// by both flat modules and packages; the only difference between them
+    /// is the __package__ value, computed by the caller.
+    fn load_source_module_inner(
+        &mut self,
+        name: &str,
+        file_path: std::path::PathBuf,
+        package: Option<String>,
         line: u32,
     ) -> Result<Value, PythonError> {
         let source = std::fs::read_to_string(&file_path).map_err(|e| {
@@ -2024,17 +2196,25 @@ impl VM {
             self.heap.push(HeapObject::Str(file_path.to_string_lossy().into_owned().into()));
             Value::str_ref(idx)
         };
+        let package_value = match package.as_deref() {
+            Some(p) => {
+                let idx = self.heap.len();
+                self.heap.push(HeapObject::Str(p.into()));
+                Value::str_ref(idx)
+            }
+            None => Value::none(),
+        };
         globals.insert("__name__".into(), name_value);
         globals.insert("__file__".into(), file_value);
         globals.insert("__doc__".into(), Value::none());
-        globals.insert("__package__".into(), Value::none());
+        globals.insert("__package__".into(), package_value);
 
         let module_idx = self.heap.len();
         self.heap.push(HeapObject::Module {
             name: name.to_string(),
             globals,
             file: Some(file_path.to_string_lossy().into_owned()),
-            package: None,
+            package,
             initialized: false,
             all: None,
         });
@@ -2079,28 +2259,34 @@ impl VM {
         Ok(module_value)
     }
 
-    /// `from module import attr` lookup. Reads `module.globals[attr]`;
-    /// if absent, the spec says to fall back to `import module.attr` as
-    /// a sub-import. That fallback lands when the source-file finder
-    /// arrives in commit 5; for now we error.
-    fn module_get_attr(&self, module: Value, attr: &str, line: u32) -> Result<Value, PythonError> {
+    /// `from module import attr` lookup. Tries the module's globals first;
+    /// if the name isn't there, attempts a sub-import of `module.attr`
+    /// (Python's documented fallback for `from pkg import sub` where sub
+    /// is a submodule rather than an attribute).
+    fn module_get_attr(&mut self, module: Value, attr: &str, line: u32) -> Result<Value, PythonError> {
         let idx = module.as_object_ref().ok_or_else(|| {
             PythonError::runtime("internal: IMPORT_FROM TOS is not an object ref", line)
         })?;
-        match &self.heap[idx] {
-            HeapObject::Module { name, globals, .. } => {
-                if let Some(&v) = globals.get(attr) {
-                    Ok(v)
-                } else {
-                    Err(PythonError::runtime(
-                        format!("cannot import name '{attr}' from '{name}'"), line,
-                    ))
-                }
-            }
-            other => Err(PythonError::runtime(
-                format!("internal: IMPORT_FROM TOS is not a Module (got {other:?})"), line,
-            )),
+        // Direct attribute hit.
+        if let HeapObject::Module { globals, .. } = &self.heap[idx]
+            && let Some(&v) = globals.get(attr)
+        {
+            return Ok(v);
         }
+        // Submodule fallback: try `module_name.attr` as a sub-import.
+        let module_name = match &self.heap[idx] {
+            HeapObject::Module { name, .. } => name.clone(),
+            _ => return Err(PythonError::runtime(
+                "internal: IMPORT_FROM TOS is not a Module", line,
+            )),
+        };
+        let submodule_name = format!("{module_name}.{attr}");
+        if let Ok(sub) = self.resolve_import(&submodule_name, line) {
+            return Ok(sub);
+        }
+        Err(PythonError::runtime(
+            format!("cannot import name '{attr}' from '{module_name}'"), line,
+        ))
     }
 
     /// `from module import *` — bind public names into the VM's globals.
@@ -2964,5 +3150,129 @@ print(fib(10))
             vec![dir.path().to_path_buf()],
         );
         assert!(err.contains("module 'partial' has no attribute 'undefined'"), "got: {err}");
+    }
+
+    // ---------- M3 commit 6: packages, relative imports, cycles ----------
+
+    #[test]
+    fn import_package_with_init_py() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "VERSION = \"1.0\"\n").unwrap();
+        let out = run_with_sys_path(
+            "import pkg\nprint(pkg.VERSION)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["1.0"]);
+    }
+
+    #[test]
+    fn from_pkg_sub_import_x() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("mypkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("sub.py"), "x = 42\n").unwrap();
+        let out = run_with_sys_path(
+            "from mypkg.sub import x\nprint(x)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["42"]);
+    }
+
+    #[test]
+    fn import_dotted_binds_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("dotpkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "PKG_MARK = 'pkg-init'\n").unwrap();
+        std::fs::write(pkg.join("sub.py"), "SUB_MARK = 'sub-loaded'\n").unwrap();
+        // `import dotpkg.sub` binds `dotpkg` (top), and dotpkg.sub is reachable
+        // as an attribute of dotpkg.
+        let out = run_with_sys_path(
+            "import dotpkg.sub\nprint(dotpkg.PKG_MARK)\nprint(dotpkg.sub.SUB_MARK)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["pkg-init", "sub-loaded"]);
+    }
+
+    #[test]
+    fn import_dotted_as_alias_loads_attr_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("aspkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("inner.py"), "X = 'inner-X'\n").unwrap();
+        // `import aspkg.inner as ai` should bind ai → aspkg.inner, not aspkg.
+        let out = run_with_sys_path(
+            "import aspkg.inner as ai\nprint(ai.X)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["inner-X"]);
+    }
+
+    #[test]
+    fn relative_import_resolves_from_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("relpkg");
+        std::fs::create_dir(&pkg).unwrap();
+        // __init__.py does a relative import from a sibling and re-exports.
+        std::fs::write(pkg.join("__init__.py"), "from .sub import value\n").unwrap();
+        std::fs::write(pkg.join("sub.py"), "value = 100\n").unwrap();
+        let out = run_with_sys_path(
+            "import relpkg\nprint(relpkg.value)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["100"]);
+    }
+
+    #[test]
+    fn relative_import_at_module_level_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Script at top level uses relative import — should fail.
+        let err = run_with_sys_path_expect_err(
+            "from . import x\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert!(err.contains("attempted relative import with no known parent package"), "got: {err}");
+    }
+
+    #[test]
+    fn package_init_runs_exactly_once() {
+        // Reload-protection: __init__.py body runs once per VM lifetime,
+        // even with multiple `import pkg` statements.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("oncepkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "print('init')\n").unwrap();
+        let out = run_with_sys_path(
+            "import oncepkg\nimport oncepkg\nimport oncepkg\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out.iter().filter(|l| *l == "init").count(), 1);
+    }
+
+    #[test]
+    fn circular_import_completes_without_infinite_loop() {
+        // a imports b which imports a. Both bodies complete because
+        // sys.modules is populated cache-before-execute. After both
+        // bodies finish, the main script can read attributes from either.
+        //
+        // Note: reading PARTIAL attributes during the cycle (e.g., b
+        // doing `a.x` while a's body is still running) needs the
+        // Frame::module_idx refactor to route attribute access through
+        // the current-module-being-executed's live globals. Test only
+        // post-cycle access for now.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"),
+            "import b\nx = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"),
+            "import a\ny = 2\n").unwrap();
+        let out = run_with_sys_path(
+            "import a\nimport b\nprint(a.x)\nprint(b.y)\n",
+            vec![dir.path().to_path_buf()],
+        );
+        assert_eq!(out, vec!["1", "2"]);
     }
 }
