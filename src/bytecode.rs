@@ -37,7 +37,7 @@ pub mod op {
     pub const COMPARE_GE: u8 = 35;
     pub const COMPARE_IS: u8 = 36;
     pub const COMPARE_IS_NOT: u8 = 37;
-    pub const CONTAINS_OP: u8 = 38;       // 'in' operator (operand: 0=in, 1=not in)
+    pub const CONTAINS_OP: u8 = 38; // 'in' operator (operand: 0=in, 1=not in)
 
     // Jumps
     pub const JUMP: u8 = 40;
@@ -67,6 +67,15 @@ pub mod op {
     pub const BUILD_TUPLE: u8 = 83;
     pub const BUILD_DICT: u8 = 84;
     pub const BUILD_SET: u8 = 85;
+    /// Pops `[obj, start, stop, step]` (step at top) and pushes the slice
+    /// `obj[start:stop:step]`. start/stop/step are each either an int or
+    /// None. Supported on lists, tuples, and strings.
+    pub const SLICE_SUBSCRIPT: u8 = 86;
+    /// Comprehension helpers. Each pops the new element(s) plus the
+    /// container, mutates the container, and pushes the container back so
+    /// it remains TOS for the next loop iteration.
+    pub const SET_ADD: u8 = 87;
+    pub const MAP_ADD: u8 = 88;
 
     // Attributes
     pub const LOAD_ATTR: u8 = 90;

@@ -30,14 +30,14 @@ const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const TAG_BITS_MASK: u64 = 0x0003_0000_0000_0000;
 
 /// Tag values (3 bits: sign + bits 49:48).
-const TAG_INT: u64 = 0;       // sign=0, bits=00
-const TAG_BOOL: u64 = 1;      // sign=0, bits=01
-const TAG_NONE: u64 = 2;      // sign=0, bits=10
-const TAG_STR: u64 = 3;       // sign=0, bits=11
-const TAG_LIST: u64 = 4;      // sign=1, bits=00
-const TAG_FUNC: u64 = 5;      // sign=1, bits=01
-const TAG_RANGE: u64 = 6;     // sign=1, bits=10
-const TAG_OBJECT: u64 = 7;    // sign=1, bits=11 — generalized object tag
+const TAG_INT: u64 = 0; // sign=0, bits=00
+const TAG_BOOL: u64 = 1; // sign=0, bits=01
+const TAG_NONE: u64 = 2; // sign=0, bits=10
+const TAG_STR: u64 = 3; // sign=0, bits=11
+const TAG_LIST: u64 = 4; // sign=1, bits=00
+const TAG_FUNC: u64 = 5; // sign=1, bits=01
+const TAG_RANGE: u64 = 6; // sign=1, bits=10
+const TAG_OBJECT: u64 = 7; // sign=1, bits=11 — generalized object tag
 
 /// A NaN-boxed Python value — 8 bytes, Copy.
 ///
@@ -180,20 +180,42 @@ impl Value {
         self.0 & PAYLOAD_MASK
     }
 
-    pub fn is_int(&self) -> bool { self.has_tag(TAG_INT) }
-    pub fn is_bool(&self) -> bool { self.has_tag(TAG_BOOL) }
-    pub fn is_none(&self) -> bool { self.has_tag(TAG_NONE) }
-    pub fn is_str(&self) -> bool { self.has_tag(TAG_STR) }
-    pub fn is_list(&self) -> bool { self.has_tag(TAG_LIST) }
-    pub fn is_func(&self) -> bool { self.has_tag(TAG_FUNC) }
-    pub fn is_range(&self) -> bool { self.has_tag(TAG_RANGE) }
-    pub fn is_object(&self) -> bool { self.has_tag(TAG_OBJECT) }
+    pub fn is_int(&self) -> bool {
+        self.has_tag(TAG_INT)
+    }
+    pub fn is_bool(&self) -> bool {
+        self.has_tag(TAG_BOOL)
+    }
+    pub fn is_none(&self) -> bool {
+        self.has_tag(TAG_NONE)
+    }
+    pub fn is_str(&self) -> bool {
+        self.has_tag(TAG_STR)
+    }
+    pub fn is_list(&self) -> bool {
+        self.has_tag(TAG_LIST)
+    }
+    pub fn is_func(&self) -> bool {
+        self.has_tag(TAG_FUNC)
+    }
+    pub fn is_range(&self) -> bool {
+        self.has_tag(TAG_RANGE)
+    }
+    pub fn is_object(&self) -> bool {
+        self.has_tag(TAG_OBJECT)
+    }
     /// Backward-compat alias.
     #[allow(dead_code)]
-    pub fn is_builtin(&self) -> bool { self.is_object() }
+    pub fn is_builtin(&self) -> bool {
+        self.is_object()
+    }
 
     pub fn as_float(&self) -> Option<f64> {
-        if self.is_float() { Some(f64::from_bits(self.0)) } else { None }
+        if self.is_float() {
+            Some(f64::from_bits(self.0))
+        } else {
+            None
+        }
     }
 
     pub fn as_int(&self) -> Option<i64> {
@@ -207,27 +229,51 @@ impl Value {
     }
 
     pub fn as_bool(&self) -> Option<bool> {
-        if self.is_bool() { Some(self.payload() != 0) } else { None }
+        if self.is_bool() {
+            Some(self.payload() != 0)
+        } else {
+            None
+        }
     }
 
     pub fn as_str_ref(&self) -> Option<usize> {
-        if self.is_str() { Some(self.payload() as usize) } else { None }
+        if self.is_str() {
+            Some(self.payload() as usize)
+        } else {
+            None
+        }
     }
 
     pub fn as_list_ref(&self) -> Option<usize> {
-        if self.is_list() { Some(self.payload() as usize) } else { None }
+        if self.is_list() {
+            Some(self.payload() as usize)
+        } else {
+            None
+        }
     }
 
     pub fn as_func_ref(&self) -> Option<usize> {
-        if self.is_func() { Some(self.payload() as usize) } else { None }
+        if self.is_func() {
+            Some(self.payload() as usize)
+        } else {
+            None
+        }
     }
 
     pub fn as_range_ref(&self) -> Option<usize> {
-        if self.is_range() { Some(self.payload() as usize) } else { None }
+        if self.is_range() {
+            Some(self.payload() as usize)
+        } else {
+            None
+        }
     }
 
     pub fn as_object_ref(&self) -> Option<usize> {
-        if self.is_object() { Some(self.payload() as usize) } else { None }
+        if self.is_object() {
+            Some(self.payload() as usize)
+        } else {
+            None
+        }
     }
 
     /// Backward-compat alias.
@@ -254,9 +300,12 @@ impl Value {
     /// tag; callers that want bool widening go through PyInt's
     /// `from_value_or_bool`).
     pub fn is_pyint(&self, heap: &[HeapObject]) -> bool {
-        if self.is_int() { return true; }
+        if self.is_int() {
+            return true;
+        }
         if let Some(idx) = self.as_object_ref()
-            && matches!(heap[idx], HeapObject::BigInt(_)) {
+            && matches!(heap[idx], HeapObject::BigInt(_))
+        {
             return true;
         }
         false
@@ -268,7 +317,9 @@ impl Value {
     /// Does NOT layer exception subtype semantics — vm.rs's `values_equal`
     /// adds that on top for except-handler matching.
     pub fn py_eq(self, other: Value, heap: &[HeapObject]) -> bool {
-        if self.bits_eq(other) { return true; }
+        if self.bits_eq(other) {
+            return true;
+        }
 
         // None — short-circuit; None equals only None.
         if self.is_none() || other.is_none() {
@@ -287,7 +338,7 @@ impl Value {
 
         // Int family: small int, big int, or bool — all compare against each
         // other as numbers. `True == 1` is required Python semantics.
-        let self_intish  = self.is_pyint(heap) || self.is_bool();
+        let self_intish = self.is_pyint(heap) || self.is_bool();
         let other_intish = other.is_pyint(heap) || other.is_bool();
         if self_intish && other_intish {
             return pyint_values_eq(self, other, heap);
@@ -332,7 +383,11 @@ impl Value {
         } else if let Some(i) = self.as_int() {
             i.to_string()
         } else if let Some(b) = self.as_bool() {
-            if b { "True".to_string() } else { "False".to_string() }
+            if b {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
         } else if self.is_none() {
             "None".to_string()
         } else if let Some(idx) = self.as_str_ref() {
@@ -380,7 +435,9 @@ fn display_object(idx: usize, heap: &[HeapObject]) -> String {
             }
         }
         HeapObject::Dict { keys, values, .. } => {
-            let parts: Vec<String> = keys.iter().zip(values.iter())
+            let parts: Vec<String> = keys
+                .iter()
+                .zip(values.iter())
                 .map(|(k, v)| format!("{}: {}", k.repr(heap), v.repr(heap)))
                 .collect();
             format!("{{{}}}", parts.join(", "))
@@ -397,16 +454,18 @@ fn display_object(idx: usize, heap: &[HeapObject]) -> String {
         HeapObject::Generator { .. } => "<generator object>".to_string(),
         HeapObject::Cell(v) => format!("<cell: {}>", v.display(heap)),
         HeapObject::Closure { name, .. } => format!("<function {name}>"),
-        HeapObject::ExceptionObj { exc_type, message, .. } => {
+        HeapObject::ExceptionObj {
+            exc_type, message, ..
+        } => {
             format!("{exc_type:?}({message})")
         }
         HeapObject::BigInt(b) => b.to_string(),
         HeapObject::Module { name, file, .. } => match file {
             Some(path) => format!("<module '{name}' from '{path}'>"),
-            None       => format!("<module '{name}' (built-in)>"),
+            None => format!("<module '{name}' (built-in)>"),
         },
         HeapObject::ListIter { .. } => "<list_iterator>".to_string(),
-        HeapObject::Set(items) => {
+        HeapObject::Set { items, .. } => {
             if items.is_empty() {
                 "set()".to_string()
             } else {
@@ -421,7 +480,11 @@ fn display_object(idx: usize, heap: &[HeapObject]) -> String {
 /// Format a float like Python does.
 fn format_float(f: f64) -> String {
     if f.is_infinite() {
-        if f > 0.0 { "inf".to_string() } else { "-inf".to_string() }
+        if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        }
     } else if f.is_nan() {
         "nan".to_string()
     } else if f == f.trunc() && f.abs() < 1e16 {
@@ -455,9 +518,9 @@ fn pyint_values_eq(a: Value, b: Value, heap: &[HeapObject]) -> bool {
     let bv = pyint_as_bigint_or_i64(b, heap);
     match (av, bv) {
         (Some(Either3::Small(x)), Some(Either3::Small(y))) => x == y,
-        (Some(Either3::Big(x)),   Some(Either3::Big(y)))   => x == y,
+        (Some(Either3::Big(x)), Some(Either3::Big(y))) => x == y,
         (Some(Either3::Small(x)), Some(Either3::Big(y)))
-            | (Some(Either3::Big(y)),  Some(Either3::Small(x))) => &BigInt::from(x) == y,
+        | (Some(Either3::Big(y)), Some(Either3::Small(x))) => &BigInt::from(x) == y,
         _ => false,
     }
 }
@@ -475,7 +538,8 @@ fn pyint_as_bigint_or_i64<'a>(v: Value, heap: &'a [HeapObject]) -> Option<Either
         return Some(Either3::Small(b as i64));
     }
     if let Some(idx) = v.as_object_ref()
-        && let HeapObject::BigInt(b) = &heap[idx] {
+        && let HeapObject::BigInt(b) = &heap[idx]
+    {
         return Some(Either3::Big(b));
     }
     None
@@ -486,11 +550,18 @@ fn pyint_as_bigint_or_i64<'a>(v: Value, heap: &'a [HeapObject]) -> Option<Either
 /// chokepoint for "give me an f64 for this thing" — int↔float coercion in
 /// arithmetic, hashing, and comparison all go through this.
 pub fn value_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
-    if let Some(f) = v.as_float() { return Some(f); }
-    if let Some(i) = v.as_int() { return Some(i as f64); }
-    if let Some(b) = v.as_bool() { return Some(if b { 1.0 } else { 0.0 }); }
+    if let Some(f) = v.as_float() {
+        return Some(f);
+    }
+    if let Some(i) = v.as_int() {
+        return Some(i as f64);
+    }
+    if let Some(b) = v.as_bool() {
+        return Some(if b { 1.0 } else { 0.0 });
+    }
     if let Some(idx) = v.as_object_ref()
-        && let HeapObject::BigInt(big) = &heap[idx] {
+        && let HeapObject::BigInt(big) = &heap[idx]
+    {
         return bigint_to_f64(big);
     }
     None
@@ -501,7 +572,11 @@ pub fn value_to_f64(v: Value, heap: &[HeapObject]) -> Option<f64> {
 /// outside f64's exact range it loses precision, consistent with CPython.
 fn bigint_to_f64(b: &BigInt) -> Option<f64> {
     Some(b.to_f64().unwrap_or_else(|| {
-        if b.sign() == Sign::Minus { f64::NEG_INFINITY } else { f64::INFINITY }
+        if b.sign() == Sign::Minus {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }
     }))
 }
 
@@ -553,9 +628,12 @@ impl<'a> PyInt<'a> {
     /// Construct from a Value. Returns None if `v` is not an int.
     /// Does NOT treat bool as int — use `from_value_or_bool` for that.
     pub fn from_value(v: Value, heap: &'a [HeapObject]) -> Option<Self> {
-        if let Some(i) = v.as_int() { return Some(PyInt::Small(i)); }
+        if let Some(i) = v.as_int() {
+            return Some(PyInt::Small(i));
+        }
         if let Some(idx) = v.as_object_ref()
-            && let HeapObject::BigInt(b) = &heap[idx] {
+            && let HeapObject::BigInt(b) = &heap[idx]
+        {
             return Some(PyInt::Big(b));
         }
         None
@@ -564,7 +642,9 @@ impl<'a> PyInt<'a> {
     /// Construct from a Value, widening bool to int (True→1, False→0).
     /// Use at arithmetic call sites — Python treats `True + 1 == 2`.
     pub fn from_value_or_bool(v: Value, heap: &'a [HeapObject]) -> Option<Self> {
-        if let Some(b) = v.as_bool() { return Some(PyInt::Small(b as i64)); }
+        if let Some(b) = v.as_bool() {
+            return Some(PyInt::Small(b as i64));
+        }
         Self::from_value(v, heap)
     }
 
@@ -663,7 +743,7 @@ impl<'a> PyInt<'a> {
             || matches!(exp, PyInt::Big(b) if b.sign() == Sign::Minus)
         {
             let base_f = self.to_f64();
-            let exp_f  = exp.to_f64();
+            let exp_f = exp.to_f64();
             return PyPowResult::Float(base_f.powf(exp_f));
         }
 
@@ -672,7 +752,7 @@ impl<'a> PyInt<'a> {
         // bit result), so we fall back to f64 powf.
         let exp_u32 = match exp {
             PyInt::Small(e) => u32::try_from(e).ok(),
-            PyInt::Big(b)   => u32::try_from(b).ok(),
+            PyInt::Big(b) => u32::try_from(b).ok(),
         };
         match exp_u32 {
             Some(e) => {
@@ -696,7 +776,10 @@ impl<'a> PyInt<'a> {
             return Err(ArithError::NegativePower);
         }
         if let PyInt::Big(b) = exp
-            && b.sign() == Sign::Minus { return Err(ArithError::NegativePower); }
+            && b.sign() == Sign::Minus
+        {
+            return Err(ArithError::NegativePower);
+        }
 
         let base = self.to_owned_bigint();
         let e = exp.to_owned_bigint();
@@ -710,7 +793,7 @@ impl<'a> PyInt<'a> {
                 // i64::MIN.checked_neg() returns None; spills to BigInt.
                 match i.checked_neg() {
                     Some(r) => PyIntOwned::Small(r).demote(),
-                    None    => PyIntOwned::Big(-BigInt::from(i)).demote(),
+                    None => PyIntOwned::Big(-BigInt::from(i)).demote(),
                 }
             }
             PyInt::Big(b) => PyIntOwned::Big(-b).demote(),
@@ -721,7 +804,7 @@ impl<'a> PyInt<'a> {
         match self {
             PyInt::Small(i) => match i.checked_abs() {
                 Some(r) => PyIntOwned::Small(r).demote(),
-                None    => PyIntOwned::Big(BigInt::from(i).abs()).demote(),
+                None => PyIntOwned::Big(BigInt::from(i).abs()).demote(),
             },
             PyInt::Big(b) => PyIntOwned::Big(b.abs()).demote(),
         }
@@ -752,7 +835,7 @@ impl<'a> PyInt<'a> {
         // ~x == -x - 1 in Python's two's-complement int model.
         match self {
             PyInt::Small(i) => PyIntOwned::Small(!i).demote(),
-            PyInt::Big(b)   => PyIntOwned::Big(!b.clone()).demote(),
+            PyInt::Big(b) => PyIntOwned::Big(!b.clone()).demote(),
         }
     }
 
@@ -786,9 +869,9 @@ impl<'a> PyInt<'a> {
     pub fn cmp(self, other: Self) -> std::cmp::Ordering {
         match (self, other) {
             (PyInt::Small(a), PyInt::Small(b)) => a.cmp(&b),
-            (PyInt::Big(a), PyInt::Big(b))     => a.cmp(b),
-            (PyInt::Small(a), PyInt::Big(b))   => BigInt::from(a).cmp(b),
-            (PyInt::Big(a), PyInt::Small(b))   => a.cmp(&BigInt::from(b)),
+            (PyInt::Big(a), PyInt::Big(b)) => a.cmp(b),
+            (PyInt::Small(a), PyInt::Big(b)) => BigInt::from(a).cmp(b),
+            (PyInt::Big(a), PyInt::Small(b)) => a.cmp(&BigInt::from(b)),
         }
     }
 
@@ -808,7 +891,7 @@ impl<'a> PyInt<'a> {
     pub fn hash(&self) -> i64 {
         match self {
             PyInt::Small(i) => hash_small_i64(*i),
-            PyInt::Big(b)   => hash_bigint(b),
+            PyInt::Big(b) => hash_bigint(b),
         }
     }
 }
@@ -820,7 +903,7 @@ impl PyIntOwned {
             PyIntOwned::Small(i) if !fits_in_i48(i) => PyIntOwned::Big(BigInt::from(i)),
             PyIntOwned::Big(b) => match bigint_to_i48(&b) {
                 Some(i) => PyIntOwned::Small(i),
-                None    => PyIntOwned::Big(b),
+                None => PyIntOwned::Big(b),
             },
             small => small,
         }
@@ -838,7 +921,6 @@ impl PyIntOwned {
             }
         }
     }
-
 }
 
 // ---------- shared helpers ----------
@@ -857,23 +939,36 @@ fn check_nonzero(d: PyInt<'_>) -> Result<(), ArithError> {
 fn floor_div_i64(a: i64, b: i64) -> i64 {
     let q = a / b;
     let r = a % b;
-    if (r != 0) && ((r < 0) != (b < 0)) { q - 1 } else { q }
+    if (r != 0) && ((r < 0) != (b < 0)) {
+        q - 1
+    } else {
+        q
+    }
 }
 
 #[inline]
 fn floor_mod_i64(a: i64, b: i64) -> i64 {
     let r = a % b;
-    if (r != 0) && ((r < 0) != (b < 0)) { r + b } else { r }
+    if (r != 0) && ((r < 0) != (b < 0)) {
+        r + b
+    } else {
+        r
+    }
 }
 
 fn pyint_to_shift_amount(p: PyInt<'_>) -> Result<usize, ArithError> {
     match p {
         PyInt::Small(s) => {
-            if s < 0 { Err(ArithError::NegativeShift) }
-            else { Ok(s as usize) }
+            if s < 0 {
+                Err(ArithError::NegativeShift)
+            } else {
+                Ok(s as usize)
+            }
         }
         PyInt::Big(b) => {
-            if b.sign() == Sign::Minus { return Err(ArithError::NegativeShift); }
+            if b.sign() == Sign::Minus {
+                return Err(ArithError::NegativeShift);
+            }
             usize::try_from(b).map_err(|_| ArithError::NegativeShift)
         }
     }
@@ -887,19 +982,25 @@ pub fn pyint_truediv(a: PyInt<'_>, b: PyInt<'_>) -> Result<f64, ArithError> {
     let bf = b.to_f64();
     // Defensive: even after check_nonzero, a non-zero BigInt can in
     // principle underflow to 0.0 in f64. Keep this guard.
-    if bf == 0.0 { return Err(ArithError::DivByZero); }
+    if bf == 0.0 {
+        return Err(ArithError::DivByZero);
+    }
     Ok(a.to_f64() / bf)
 }
 
 // ---------- Mersenne hash (allocation-free, division-free) ----------
 
-const PYHASH_BITS:    u32 = 61;
+const PYHASH_BITS: u32 = 61;
 const PYHASH_MODULUS: u64 = (1u64 << PYHASH_BITS) - 1; // 2^61 - 1
 
 #[inline(always)]
 const fn mod_mersenne_u64(x: u64) -> u64 {
     let r = (x & PYHASH_MODULUS) + (x >> PYHASH_BITS);
-    if r >= PYHASH_MODULUS { r - PYHASH_MODULUS } else { r }
+    if r >= PYHASH_MODULUS {
+        r - PYHASH_MODULUS
+    } else {
+        r
+    }
 }
 
 #[inline(always)]
@@ -907,13 +1008,17 @@ const fn mod_mersenne_u128(mut x: u128) -> u64 {
     x = (x & PYHASH_MODULUS as u128) + (x >> PYHASH_BITS);
     x = (x & PYHASH_MODULUS as u128) + (x >> PYHASH_BITS);
     let r = x as u64;
-    if r >= PYHASH_MODULUS { r - PYHASH_MODULUS } else { r }
+    if r >= PYHASH_MODULUS {
+        r - PYHASH_MODULUS
+    } else {
+        r
+    }
 }
 
 #[inline(always)]
 fn hash_small_i64(i: i64) -> i64 {
-    let abs    = i.unsigned_abs();
-    let h      = mod_mersenne_u64(abs) as i64;
+    let abs = i.unsigned_abs();
+    let h = mod_mersenne_u64(abs) as i64;
     let signed = if i < 0 { -h } else { h };
     signed - ((signed == -1) as i64) // -1 → -2, branchless
 }
@@ -921,15 +1026,19 @@ fn hash_small_i64(i: i64) -> i64 {
 #[inline(never)]
 #[cold]
 fn hash_bigint(b: &BigInt) -> i64 {
-    let mut h:    u64 = 0;
+    let mut h: u64 = 0;
     let mut pow8: u64 = 1; // 8^i mod P
     for limb in b.iter_u64_digits() {
         let limb_mod = mod_mersenne_u64(limb);
-        let term     = mod_mersenne_u128(limb_mod as u128 * pow8 as u128);
-        h            = mod_mersenne_u64(h + term);
-        pow8         = mod_mersenne_u64(pow8 << 3);
+        let term = mod_mersenne_u128(limb_mod as u128 * pow8 as u128);
+        h = mod_mersenne_u64(h + term);
+        pow8 = mod_mersenne_u64(pow8 << 3);
     }
-    let signed = if b.sign() == Sign::Minus { -(h as i64) } else { h as i64 };
+    let signed = if b.sign() == Sign::Minus {
+        -(h as i64)
+    } else {
+        h as i64
+    };
     signed - ((signed == -1) as i64)
 }
 
@@ -958,16 +1067,9 @@ pub enum HeapObject {
         module_idx: Option<usize>,
     },
     /// Range iterator state.
-    RangeIter {
-        current: i64,
-        stop: i64,
-        step: i64,
-    },
+    RangeIter { current: i64, stop: i64, step: i64 },
     /// Built-in function.
-    BuiltinFn {
-        name: String,
-        id: BuiltinId,
-    },
+    BuiltinFn { name: String, id: BuiltinId },
     /// Tuple (immutable sequence).
     Tuple(Vec<Value>),
     /// Dictionary.
@@ -977,7 +1079,14 @@ pub enum HeapObject {
         index_map: HashMap<u64, usize>,
     },
     /// Set.
-    Set(Vec<Value>),
+    /// `items` is the insertion-ordered backing store. `index_map` maps
+    /// `value_hash(v)` → index in `items`, giving O(1) average membership
+    /// checks; hash collisions are resolved by a linear scan over
+    /// `items` (same collision strategy as Dict).
+    Set {
+        items: Vec<Value>,
+        index_map: HashMap<u64, usize>,
+    },
     /// Class object.
     Class {
         name: String,
@@ -992,10 +1101,11 @@ pub enum HeapObject {
         attrs: HashMap<String, Value>,
     },
     /// Bound method (instance + function).
-    BoundMethod {
-        instance: Value,
-        method: Value,
-    },
+    BoundMethod { instance: Value, method: Value },
+    /// `super(type, obj)` proxy. Attribute access walks `type`'s MRO
+    /// starting AFTER `type` — i.e. lookups skip `type`'s own attrs and
+    /// resolve to the first parent that defines the name.
+    SuperProxy { class_idx: usize, instance: Value },
     /// Generator object.
     Generator {
         code_index: usize,
@@ -1023,25 +1133,13 @@ pub enum HeapObject {
         args: Vec<Value>,
     },
     /// List iterator.
-    ListIter {
-        list_idx: usize,
-        index: usize,
-    },
+    ListIter { list_idx: usize, index: usize },
     /// Tuple iterator.
-    TupleIter {
-        tuple_idx: usize,
-        index: usize,
-    },
+    TupleIter { tuple_idx: usize, index: usize },
     /// String iterator.
-    StringIter {
-        str_idx: usize,
-        index: usize,
-    },
+    StringIter { str_idx: usize, index: usize },
     /// Dict key iterator.
-    DictKeyIter {
-        dict_idx: usize,
-        index: usize,
-    },
+    DictKeyIter { dict_idx: usize, index: usize },
     /// Arbitrary-precision integer. Only present when a value has
     /// overflowed the i48 small-int range, or when a source literal
     /// exceeds i64. Reached via TAG_OBJECT.
@@ -1115,7 +1213,8 @@ pub trait CModule {
 pub fn heap_str(heap: &[HeapObject], idx: usize) -> Result<&str, crate::error::PythonError> {
     heap.get(idx).and_then(HeapObject::as_str).ok_or_else(|| {
         crate::error::PythonError::runtime(
-            format!("internal: heap index {idx} does not point to a Str"), 0,
+            format!("internal: heap index {idx} does not point to a Str"),
+            0,
         )
     })
 }
@@ -1136,6 +1235,13 @@ pub fn alloc_tuple(heap: &mut Vec<HeapObject>, items: Vec<Value>) -> Value {
     Value::object_ref(idx)
 }
 
+/// Allocate a `List` into `heap` and return the `Value::list_ref` to it.
+pub fn alloc_list(heap: &mut Vec<HeapObject>, items: Vec<Value>) -> Value {
+    let idx = heap.len();
+    heap.push(HeapObject::List(items));
+    Value::list_ref(idx)
+}
+
 /// Allocate a `Module` heap entry and return the `Value::object_ref`.
 /// Single source of truth for the variant's field shape — adding a future
 /// field (e.g., `__spec__`) becomes one edit instead of three.
@@ -1148,7 +1254,14 @@ pub fn alloc_module(
     initialized: bool,
 ) -> Value {
     let idx = heap.len();
-    heap.push(HeapObject::Module { name, globals, file, package, initialized, all: None });
+    heap.push(HeapObject::Module {
+        name,
+        globals,
+        file,
+        package,
+        initialized,
+        all: None,
+    });
     Value::object_ref(idx)
 }
 
@@ -1158,7 +1271,7 @@ pub fn alloc_module(
 pub fn split_module_name(name: &str) -> (Option<&str>, &str) {
     match name.rfind('.') {
         Some(i) => (Some(&name[..i]), &name[i + 1..]),
-        None    => (None, name),
+        None => (None, name),
     }
 }
 
@@ -1199,7 +1312,9 @@ pub enum ExceptionType {
 impl ExceptionType {
     /// Check if self is a subtype of target.
     pub fn is_subtype(self, target: Self) -> bool {
-        if self == target { return true; }
+        if self == target {
+            return true;
+        }
         match target {
             Self::BaseException => true,
             Self::Exception => self != Self::BaseException,
@@ -1274,6 +1389,7 @@ pub enum BuiltinId {
     Id,
     Iter,
     Next,
+    Repr,
     // List methods
     ListAppend,
     ListPop,
@@ -1331,7 +1447,17 @@ mod tests {
 
     #[test]
     fn int_roundtrip() {
-        for v in [0, 1, -1, 42, -42, 100_000, -100_000, (1 << 47) - 1, -(1 << 47)] {
+        for v in [
+            0,
+            1,
+            -1,
+            42,
+            -42,
+            100_000,
+            -100_000,
+            (1 << 47) - 1,
+            -(1 << 47),
+        ] {
             let val = Value::small_int_unchecked(v);
             assert!(val.is_int(), "expected int for {v}");
             assert_eq!(val.as_int(), Some(v), "roundtrip failed for {v}");
@@ -1476,7 +1602,10 @@ mod tests {
     fn from_i64_promotes_to_bigint_for_overflow() {
         let mut heap = Vec::new();
         let v = Value::from_i64(i64::MAX, &mut heap);
-        assert!(!v.is_int(), "i64::MAX does not fit in i48, must not be TAG_INT");
+        assert!(
+            !v.is_int(),
+            "i64::MAX does not fit in i48, must not be TAG_INT"
+        );
         assert!(v.is_object());
         assert_eq!(heap.len(), 1, "one BigInt allocated");
         assert!(matches!(heap[0], HeapObject::BigInt(_)));
@@ -1574,7 +1703,10 @@ mod tests {
         };
         let heap = vec![m];
         let v = Value::object_ref(0);
-        assert_eq!(v.display(&heap), "<module 'mymodule' from '/tmp/mymodule.py'>");
+        assert_eq!(
+            v.display(&heap),
+            "<module 'mymodule' from '/tmp/mymodule.py'>"
+        );
     }
 
     #[test]
@@ -1595,9 +1727,15 @@ mod tests {
     #[test]
     fn import_error_exception_type_round_trip() {
         assert_eq!(ExceptionType::ImportError.name(), "ImportError");
-        assert_eq!(ExceptionType::from_name("ImportError"), Some(ExceptionType::ImportError));
+        assert_eq!(
+            ExceptionType::from_name("ImportError"),
+            Some(ExceptionType::ImportError)
+        );
         // ModuleNotFoundError (3.6+) aliases to ImportError in our 3.0.1 target.
-        assert_eq!(ExceptionType::from_name("ModuleNotFoundError"), Some(ExceptionType::ImportError));
+        assert_eq!(
+            ExceptionType::from_name("ModuleNotFoundError"),
+            Some(ExceptionType::ImportError)
+        );
         assert_eq!(ExceptionType::from_name("NotAnException"), None);
     }
 
@@ -1610,7 +1748,9 @@ mod tests {
 
     // ---------- M2 commit 2: PyInt arithmetic ----------
 
-    fn small(i: i64) -> PyInt<'static> { PyInt::Small(i) }
+    fn small(i: i64) -> PyInt<'static> {
+        PyInt::Small(i)
+    }
 
     fn as_i64(p: &PyIntOwned) -> Option<i64> {
         match p {
@@ -1680,9 +1820,15 @@ mod tests {
 
     #[test]
     fn pyint_div_by_zero() {
-        assert_eq!(small(1).floordiv(small(0)).unwrap_err(), ArithError::DivByZero);
+        assert_eq!(
+            small(1).floordiv(small(0)).unwrap_err(),
+            ArithError::DivByZero
+        );
         assert_eq!(small(1).mod_(small(0)).unwrap_err(), ArithError::DivByZero);
-        assert_eq!(small(1).divmod(small(0)).unwrap_err(), ArithError::DivByZero);
+        assert_eq!(
+            small(1).divmod(small(0)).unwrap_err(),
+            ArithError::DivByZero
+        );
     }
 
     #[test]
@@ -1729,7 +1875,10 @@ mod tests {
 
     #[test]
     fn pyint_pow_mod_negative_exp_errors() {
-        assert_eq!(small(2).pow_mod(small(-1), small(7)).unwrap_err(), ArithError::NegativePower);
+        assert_eq!(
+            small(2).pow_mod(small(-1), small(7)).unwrap_err(),
+            ArithError::NegativePower
+        );
     }
 
     #[test]
@@ -1768,8 +1917,14 @@ mod tests {
 
     #[test]
     fn pyint_shift_negative_errors() {
-        assert_eq!(small(1).shl(small(-1)).unwrap_err(), ArithError::NegativeShift);
-        assert_eq!(small(1).shr(small(-1)).unwrap_err(), ArithError::NegativeShift);
+        assert_eq!(
+            small(1).shl(small(-1)).unwrap_err(),
+            ArithError::NegativeShift
+        );
+        assert_eq!(
+            small(1).shr(small(-1)).unwrap_err(),
+            ArithError::NegativeShift
+        );
     }
 
     #[test]
@@ -1811,7 +1966,10 @@ mod tests {
     #[test]
     fn pyint_truediv_basic() {
         assert_eq!(pyint_truediv(small(7), small(2)).unwrap(), 3.5);
-        assert_eq!(pyint_truediv(small(1), small(0)).unwrap_err(), ArithError::DivByZero);
+        assert_eq!(
+            pyint_truediv(small(1), small(0)).unwrap_err(),
+            ArithError::DivByZero
+        );
     }
 
     #[test]
@@ -1887,8 +2045,16 @@ mod tests {
     #[test]
     fn mod_mersenne_u64_correctness() {
         // Spot-check against straightforward % to confirm the optimization.
-        for x in [0u64, 1, PYHASH_MODULUS - 1, PYHASH_MODULUS, PYHASH_MODULUS + 1,
-                  u64::MAX, 1u64 << 61, (1u64 << 61) + 7] {
+        for x in [
+            0u64,
+            1,
+            PYHASH_MODULUS - 1,
+            PYHASH_MODULUS,
+            PYHASH_MODULUS + 1,
+            u64::MAX,
+            1u64 << 61,
+            (1u64 << 61) + 7,
+        ] {
             assert_eq!(mod_mersenne_u64(x), x % PYHASH_MODULUS, "x={x}");
         }
     }

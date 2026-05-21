@@ -1,6 +1,8 @@
 /// Built-in functions: print, range, len, type, int, str, bool, isinstance, super, etc.
 use crate::error::PythonError;
-use crate::object::{BuiltinId, ExceptionType, HeapObject, PyInt, Value, heap_str, value_hash};
+use crate::object::{
+    BuiltinId, ExceptionType, HeapObject, PyInt, Value, alloc_str, heap_str, value_hash,
+};
 use num_bigint::BigInt;
 use std::collections::HashMap;
 
@@ -28,6 +30,7 @@ pub fn register_builtins(globals: &mut HashMap<String, Value>, heap: &mut Vec<He
         ("id", BuiltinId::Id),
         ("iter", BuiltinId::Iter),
         ("next", BuiltinId::Next),
+        ("repr", BuiltinId::Repr),
     ];
 
     for (name, id) in builtins {
@@ -74,7 +77,7 @@ pub fn call_builtin(
     args: &[Value],
     heap: &mut Vec<HeapObject>,
     output: &mut Vec<String>,
-    globals: &HashMap<String, Value>,
+    _globals: &HashMap<String, Value>,
 ) -> Result<Value, PythonError> {
     match id {
         BuiltinId::Print => builtin_print(args, heap, output),
@@ -91,13 +94,14 @@ pub fn call_builtin(
         BuiltinId::Max => builtin_max(args, heap),
         BuiltinId::Isinstance => builtin_isinstance(args, heap),
         BuiltinId::Issubclass => builtin_issubclass(args, heap),
-        BuiltinId::Super => builtin_super(args, globals),
+        BuiltinId::Super => builtin_super(args, heap),
         BuiltinId::Hasattr => builtin_hasattr(args, heap),
         BuiltinId::Getattr => builtin_getattr(args, heap),
         BuiltinId::Setattr => builtin_setattr(args, heap),
         BuiltinId::Id => builtin_id(args),
         BuiltinId::Iter => Ok(Value::none()), // handled in VM
         BuiltinId::Next => Ok(Value::none()), // handled in VM
+        BuiltinId::Repr => builtin_repr(args, heap),
         BuiltinId::ExcConstructor(et) => builtin_exc_constructor(et, args, heap),
         // List methods
         BuiltinId::ListAppend => builtin_list_append(args, heap),
@@ -126,12 +130,18 @@ pub fn call_builtin(
     }
 }
 
-fn builtin_print(args: &[Value], heap: &[HeapObject], output: &mut Vec<String>) -> Result<Value, PythonError> {
+fn builtin_print(
+    args: &[Value],
+    heap: &[HeapObject],
+    output: &mut Vec<String>,
+) -> Result<Value, PythonError> {
     // Build the line directly instead of collecting into Vec<String> + join;
     // saves one Vec allocation per print() call.
     let mut line = String::new();
     for (i, v) in args.iter().enumerate() {
-        if i > 0 { line.push(' '); }
+        if i > 0 {
+            line.push(' ');
+        }
         line.push_str(&v.display(heap));
     }
     output.push(line);
@@ -141,18 +151,30 @@ fn builtin_print(args: &[Value], heap: &[HeapObject], output: &mut Vec<String>) 
 fn builtin_range(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
     let (start, stop, step) = match args.len() {
         1 => {
-            let stop = args[0].as_int().ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
+            let stop = args[0]
+                .as_int()
+                .ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
             (0, stop, 1)
         }
         2 => {
-            let start = args[0].as_int().ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
-            let stop = args[1].as_int().ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
+            let start = args[0]
+                .as_int()
+                .ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
+            let stop = args[1]
+                .as_int()
+                .ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
             (start, stop, 1)
         }
         3 => {
-            let start = args[0].as_int().ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
-            let stop = args[1].as_int().ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
-            let step = args[2].as_int().ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
+            let start = args[0]
+                .as_int()
+                .ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
+            let stop = args[1]
+                .as_int()
+                .ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
+            let step = args[2]
+                .as_int()
+                .ok_or_else(|| PythonError::runtime("range() integer expected", 0))?;
             if step == 0 {
                 return Err(PythonError::runtime("range() arg 3 must not be zero", 0));
             }
@@ -188,7 +210,7 @@ fn builtin_len(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError
         match &heap[idx] {
             HeapObject::Tuple(items) => Ok(Value::small_int_unchecked(items.len() as i64)),
             HeapObject::Dict { keys, .. } => Ok(Value::small_int_unchecked(keys.len() as i64)),
-            HeapObject::Set(items) => Ok(Value::small_int_unchecked(items.len() as i64)),
+            HeapObject::Set { items, .. } => Ok(Value::small_int_unchecked(items.len() as i64)),
             _ => Err(PythonError::runtime("object has no len()", 0)),
         }
     } else {
@@ -229,8 +251,8 @@ fn builtin_type(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyt
             HeapObject::Class { .. } => "<class 'type'>",
             HeapObject::Tuple(_) => "<class 'tuple'>",
             HeapObject::Dict { .. } => "<class 'dict'>",
-            HeapObject::Set(_) => "<class 'set'>",
-            _ => "<class 'object'>"
+            HeapObject::Set { .. } => "<class 'set'>",
+            _ => "<class 'object'>",
         }
     } else {
         "<class 'object'>"
@@ -260,7 +282,8 @@ fn builtin_int(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyth
         // a BigInt; for inf/nan, Python raises (we surface as a runtime error).
         if !f.is_finite() {
             return Err(PythonError::runtime(
-                "cannot convert float infinity/NaN to integer", 0,
+                "cannot convert float infinity/NaN to integer",
+                0,
             ));
         }
         // Floats up to ~9e18 fit in i64; beyond that route through BigInt.
@@ -270,9 +293,9 @@ fn builtin_int(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyth
         // Use the string round-trip — slow but correct for the rare big-float case.
         let truncated = f.trunc();
         let s = format!("{truncated:.0}");
-        let b: BigInt = s.parse().map_err(|_| {
-            PythonError::runtime("cannot convert float to integer", 0)
-        })?;
+        let b: BigInt = s
+            .parse()
+            .map_err(|_| PythonError::runtime("cannot convert float to integer", 0))?;
         return Ok(Value::from_bigint(b, heap));
     }
     if let Some(idx) = val.as_str_ref() {
@@ -286,22 +309,32 @@ fn builtin_int(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyth
         })?;
         return Ok(Value::from_bigint(b, heap));
     }
-    Err(PythonError::runtime("int() argument must be a string or number", 0))
+    Err(PythonError::runtime(
+        "int() argument must be a string or number",
+        0,
+    ))
 }
 
 fn builtin_str(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
     if args.is_empty() {
-        let heap_idx = heap.len();
-        heap.push(HeapObject::Str("".into()));
-        return Ok(Value::str_ref(heap_idx));
+        return Ok(alloc_str(heap, ""));
     }
     if args.len() != 1 {
         return Err(PythonError::runtime("str() takes at most one argument", 0));
     }
     let s = args[0].display(heap);
-    let heap_idx = heap.len();
-    heap.push(HeapObject::Str(s.into()));
-    Ok(Value::str_ref(heap_idx))
+    Ok(alloc_str(heap, s))
+}
+
+/// `repr(x)` builtin. The VM intercepts `repr(instance)` before this
+/// when `__repr__` is user-defined, so reaching here for an Instance
+/// means the user inherited the default formatter.
+fn builtin_repr(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
+    if args.len() != 1 {
+        return Err(PythonError::runtime("repr() takes exactly one argument", 0));
+    }
+    let s = args[0].repr(heap);
+    Ok(alloc_str(heap, s))
 }
 
 fn builtin_bool(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
@@ -313,10 +346,14 @@ fn builtin_bool(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonErro
     }
     // Check heap-based truthiness
     let val = args[0];
-    if let Some(idx) = val.as_str_ref() && let Some(s) = heap[idx].as_str() {
+    if let Some(idx) = val.as_str_ref()
+        && let Some(s) = heap[idx].as_str()
+    {
         return Ok(Value::bool_val(!s.is_empty()));
     }
-    if let Some(idx) = val.as_list_ref() && let HeapObject::List(items) = &heap[idx] {
+    if let Some(idx) = val.as_list_ref()
+        && let HeapObject::List(items) = &heap[idx]
+    {
         return Ok(Value::bool_val(!items.is_empty()));
     }
     Ok(Value::bool_val(val.is_truthy()))
@@ -327,7 +364,10 @@ fn builtin_float(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonErr
         return Ok(Value::float(0.0));
     }
     if args.len() != 1 {
-        return Err(PythonError::runtime("float() takes at most one argument", 0));
+        return Err(PythonError::runtime(
+            "float() takes at most one argument",
+            0,
+        ));
     }
     let val = args[0];
     if let Some(f) = val.as_float() {
@@ -345,7 +385,10 @@ fn builtin_float(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonErr
         })?;
         return Ok(Value::float(f));
     }
-    Err(PythonError::runtime("float() argument must be a string or number", 0))
+    Err(PythonError::runtime(
+        "float() argument must be a string or number",
+        0,
+    ))
 }
 
 fn builtin_abs(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
@@ -364,13 +407,17 @@ fn builtin_abs(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, Pyth
 
 fn builtin_divmod(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
     if args.len() != 2 {
-        return Err(PythonError::runtime("divmod() takes exactly two arguments", 0));
+        return Err(PythonError::runtime(
+            "divmod() takes exactly two arguments",
+            0,
+        ));
     }
     let a = PyInt::from_value_or_bool(args[0], heap);
     let b = PyInt::from_value_or_bool(args[1], heap);
     match (a, b) {
         (Some(ai), Some(bi)) => {
-            let (q, r) = ai.divmod(bi)
+            let (q, r) = ai
+                .divmod(bi)
                 .map_err(|_| PythonError::runtime("integer division or modulo by zero", 0))?;
             let qv = q.into_value(heap);
             let rv = r.into_value(heap);
@@ -378,7 +425,10 @@ fn builtin_divmod(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, P
             heap.push(HeapObject::Tuple(vec![qv, rv]));
             Ok(Value::object_ref(tuple_idx))
         }
-        _ => Err(PythonError::runtime("divmod() requires two integer arguments", 0)),
+        _ => Err(PythonError::runtime(
+            "divmod() requires two integer arguments",
+            0,
+        )),
     }
 }
 
@@ -391,20 +441,32 @@ fn builtin_max(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError
 }
 
 #[derive(Clone, Copy)]
-enum MinMax { Min, Max }
+enum MinMax {
+    Min,
+    Max,
+}
 
 impl MinMax {
     fn name(self) -> &'static str {
-        match self { Self::Min => "min", Self::Max => "max" }
+        match self {
+            Self::Min => "min",
+            Self::Max => "max",
+        }
     }
     fn want(self) -> std::cmp::Ordering {
-        match self { Self::Min => std::cmp::Ordering::Less, Self::Max => std::cmp::Ordering::Greater }
+        match self {
+            Self::Min => std::cmp::Ordering::Less,
+            Self::Max => std::cmp::Ordering::Greater,
+        }
     }
 }
 
 fn minmax(args: &[Value], heap: &[HeapObject], kind: MinMax) -> Result<Value, PythonError> {
     if args.len() < 2 {
-        return Err(PythonError::runtime(format!("{}() requires at least 2 arguments", kind.name()), 0));
+        return Err(PythonError::runtime(
+            format!("{}() requires at least 2 arguments", kind.name()),
+            0,
+        ));
     }
     let mut result = args[0];
     for arg in &args[1..] {
@@ -413,6 +475,13 @@ fn minmax(args: &[Value], heap: &[HeapObject], kind: MinMax) -> Result<Value, Py
             PyInt::from_value_or_bool(result, heap),
         ) {
             a.cmp(b) == kind.want()
+        } else if let (Some(a_idx), Some(b_idx)) = (arg.as_str_ref(), result.as_str_ref()) {
+            // String comparison falls back to lexicographic ordering on the
+            // underlying bytes — matches Python str.__lt__/__gt__ semantics
+            // for the ASCII-heavy subset we care about.
+            let a = heap.get(a_idx).and_then(HeapObject::as_str).unwrap_or("");
+            let b = heap.get(b_idx).and_then(HeapObject::as_str).unwrap_or("");
+            a.cmp(b) == kind.want()
         } else if let (Some(a), Some(b)) = (arg.to_f64(), result.to_f64()) {
             // partial_cmp returns None for NaN, so NaN never replaces — same
             // behavior as the prior `a < b` / `a > b` checks.
@@ -420,14 +489,19 @@ fn minmax(args: &[Value], heap: &[HeapObject], kind: MinMax) -> Result<Value, Py
         } else {
             false
         };
-        if replaces { result = *arg; }
+        if replaces {
+            result = *arg;
+        }
     }
     Ok(result)
 }
 
 fn builtin_isinstance(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
     if args.len() != 2 {
-        return Err(PythonError::runtime("isinstance() takes exactly 2 arguments", 0));
+        return Err(PythonError::runtime(
+            "isinstance() takes exactly 2 arguments",
+            0,
+        ));
     }
     let obj = args[0];
     let type_val = args[1];
@@ -449,16 +523,30 @@ fn builtin_isinstance(args: &[Value], heap: &[HeapObject]) -> Result<Value, Pyth
     }
     // Check primitive types
     if let Some(type_idx) = type_val.as_object_ref() {
-        if let HeapObject::BuiltinFn { id: BuiltinId::Int, .. } = &heap[type_idx] {
+        if let HeapObject::BuiltinFn {
+            id: BuiltinId::Int, ..
+        } = &heap[type_idx]
+        {
             return Ok(Value::bool_val(obj.is_int()));
         }
-        if let HeapObject::BuiltinFn { id: BuiltinId::Str, .. } = &heap[type_idx] {
+        if let HeapObject::BuiltinFn {
+            id: BuiltinId::Str, ..
+        } = &heap[type_idx]
+        {
             return Ok(Value::bool_val(obj.is_str()));
         }
-        if let HeapObject::BuiltinFn { id: BuiltinId::Bool, .. } = &heap[type_idx] {
+        if let HeapObject::BuiltinFn {
+            id: BuiltinId::Bool,
+            ..
+        } = &heap[type_idx]
+        {
             return Ok(Value::bool_val(obj.is_bool()));
         }
-        if let HeapObject::BuiltinFn { id: BuiltinId::Float, .. } = &heap[type_idx] {
+        if let HeapObject::BuiltinFn {
+            id: BuiltinId::Float,
+            ..
+        } = &heap[type_idx]
+        {
             return Ok(Value::bool_val(obj.is_float()));
         }
     }
@@ -467,7 +555,10 @@ fn builtin_isinstance(args: &[Value], heap: &[HeapObject]) -> Result<Value, Pyth
 
 fn builtin_issubclass(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
     if args.len() != 2 {
-        return Err(PythonError::runtime("issubclass() takes exactly 2 arguments", 0));
+        return Err(PythonError::runtime(
+            "issubclass() takes exactly 2 arguments",
+            0,
+        ));
     }
     if let (Some(cls_idx), Some(base_idx)) = (args[0].as_object_ref(), args[1].as_object_ref())
         && let HeapObject::Class { mro, .. } = &heap[cls_idx]
@@ -477,16 +568,36 @@ fn builtin_issubclass(args: &[Value], heap: &[HeapObject]) -> Result<Value, Pyth
     Ok(Value::bool_val(false))
 }
 
-fn builtin_super(_args: &[Value], _globals: &HashMap<String, Value>) -> Result<Value, PythonError> {
-    // super() is handled specially in the VM during CALL_FUNCTION
-    // Here we just return None as a placeholder — actual super resolution happens
-    // when attributes are accessed on the super result
-    Ok(Value::none())
+/// `super(type, obj)` — two-arg form per PEP 3135. Returns a SuperProxy
+/// heap object that LOAD_ATTR resolves through the MRO starting AFTER
+/// `type`. The zero-arg form is a separate path (compiler injects the
+/// args from `__class__`/first param) and not yet implemented.
+fn builtin_super(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
+    if args.len() != 2 {
+        return Err(PythonError::runtime(
+            "super() in this build requires exactly two arguments (type, obj)",
+            0,
+        ));
+    }
+    let class_idx = args[0]
+        .as_object_ref()
+        .filter(|i| matches!(heap.get(*i), Some(HeapObject::Class { .. })))
+        .ok_or_else(|| PythonError::runtime("super() argument 1 must be a class", 0))?;
+    let instance = args[1];
+    let idx = heap.len();
+    heap.push(HeapObject::SuperProxy {
+        class_idx,
+        instance,
+    });
+    Ok(Value::object_ref(idx))
 }
 
 fn builtin_hasattr(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
     if args.len() != 2 {
-        return Err(PythonError::runtime("hasattr() takes exactly 2 arguments", 0));
+        return Err(PythonError::runtime(
+            "hasattr() takes exactly 2 arguments",
+            0,
+        ));
     }
     let obj = args[0];
     let attr_name = args[1].display(heap);
@@ -497,7 +608,10 @@ fn builtin_hasattr(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonE
                     return Ok(Value::bool_val(true));
                 }
                 // Check class attrs
-                if let HeapObject::Class { attrs: cattrs, mro, .. } = &heap[*class_idx] {
+                if let HeapObject::Class {
+                    attrs: cattrs, mro, ..
+                } = &heap[*class_idx]
+                {
                     if cattrs.contains_key(&attr_name) {
                         return Ok(Value::bool_val(true));
                     }
@@ -536,13 +650,19 @@ fn builtin_getattr(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonE
     if let Some(d) = default {
         Ok(d)
     } else {
-        Err(PythonError::runtime(format!("object has no attribute '{attr_name}'"), 0))
+        Err(PythonError::runtime(
+            format!("object has no attribute '{attr_name}'"),
+            0,
+        ))
     }
 }
 
 fn builtin_setattr(args: &[Value], heap: &mut [HeapObject]) -> Result<Value, PythonError> {
     if args.len() != 3 {
-        return Err(PythonError::runtime("setattr() takes exactly 3 arguments", 0));
+        return Err(PythonError::runtime(
+            "setattr() takes exactly 3 arguments",
+            0,
+        ));
     }
     let obj = args[0];
     let attr_name = args[1].display(heap);
@@ -553,7 +673,10 @@ fn builtin_setattr(args: &[Value], heap: &mut [HeapObject]) -> Result<Value, Pyt
         attrs.insert(attr_name, val);
         return Ok(Value::none());
     }
-    Err(PythonError::runtime("setattr: object does not support attribute assignment", 0))
+    Err(PythonError::runtime(
+        "setattr: object does not support attribute assignment",
+        0,
+    ))
 }
 
 fn builtin_id(args: &[Value]) -> Result<Value, PythonError> {
@@ -564,7 +687,11 @@ fn builtin_id(args: &[Value]) -> Result<Value, PythonError> {
     Ok(Value::small_int_unchecked(args[0].display_bits() as i64))
 }
 
-fn builtin_exc_constructor(et: ExceptionType, args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
+fn builtin_exc_constructor(
+    et: ExceptionType,
+    args: &[Value],
+    heap: &mut Vec<HeapObject>,
+) -> Result<Value, PythonError> {
     let msg = if !args.is_empty() {
         args[0].display(heap)
     } else {
@@ -583,7 +710,10 @@ fn builtin_exc_constructor(et: ExceptionType, args: &[Value], heap: &mut Vec<Hea
 
 fn builtin_list_append(args: &[Value], heap: &mut [HeapObject]) -> Result<Value, PythonError> {
     if args.len() != 2 {
-        return Err(PythonError::runtime("append() takes exactly one argument", 0));
+        return Err(PythonError::runtime(
+            "append() takes exactly one argument",
+            0,
+        ));
     }
     let list = args[0];
     let val = args[1];
@@ -602,14 +732,17 @@ fn builtin_list_pop(args: &[Value], heap: &mut [HeapObject]) -> Result<Value, Py
         && let HeapObject::List(items) = &mut heap[idx]
     {
         if args.len() == 2 {
-            let i = args[1].as_int().ok_or_else(|| PythonError::runtime("pop: index must be integer", 0))?;
+            let i = args[1]
+                .as_int()
+                .ok_or_else(|| PythonError::runtime("pop: index must be integer", 0))?;
             let i = if i < 0 { items.len() as i64 + i } else { i } as usize;
             if i < items.len() {
                 return Ok(items.remove(i));
             }
             return Err(PythonError::runtime("pop index out of range", 0));
         }
-        return items.pop()
+        return items
+            .pop()
             .ok_or_else(|| PythonError::runtime("pop from empty list", 0));
     }
     Err(PythonError::runtime("pop: not a list", 0))
@@ -647,15 +780,24 @@ fn builtin_list_reverse(args: &[Value], heap: &mut [HeapObject]) -> Result<Value
 
 fn builtin_list_insert(args: &[Value], heap: &mut [HeapObject]) -> Result<Value, PythonError> {
     if args.len() != 3 {
-        return Err(PythonError::runtime("insert() takes exactly 2 arguments", 0));
+        return Err(PythonError::runtime(
+            "insert() takes exactly 2 arguments",
+            0,
+        ));
     }
     let list = args[0];
-    let i = args[1].as_int().ok_or_else(|| PythonError::runtime("insert: index must be integer", 0))?;
+    let i = args[1]
+        .as_int()
+        .ok_or_else(|| PythonError::runtime("insert: index must be integer", 0))?;
     let val = args[2];
     if let Some(idx) = list.as_list_ref()
         && let HeapObject::List(items) = &mut heap[idx]
     {
-        let i = if i < 0 { (items.len() as i64 + i).max(0) } else { i } as usize;
+        let i = if i < 0 {
+            (items.len() as i64 + i).max(0)
+        } else {
+            i
+        } as usize;
         let i = i.min(items.len());
         items.insert(i, val);
         return Ok(Value::none());
@@ -665,7 +807,10 @@ fn builtin_list_insert(args: &[Value], heap: &mut [HeapObject]) -> Result<Value,
 
 fn builtin_list_extend(args: &[Value], heap: &mut [HeapObject]) -> Result<Value, PythonError> {
     if args.len() != 2 {
-        return Err(PythonError::runtime("extend() takes exactly one argument", 0));
+        return Err(PythonError::runtime(
+            "extend() takes exactly one argument",
+            0,
+        ));
     }
     let list = args[0];
     let other = args[1];
@@ -746,7 +891,10 @@ fn builtin_str_join(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value,
 fn builtin_str_replace(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
     let s = get_self_str(args, heap)?;
     if args.len() < 3 {
-        return Err(PythonError::runtime("replace() takes at least 2 arguments", 0));
+        return Err(PythonError::runtime(
+            "replace() takes at least 2 arguments",
+            0,
+        ));
     }
     let old = args[1].display(heap);
     let new = args[2].display(heap);
@@ -759,7 +907,10 @@ fn builtin_str_replace(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Val
 fn builtin_str_startswith(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
     let s = get_self_str(args, heap)?;
     if args.len() < 2 {
-        return Err(PythonError::runtime("startswith() takes at least 1 argument", 0));
+        return Err(PythonError::runtime(
+            "startswith() takes at least 1 argument",
+            0,
+        ));
     }
     let prefix = args[1].display(heap);
     Ok(Value::bool_val(s.starts_with(&prefix)))
@@ -768,7 +919,10 @@ fn builtin_str_startswith(args: &[Value], heap: &[HeapObject]) -> Result<Value, 
 fn builtin_str_endswith(args: &[Value], heap: &[HeapObject]) -> Result<Value, PythonError> {
     let s = get_self_str(args, heap)?;
     if args.len() < 2 {
-        return Err(PythonError::runtime("endswith() takes at least 1 argument", 0));
+        return Err(PythonError::runtime(
+            "endswith() takes at least 1 argument",
+            0,
+        ));
     }
     let suffix = args[1].display(heap);
     Ok(Value::bool_val(s.ends_with(&suffix)))
@@ -792,12 +946,122 @@ fn builtin_str_strip(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value
     Ok(Value::str_ref(idx))
 }
 
+/// `str.format(...)` implementing positional placeholders: `{}` for
+/// auto-numbered, `{N}` for explicit index. Conversion flags (`!r`,
+/// `!s`) are honored; format specs after `:` are stripped. Keyword
+/// arguments and nested field paths are not supported yet — both raise
+/// a runtime error so silent misformatting doesn't slip through.
 fn builtin_str_format(args: &[Value], heap: &mut Vec<HeapObject>) -> Result<Value, PythonError> {
-    // Simplified format: just return self for now
-    let s = get_self_str(args, heap)?;
-    let idx = heap.len();
-    heap.push(HeapObject::Str(s.into()));
-    Ok(Value::str_ref(idx))
+    let template = get_self_str(args, heap)?;
+    let fmt_args = &args[1..];
+
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    let mut auto_idx: usize = 0;
+    let mut saw_explicit = false;
+    let mut saw_auto = false;
+
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Escaped `{{`
+            if chars.peek() == Some(&'{') {
+                chars.next();
+                out.push('{');
+                continue;
+            }
+            let mut spec = String::new();
+            let mut closed = false;
+            for c2 in chars.by_ref() {
+                if c2 == '}' {
+                    closed = true;
+                    break;
+                }
+                spec.push(c2);
+            }
+            if !closed {
+                return Err(PythonError::runtime("unmatched '{' in format string", 0));
+            }
+            // Split spec into field_name!conv:format_spec
+            let (field, conv) = match spec.find('!') {
+                Some(i) => {
+                    let (a, b) = spec.split_at(i);
+                    let rest = &b[1..]; // skip '!'
+                    // conversion is one char; ignore any trailing :fmt
+                    let conv = rest.chars().next();
+                    (a.to_string(), conv)
+                }
+                None => {
+                    // Drop any :format-spec for now
+                    let field = match spec.find(':') {
+                        Some(i) => spec[..i].to_string(),
+                        None => spec.clone(),
+                    };
+                    (field, None)
+                }
+            };
+
+            let idx = if field.is_empty() {
+                if saw_explicit {
+                    return Err(PythonError::runtime(
+                        "cannot switch from manual field specification to automatic field numbering",
+                        0,
+                    ));
+                }
+                saw_auto = true;
+                let i = auto_idx;
+                auto_idx += 1;
+                i
+            } else if let Ok(i) = field.parse::<usize>() {
+                if saw_auto {
+                    return Err(PythonError::runtime(
+                        "cannot switch from automatic field numbering to manual field specification",
+                        0,
+                    ));
+                }
+                saw_explicit = true;
+                i
+            } else {
+                return Err(PythonError::runtime(
+                    format!("keyword and dotted field names not supported: '{field}'"),
+                    0,
+                ));
+            };
+
+            if idx >= fmt_args.len() {
+                return Err(PythonError::runtime(
+                    format!("Replacement index {idx} out of range for positional args tuple"),
+                    0,
+                ));
+            }
+            let val = fmt_args[idx];
+            let rendered = match conv {
+                Some('r') => val.repr(heap),
+                Some('s') | None => val.display(heap),
+                Some(other) => {
+                    return Err(PythonError::runtime(
+                        format!("Unknown conversion specifier '{other}'"),
+                        0,
+                    ));
+                }
+            };
+            out.push_str(&rendered);
+        } else if c == '}' {
+            // `}}` is an escaped literal `}`
+            if chars.peek() == Some(&'}') {
+                chars.next();
+                out.push('}');
+            } else {
+                return Err(PythonError::runtime(
+                    "Single '}' encountered in format string",
+                    0,
+                ));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+
+    Ok(alloc_str(heap, out))
 }
 
 fn get_self_str(args: &[Value], heap: &[HeapObject]) -> Result<String, PythonError> {
@@ -868,10 +1132,18 @@ fn builtin_dict_get(args: &[Value], heap: &[HeapObject]) -> Result<Value, Python
     }
     let dict = args[0];
     let key = args[1];
-    let default = if args.len() >= 3 { args[2] } else { Value::none() };
+    let default = if args.len() >= 3 {
+        args[2]
+    } else {
+        Value::none()
+    };
 
     if let Some(idx) = dict.as_object_ref()
-        && let HeapObject::Dict { keys, values, index_map } = &heap[idx]
+        && let HeapObject::Dict {
+            keys,
+            values,
+            index_map,
+        } = &heap[idx]
     {
         let h = value_hash(key, heap);
         if let Some(&i) = index_map.get(&h)
@@ -898,21 +1170,44 @@ fn builtin_dict_pop(args: &[Value], heap: &mut [HeapObject]) -> Result<Value, Py
     let key = args[1];
     let default = if args.len() >= 3 { Some(args[2]) } else { None };
 
-    if let Some(idx) = dict.as_object_ref()
-        && let HeapObject::Dict { keys, values, index_map } = &mut heap[idx]
+    let Some(idx) = dict.as_object_ref() else {
+        return Err(PythonError::runtime("pop: not a dict", 0));
+    };
+
+    // Compute the lookup hash + snapshot keys for the reindex pass BEFORE
+    // taking the mutable borrow — value_hash needs the read-only heap for
+    // string-key lookups, which we can't do under a mutable borrow.
+    let h = value_hash(key, heap);
+    let snapshot: Vec<(Value, u64)> = if let HeapObject::Dict { keys, .. } = &heap[idx] {
+        keys.iter().map(|k| (*k, value_hash(*k, heap))).collect()
+    } else {
+        return Err(PythonError::runtime("pop: not a dict", 0));
+    };
+
+    // Now apply the mutation with the precomputed hashes.
+    if let HeapObject::Dict {
+        keys,
+        values,
+        index_map,
+    } = &mut heap[idx]
     {
-        let h = value_hash(key, &[]);  // simplified hash
         if let Some(&i) = index_map.get(&h)
             && i < keys.len()
         {
             let val = values[i];
             keys.remove(i);
             values.remove(i);
-            index_map.remove(&h);
-            // Reindex
-            let new_map: HashMap<u64, usize> = keys.iter().enumerate()
-                .map(|(i, k)| (value_hash(*k, &[]), i))
-                .collect();
+            // Rebuild index_map from the snapshot (minus the popped entry).
+            let mut new_map = HashMap::with_capacity(keys.len());
+            for (new_i, (_, hash)) in snapshot
+                .into_iter()
+                .enumerate()
+                .filter(|(old_i, _)| *old_i != i)
+                .enumerate()
+                .map(|(new_i, (_, (k, h)))| (new_i, (k, h)))
+            {
+                new_map.insert(hash, new_i);
+            }
             *index_map = new_map;
             return Ok(val);
         }
@@ -954,7 +1249,12 @@ mod tests {
         let mut heap = Vec::new();
         let result = builtin_range(&[Value::small_int_unchecked(5)], &mut heap).unwrap();
         assert!(result.is_range());
-        if let HeapObject::RangeIter { current, stop, step } = &heap[result.as_range_ref().unwrap()] {
+        if let HeapObject::RangeIter {
+            current,
+            stop,
+            step,
+        } = &heap[result.as_range_ref().unwrap()]
+        {
             assert_eq!(*current, 0);
             assert_eq!(*stop, 5);
             assert_eq!(*step, 1);
@@ -964,7 +1264,14 @@ mod tests {
     #[test]
     fn test_range_with_start_stop() {
         let mut heap = Vec::new();
-        let result = builtin_range(&[Value::small_int_unchecked(1), Value::small_int_unchecked(10)], &mut heap).unwrap();
+        let result = builtin_range(
+            &[
+                Value::small_int_unchecked(1),
+                Value::small_int_unchecked(10),
+            ],
+            &mut heap,
+        )
+        .unwrap();
         assert!(result.is_range());
         if let HeapObject::RangeIter { current, stop, .. } = &heap[result.as_range_ref().unwrap()] {
             assert_eq!(*current, 1);

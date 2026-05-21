@@ -251,6 +251,42 @@ pub enum Expr {
         value: Box<Expr>,
         line: u32,
     },
+    /// `start:stop:step` inside a `[]` subscript. All three fields are
+    /// optional (omitted means the default — 0/len/1 depending on side).
+    /// Slices only appear as the immediate `index` of an `Expr::Subscript`.
+    Slice {
+        start: Option<Box<Expr>>,
+        stop: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+        line: u32,
+    },
+    /// `[elt for x in iter if cond ...]`
+    ListComp {
+        elt: Box<Expr>,
+        clauses: Vec<ComprehensionClause>,
+        line: u32,
+    },
+    /// `{elt for x in iter if cond ...}`
+    SetComp {
+        elt: Box<Expr>,
+        clauses: Vec<ComprehensionClause>,
+        line: u32,
+    },
+    /// `{k: v for x in iter if cond ...}`
+    DictComp {
+        key: Box<Expr>,
+        value: Box<Expr>,
+        clauses: Vec<ComprehensionClause>,
+        line: u32,
+    },
+}
+
+/// One `for target in iter [if cond]*` clause of a comprehension.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComprehensionClause {
+    pub target: AssignTarget,
+    pub iter: Expr,
+    pub conditions: Vec<Expr>,
 }
 
 impl Expr {
@@ -279,7 +315,11 @@ impl Expr {
             | Self::Lambda { line, .. }
             | Self::IfExpr { line, .. }
             | Self::Yield { line, .. }
-            | Self::Starred { line, .. } => *line,
+            | Self::Starred { line, .. }
+            | Self::Slice { line, .. }
+            | Self::ListComp { line, .. }
+            | Self::SetComp { line, .. }
+            | Self::DictComp { line, .. } => *line,
         }
     }
 }
@@ -340,12 +380,45 @@ mod tests {
     fn expr_line_returns_stored_line() {
         let cases: Vec<(Expr, u32)> = vec![
             (Expr::IntLit { value: 1, line: 5 }, 5),
-            (Expr::FloatLit { value: 1.0, line: 7 }, 7),
-            (Expr::StringLit { value: "x".into(), line: 9 }, 9),
-            (Expr::BoolLit { value: true, line: 11 }, 11),
+            (
+                Expr::FloatLit {
+                    value: 1.0,
+                    line: 7,
+                },
+                7,
+            ),
+            (
+                Expr::StringLit {
+                    value: "x".into(),
+                    line: 9,
+                },
+                9,
+            ),
+            (
+                Expr::BoolLit {
+                    value: true,
+                    line: 11,
+                },
+                11,
+            ),
             (Expr::NoneLit { line: 13 }, 13),
-            (Expr::Name { id: "x".into(), line: 15 }, 15),
-            (Expr::Starred { value: Box::new(Expr::Name { id: "x".into(), line: 17 }), line: 17 }, 17),
+            (
+                Expr::Name {
+                    id: "x".into(),
+                    line: 15,
+                },
+                15,
+            ),
+            (
+                Expr::Starred {
+                    value: Box::new(Expr::Name {
+                        id: "x".into(),
+                        line: 17,
+                    }),
+                    line: 17,
+                },
+                17,
+            ),
         ];
         for (expr, expected) in cases {
             assert_eq!(expr.line(), expected, "wrong line for {expr:?}");
@@ -389,7 +462,10 @@ mod tests {
     fn assign_target_variants() {
         let targets = vec![
             AssignTarget::Name("x".into()),
-            AssignTarget::Tuple(vec![AssignTarget::Name("a".into()), AssignTarget::Name("b".into())]),
+            AssignTarget::Tuple(vec![
+                AssignTarget::Name("a".into()),
+                AssignTarget::Name("b".into()),
+            ]),
         ];
         for t in &targets {
             let _ = format!("{t:?}");
@@ -399,7 +475,10 @@ mod tests {
 
     #[test]
     fn import_alias_constructible() {
-        let a = ImportAlias { name: "foo.bar".into(), asname: Some("fb".into()) };
+        let a = ImportAlias {
+            name: "foo.bar".into(),
+            asname: Some("fb".into()),
+        };
         assert_eq!(a, a.clone());
         let _ = format!("{a:?}");
     }

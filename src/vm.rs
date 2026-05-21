@@ -3,9 +3,9 @@ use crate::builtins;
 use crate::bytecode::{self, CodeObject, op};
 use crate::error::PythonError;
 use crate::object::{
-    ArithError, BuiltinId, ExceptionType, GeneratorState, HeapObject, PyInt, PyPowResult,
-    Value, alloc_module, alloc_str, dotted_top, heap_str, pyint_truediv, split_module_name,
-    value_hash, value_to_f64,
+    ArithError, BuiltinId, ExceptionType, GeneratorState, HeapObject, PyInt, PyPowResult, Value,
+    alloc_list, alloc_module, alloc_str, alloc_tuple, dotted_top, heap_str, pyint_truediv,
+    split_module_name, value_hash, value_to_f64,
 };
 use std::collections::HashMap;
 
@@ -73,6 +73,24 @@ impl Frame {
     fn peek(&self) -> Value {
         self.stack[self.sp - 1]
     }
+}
+
+/// Which dunder to dispatch when formatting an instance. `Str` falls
+/// back to `__repr__` if `__str__` isn't defined; `Repr` does not fall
+/// back further.
+#[derive(Clone, Copy)]
+enum DunderKind {
+    Str,
+    Repr,
+}
+
+/// Identifies which kind of sequence a slice operates on. `Str` carries
+/// the already-decoded char vector so the UTF-8 walk happens once (for
+/// length + indexing) rather than twice.
+enum SliceKind {
+    List(usize),
+    Tuple(usize),
+    Str(Vec<char>),
 }
 
 /// Exception handler entry on the handler stack.
@@ -185,7 +203,8 @@ impl VM {
         // Top-level main runs in code object 0 with module_idx=None so
         // LOAD_GLOBAL routes through VM.globals (the main namespace).
         let main_num_locals = self.code_objects[0].num_locals;
-        self.frames.push(Frame::new_for_code(0, main_num_locals, None));
+        self.frames
+            .push(Frame::new_for_code(0, main_num_locals, None));
         self.execute_until_depth(0)
     }
 
@@ -215,7 +234,10 @@ impl VM {
             // No handler — propagate as Rust error
             let msg = if let Some(exc) = &self.current_exception {
                 if let Some(idx) = exc.as_object_ref() {
-                    if let HeapObject::ExceptionObj { exc_type, message, .. } = &self.heap[idx] {
+                    if let HeapObject::ExceptionObj {
+                        exc_type, message, ..
+                    } = &self.heap[idx]
+                    {
                         format!("{}: {}", exc_type.name(), message)
                     } else {
                         exc.display(&self.heap)
@@ -231,7 +253,12 @@ impl VM {
     }
 
     /// Create an exception object and raise it.
-    fn raise_exc(&mut self, exc_type: ExceptionType, message: &str, line: u32) -> Result<(), PythonError> {
+    fn raise_exc(
+        &mut self,
+        exc_type: ExceptionType,
+        message: &str,
+        line: u32,
+    ) -> Result<(), PythonError> {
         let idx = self.heap.len();
         self.heap.push(HeapObject::ExceptionObj {
             exc_type,
@@ -253,19 +280,20 @@ impl VM {
             PythonError::RuntimeError { msg, .. } => msg.clone(),
             _ => return Err(err),
         };
-        let exc_type = if msg.contains("division by zero") || msg.contains("division or modulo by zero") {
-            ExceptionType::ZeroDivisionError
-        } else if msg.contains("unsupported operand") || msg.contains("not supported") {
-            ExceptionType::TypeError
-        } else if msg.contains("is not defined") {
-            ExceptionType::NameError
-        } else if msg.contains("index out of range") || msg.contains("out of bounds") {
-            ExceptionType::IndexError
-        } else if msg.contains("KeyError") {
-            ExceptionType::KeyError
-        } else {
-            ExceptionType::RuntimeError
-        };
+        let exc_type =
+            if msg.contains("division by zero") || msg.contains("division or modulo by zero") {
+                ExceptionType::ZeroDivisionError
+            } else if msg.contains("unsupported operand") || msg.contains("not supported") {
+                ExceptionType::TypeError
+            } else if msg.contains("is not defined") {
+                ExceptionType::NameError
+            } else if msg.contains("index out of range") || msg.contains("out of bounds") {
+                ExceptionType::IndexError
+            } else if msg.contains("KeyError") {
+                ExceptionType::KeyError
+            } else {
+                ExceptionType::RuntimeError
+            };
         self.raise_exc(exc_type, &msg, line)?;
         Ok(true)
     }
@@ -303,12 +331,20 @@ impl VM {
                     self.frames[frame_idx].push(val);
                 }
                 op::LOAD_FAST => {
-                    let val = unsafe { *self.frames[frame_idx].locals.get_unchecked(operand as usize) };
+                    let val = unsafe {
+                        *self.frames[frame_idx]
+                            .locals
+                            .get_unchecked(operand as usize)
+                    };
                     self.frames[frame_idx].push(val);
                 }
                 op::STORE_FAST => {
                     let val = self.frames[frame_idx].pop();
-                    unsafe { *self.frames[frame_idx].locals.get_unchecked_mut(operand as usize) = val; }
+                    unsafe {
+                        *self.frames[frame_idx]
+                            .locals
+                            .get_unchecked_mut(operand as usize) = val;
+                    }
                 }
                 op::LOAD_GLOBAL => {
                     // Borrow the name briefly for the lookup; clone only on
@@ -321,8 +357,10 @@ impl VM {
                     match lookup {
                         Some(val) => self.frames[frame_idx].push(val),
                         None => {
-                            let name = self.code_objects[code_index].names[operand as usize].clone();
-                            let err = PythonError::runtime(format!("name '{name}' is not defined"), line);
+                            let name =
+                                self.code_objects[code_index].names[operand as usize].clone();
+                            let err =
+                                PythonError::runtime(format!("name '{name}' is not defined"), line);
                             self.try_handle_error(err, line)?;
                             continue;
                         }
@@ -351,7 +389,10 @@ impl VM {
                     if let Some(ci) = cell_idx {
                         self.heap[ci] = HeapObject::Cell(val);
                     } else {
-                        return Err(PythonError::runtime("STORE_DEREF: invalid cell index", line));
+                        return Err(PythonError::runtime(
+                            "STORE_DEREF: invalid cell index",
+                            line,
+                        ));
                     }
                 }
                 op::LOAD_CLOSURE => {
@@ -360,7 +401,10 @@ impl VM {
                         // Push the cell heap index as an int (used by MAKE_CLOSURE)
                         self.frames[frame_idx].push(Value::small_int_unchecked(ci as i64));
                     } else {
-                        return Err(PythonError::runtime("LOAD_CLOSURE: invalid cell index", line));
+                        return Err(PythonError::runtime(
+                            "LOAD_CLOSURE: invalid cell index",
+                            line,
+                        ));
                     }
                 }
                 op::ADD => {
@@ -368,7 +412,10 @@ impl VM {
                     let left = self.frames[frame_idx].pop();
                     match binary_add(left, right, &mut self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
-                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::SUB => {
@@ -376,7 +423,10 @@ impl VM {
                     let left = self.frames[frame_idx].pop();
                     match binary_sub(left, right, &mut self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
-                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::MUL => {
@@ -384,7 +434,10 @@ impl VM {
                     let left = self.frames[frame_idx].pop();
                     match binary_mul(left, right, &mut self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
-                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::DIV => {
@@ -392,7 +445,10 @@ impl VM {
                     let left = self.frames[frame_idx].pop();
                     match binary_div(left, right, &self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
-                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::FLOOR_DIV => {
@@ -400,7 +456,10 @@ impl VM {
                     let left = self.frames[frame_idx].pop();
                     match binary_floor_div(left, right, &mut self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
-                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::MOD => {
@@ -408,7 +467,10 @@ impl VM {
                     let left = self.frames[frame_idx].pop();
                     match binary_mod(left, right, &mut self.heap, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
-                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::POW => {
@@ -436,8 +498,11 @@ impl VM {
                 op::UNARY_POS => {
                     let val = self.frames[frame_idx].pop();
                     // Unary + is identity on numbers — int/float/bool/BigInt.
-                    let result = if val.is_int() || val.is_float() || val.is_bool()
-                        || val.is_pyint(&self.heap) {
+                    let result = if val.is_int()
+                        || val.is_float()
+                        || val.is_bool()
+                        || val.is_pyint(&self.heap)
+                    {
                         val
                     } else {
                         return Err(PythonError::runtime("bad operand for unary +", line));
@@ -519,7 +584,10 @@ impl VM {
                         let r = a.and_(b).into_value(&mut self.heap);
                         self.frames[frame_idx].push(r);
                     } else {
-                        return Err(PythonError::runtime("unsupported operand type(s) for &", line));
+                        return Err(PythonError::runtime(
+                            "unsupported operand type(s) for &",
+                            line,
+                        ));
                     }
                 }
                 op::BIT_OR => {
@@ -532,7 +600,10 @@ impl VM {
                         let r = a.or_(b).into_value(&mut self.heap);
                         self.frames[frame_idx].push(r);
                     } else {
-                        return Err(PythonError::runtime("unsupported operand type(s) for |", line));
+                        return Err(PythonError::runtime(
+                            "unsupported operand type(s) for |",
+                            line,
+                        ));
                     }
                 }
                 op::BIT_XOR => {
@@ -545,7 +616,10 @@ impl VM {
                         let r = a.xor_(b).into_value(&mut self.heap);
                         self.frames[frame_idx].push(r);
                     } else {
-                        return Err(PythonError::runtime("unsupported operand type(s) for ^", line));
+                        return Err(PythonError::runtime(
+                            "unsupported operand type(s) for ^",
+                            line,
+                        ));
                     }
                 }
                 op::LSHIFT => {
@@ -560,7 +634,10 @@ impl VM {
                             Err(e) => return Err(arith_to_runtime(e, "<<", line)),
                         }
                     } else {
-                        return Err(PythonError::runtime("unsupported operand type(s) for <<", line));
+                        return Err(PythonError::runtime(
+                            "unsupported operand type(s) for <<",
+                            line,
+                        ));
                     }
                 }
                 op::RSHIFT => {
@@ -575,7 +652,10 @@ impl VM {
                             Err(e) => return Err(arith_to_runtime(e, ">>", line)),
                         }
                     } else {
-                        return Err(PythonError::runtime("unsupported operand type(s) for >>", line));
+                        return Err(PythonError::runtime(
+                            "unsupported operand type(s) for >>",
+                            line,
+                        ));
                     }
                 }
                 op::JUMP => {
@@ -607,24 +687,77 @@ impl VM {
                         match &self.heap[heap_idx] {
                             HeapObject::BuiltinFn { id, .. } => {
                                 let id = *id;
-                                match builtins::call_builtin(
-                                    id, &args, &mut self.heap, &mut self.output, &self.globals,
-                                ) {
-                                    Ok(result) => self.frames[frame_idx].push(result),
-                                    Err(e) => { self.try_handle_error(e, line)?; continue; }
+                                // str()/repr()/print() route through any
+                                // user-defined __str__/__repr__ before
+                                // formatting. For unary str/repr the
+                                // dunder result IS the final value
+                                // (bypass the builtin); for print we
+                                // substitute each Instance arg with its
+                                // formatted string and run print as usual.
+                                let dunder = match id {
+                                    BuiltinId::Str | BuiltinId::Print => Some(DunderKind::Str),
+                                    BuiltinId::Repr => Some(DunderKind::Repr),
+                                    _ => None,
+                                };
+                                let mut bypass: Option<Value> = None;
+                                if let Some(dk) = dunder {
+                                    if matches!(id, BuiltinId::Str | BuiltinId::Repr)
+                                        && args.len() == 1
+                                    {
+                                        bypass = self
+                                            .dispatch_dunder_format(frame_idx, args[0], dk, line)?;
+                                    } else {
+                                        for arg in args.iter_mut() {
+                                            if let Some(v) = self
+                                                .dispatch_dunder_format(frame_idx, *arg, dk, line)?
+                                            {
+                                                *arg = v;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(v) = bypass {
+                                    self.frames[frame_idx].push(v);
+                                } else {
+                                    match builtins::call_builtin(
+                                        id,
+                                        &args,
+                                        &mut self.heap,
+                                        &mut self.output,
+                                        &self.globals,
+                                    ) {
+                                        Ok(result) => self.frames[frame_idx].push(result),
+                                        Err(e) => {
+                                            self.try_handle_error(e, line)?;
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
-                            HeapObject::Closure { code_index, arity, cells, module_idx, .. } => {
+                            HeapObject::Closure {
+                                code_index,
+                                arity,
+                                cells,
+                                module_idx,
+                                ..
+                            } => {
                                 let func_code_index = *code_index;
                                 let arity = *arity as usize;
                                 let cells = cells.clone();
                                 let func_module_idx = *module_idx;
                                 if argc != arity {
-                                    let name = if let HeapObject::Closure { name, .. } = &self.heap[heap_idx] {
+                                    let name = if let HeapObject::Closure { name, .. } =
+                                        &self.heap[heap_idx]
+                                    {
                                         name.clone()
-                                    } else { "???".to_string() };
+                                    } else {
+                                        "???".to_string()
+                                    };
                                     return Err(PythonError::runtime(
-                                        format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
+                                        format!(
+                                            "{name}() takes {arity} argument(s) but {argc} were given"
+                                        ),
+                                        line,
                                     ));
                                 }
 
@@ -646,7 +779,11 @@ impl VM {
                                     });
                                     self.frames[frame_idx].push(Value::object_ref(gen_idx));
                                 } else {
-                                    let mut new_frame = Frame::new_for_code(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
+                                    let mut new_frame = Frame::new_for_code(
+                                        func_code_index,
+                                        self.code_objects[func_code_index].num_locals,
+                                        func_module_idx,
+                                    );
                                     for (i, arg) in args.iter().enumerate() {
                                         new_frame.locals[i] = *arg;
                                     }
@@ -660,11 +797,16 @@ impl VM {
                                         new_frame.cells.push(ci);
                                     }
                                     // Initialize cell vars from params if they're also cell vars
-                                    let cell_var_names: Vec<String> = self.code_objects[func_code_index].cell_var_names.clone();
+                                    let cell_var_names: Vec<String> =
+                                        self.code_objects[func_code_index].cell_var_names.clone();
                                     for (ci, cv_name) in cell_var_names.iter().enumerate() {
-                                        let local_names = &self.code_objects[func_code_index].local_names;
-                                        if let Some(li) = local_names.iter().position(|n| n == cv_name) {
-                                            self.heap[new_frame.cells[ci]] = HeapObject::Cell(new_frame.locals[li]);
+                                        let local_names =
+                                            &self.code_objects[func_code_index].local_names;
+                                        if let Some(li) =
+                                            local_names.iter().position(|n| n == cv_name)
+                                        {
+                                            self.heap[new_frame.cells[ci]] =
+                                                HeapObject::Cell(new_frame.locals[li]);
                                         }
                                     }
                                     for i in 0..num_free {
@@ -684,7 +826,10 @@ impl VM {
                                             continue; // __init__ pushed a frame
                                         }
                                     }
-                                    Err(e) => { self.try_handle_error(e, line)?; continue; }
+                                    Err(e) => {
+                                        self.try_handle_error(e, line)?;
+                                        continue;
+                                    }
                                 }
                             }
                             HeapObject::BoundMethod { instance, method } => {
@@ -716,25 +861,40 @@ impl VM {
                             }
                             _ => {
                                 return Err(PythonError::runtime(
-                                    format!("'{}' is not callable", func_val.display(&self.heap)), line,
+                                    format!("'{}' is not callable", func_val.display(&self.heap)),
+                                    line,
                                 ));
                             }
                         }
                     } else if let Some(heap_idx) = func_val.as_func_ref() {
-                        let (func_code_index, arity, func_module_idx) = if let HeapObject::Function { code_index, arity, module_idx, .. } = &self.heap[heap_idx] {
-                            (*code_index, *arity as usize, *module_idx)
-                        } else {
-                            return Err(PythonError::runtime("not a callable", line));
-                        };
+                        let (func_code_index, arity, func_module_idx) =
+                            if let HeapObject::Function {
+                                code_index,
+                                arity,
+                                module_idx,
+                                ..
+                            } = &self.heap[heap_idx]
+                            {
+                                (*code_index, *arity as usize, *module_idx)
+                            } else {
+                                return Err(PythonError::runtime("not a callable", line));
+                            };
 
                         // Check if this is a generator function
                         if self.code_objects[func_code_index].is_generator {
                             if argc != arity {
-                                let name = if let HeapObject::Function { name, .. } = &self.heap[heap_idx] {
+                                let name = if let HeapObject::Function { name, .. } =
+                                    &self.heap[heap_idx]
+                                {
                                     name.clone()
-                                } else { "???".to_string() };
+                                } else {
+                                    "???".to_string()
+                                };
                                 return Err(PythonError::runtime(
-                                    format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
+                                    format!(
+                                        "{name}() takes {arity} argument(s) but {argc} were given"
+                                    ),
+                                    line,
                                 ));
                             }
                             let gen_idx = self.heap.len();
@@ -754,14 +914,25 @@ impl VM {
                             self.frames[frame_idx].push(Value::object_ref(gen_idx));
                         } else {
                             if argc != arity {
-                                let name = if let HeapObject::Function { name, .. } = &self.heap[heap_idx] {
+                                let name = if let HeapObject::Function { name, .. } =
+                                    &self.heap[heap_idx]
+                                {
                                     name.clone()
-                                } else { "???".to_string() };
+                                } else {
+                                    "???".to_string()
+                                };
                                 return Err(PythonError::runtime(
-                                    format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
+                                    format!(
+                                        "{name}() takes {arity} argument(s) but {argc} were given"
+                                    ),
+                                    line,
                                 ));
                             }
-                            let mut new_frame = Frame::new_for_code(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
+                            let mut new_frame = Frame::new_for_code(
+                                func_code_index,
+                                self.code_objects[func_code_index].num_locals,
+                                func_module_idx,
+                            );
                             for (i, arg) in args.iter().enumerate() {
                                 new_frame.locals[i] = *arg;
                             }
@@ -773,11 +944,13 @@ impl VM {
                                 new_frame.cells.push(ci);
                             }
                             // Initialize cells from params
-                            let cell_var_names: Vec<String> = self.code_objects[func_code_index].cell_var_names.clone();
+                            let cell_var_names: Vec<String> =
+                                self.code_objects[func_code_index].cell_var_names.clone();
                             for (ci, cv_name) in cell_var_names.iter().enumerate() {
                                 let local_names = &self.code_objects[func_code_index].local_names;
                                 if let Some(li) = local_names.iter().position(|n| n == cv_name) {
-                                    self.heap[new_frame.cells[ci]] = HeapObject::Cell(new_frame.locals[li]);
+                                    self.heap[new_frame.cells[ci]] =
+                                        HeapObject::Cell(new_frame.locals[li]);
                                 }
                             }
                             self.frames.push(new_frame);
@@ -785,7 +958,8 @@ impl VM {
                         }
                     } else {
                         return Err(PythonError::runtime(
-                            format!("'{}' is not callable", func_val.display(&self.heap)), line,
+                            format!("'{}' is not callable", func_val.display(&self.heap)),
+                            line,
                         ));
                     }
                 }
@@ -808,8 +982,12 @@ impl VM {
                         // When FOR_ITER ran, it incremented IP past FOR_ITER, then called
                         // resume_generator + continue. So caller.ip is at FOR_ITER + 1.
                         // We go back 2 to re-run LOAD_FAST, FOR_ITER, which will now see Completed.
-                        let caller = self.frames.last_mut().ok_or_else(||
-                            PythonError::runtime("internal: caller frame missing after generator return", line))?;
+                        let caller = self.frames.last_mut().ok_or_else(|| {
+                            PythonError::runtime(
+                                "internal: caller frame missing after generator return",
+                                line,
+                            )
+                        })?;
                         caller.ip = caller.ip.saturating_sub(2);
                         continue;
                     }
@@ -817,8 +995,12 @@ impl VM {
                     if self.frames.is_empty() {
                         return Ok(());
                     }
-                    let caller = self.frames.last_mut().ok_or_else(||
-                        PythonError::runtime("internal: caller frame missing after RETURN_VALUE", line))?;
+                    let caller = self.frames.last_mut().ok_or_else(|| {
+                        PythonError::runtime(
+                            "internal: caller frame missing after RETURN_VALUE",
+                            line,
+                        )
+                    })?;
                     // If this was an __init__ frame, push the instance instead of None
                     if let Some(instance) = init_inst {
                         caller.push(instance);
@@ -829,9 +1011,12 @@ impl VM {
                 }
                 op::MAKE_FUNCTION => {
                     let code_idx_val = self.code_objects[code_index].constants[operand as usize];
-                    let func_code_index = code_idx_val.as_int().ok_or_else(||
-                        PythonError::runtime("internal: MAKE_FUNCTION operand isn't a small int", line))?
-                        as usize;
+                    let func_code_index = code_idx_val.as_int().ok_or_else(|| {
+                        PythonError::runtime(
+                            "internal: MAKE_FUNCTION operand isn't a small int",
+                            line,
+                        )
+                    })? as usize;
                     let func_name = self.code_objects[func_code_index].name.clone();
                     let arity = self.code_objects[func_code_index].num_params as u8;
                     // Capture the defining module so the function's body resolves
@@ -849,9 +1034,12 @@ impl VM {
                 }
                 op::MAKE_CLOSURE => {
                     let code_idx_val = self.code_objects[code_index].constants[operand as usize];
-                    let func_code_index = code_idx_val.as_int().ok_or_else(||
-                        PythonError::runtime("internal: MAKE_CLOSURE operand isn't a small int", line))?
-                        as usize;
+                    let func_code_index = code_idx_val.as_int().ok_or_else(|| {
+                        PythonError::runtime(
+                            "internal: MAKE_CLOSURE operand isn't a small int",
+                            line,
+                        )
+                    })? as usize;
                     let func_name = self.code_objects[func_code_index].name.clone();
                     let arity = self.code_objects[func_code_index].num_params as u8;
                     let num_free = self.code_objects[func_code_index].free_var_names.len();
@@ -861,9 +1049,12 @@ impl VM {
                     let mut cells = Vec::with_capacity(num_free);
                     for _ in 0..num_free {
                         let cell_val = self.frames[frame_idx].pop();
-                        let cell_idx = cell_val.as_int().ok_or_else(||
-                            PythonError::runtime("internal: LOAD_CLOSURE pushed non-int cell index", line))?
-                            as usize;
+                        let cell_idx = cell_val.as_int().ok_or_else(|| {
+                            PythonError::runtime(
+                                "internal: LOAD_CLOSURE pushed non-int cell index",
+                                line,
+                            )
+                        })? as usize;
                         cells.push(cell_idx);
                     }
                     cells.reverse();
@@ -895,12 +1086,18 @@ impl VM {
                         match &self.heap[obj_idx] {
                             HeapObject::Tuple(_) => {
                                 let iter_idx = self.heap.len();
-                                self.heap.push(HeapObject::TupleIter { tuple_idx: obj_idx, index: 0 });
+                                self.heap.push(HeapObject::TupleIter {
+                                    tuple_idx: obj_idx,
+                                    index: 0,
+                                });
                                 self.frames[frame_idx].push(Value::object_ref(iter_idx));
                             }
                             HeapObject::Dict { .. } => {
                                 let iter_idx = self.heap.len();
-                                self.heap.push(HeapObject::DictKeyIter { dict_idx: obj_idx, index: 0 });
+                                self.heap.push(HeapObject::DictKeyIter {
+                                    dict_idx: obj_idx,
+                                    index: 0,
+                                });
                                 self.frames[frame_idx].push(Value::object_ref(iter_idx));
                             }
                             HeapObject::Generator { .. } => {
@@ -910,7 +1107,9 @@ impl VM {
                             HeapObject::Instance { class_idx, .. } => {
                                 // Look for __iter__ method
                                 let class_idx = *class_idx;
-                                if let Some(iter_method) = self.lookup_attr_on_class(class_idx, "__iter__") {
+                                if let Some(iter_method) =
+                                    self.lookup_attr_on_class(class_idx, "__iter__")
+                                {
                                     // Call __iter__(self)
                                     let bound_idx = self.heap.len();
                                     self.heap.push(HeapObject::BoundMethod {
@@ -938,7 +1137,10 @@ impl VM {
                                     if self.lookup_attr_on_class(class_idx, "__next__").is_some() {
                                         self.frames[frame_idx].push(val);
                                     } else {
-                                        return Err(PythonError::runtime("object is not iterable", line));
+                                        return Err(PythonError::runtime(
+                                            "object is not iterable",
+                                            line,
+                                        ));
                                     }
                                 }
                             }
@@ -954,17 +1156,28 @@ impl VM {
                     let iter_val = self.frames[frame_idx].pop();
 
                     if let Some(heap_idx) = iter_val.as_range_ref() {
-                        let (current, stop, step) = if let HeapObject::RangeIter { current, stop, step } = &self.heap[heap_idx] {
+                        let (current, stop, step) = if let HeapObject::RangeIter {
+                            current,
+                            stop,
+                            step,
+                        } = &self.heap[heap_idx]
+                        {
                             (*current, *stop, *step)
                         } else {
                             return Err(PythonError::runtime("expected iterator", line));
                         };
-                        let exhausted = if step > 0 { current >= stop } else { current <= stop };
+                        let exhausted = if step > 0 {
+                            current >= stop
+                        } else {
+                            current <= stop
+                        };
                         if exhausted {
                             self.frames[frame_idx].ip = operand as usize;
                         } else {
                             self.frames[frame_idx].push(Value::small_int_unchecked(current));
-                            if let HeapObject::RangeIter { current: c, .. } = &mut self.heap[heap_idx] {
+                            if let HeapObject::RangeIter { current: c, .. } =
+                                &mut self.heap[heap_idx]
+                            {
                                 *c = current + step;
                             }
                         }
@@ -975,15 +1188,22 @@ impl VM {
                                 let index = *index;
                                 let len = if let HeapObject::List(items) = &self.heap[list_idx] {
                                     items.len()
-                                } else { 0 };
+                                } else {
+                                    0
+                                };
                                 if index >= len {
                                     self.frames[frame_idx].ip = operand as usize;
                                 } else {
-                                    let val = if let HeapObject::List(items) = &self.heap[list_idx] {
+                                    let val = if let HeapObject::List(items) = &self.heap[list_idx]
+                                    {
                                         items[index]
-                                    } else { Value::none() };
+                                    } else {
+                                        Value::none()
+                                    };
                                     self.frames[frame_idx].push(val);
-                                    if let HeapObject::ListIter { index: idx, .. } = &mut self.heap[obj_idx] {
+                                    if let HeapObject::ListIter { index: idx, .. } =
+                                        &mut self.heap[obj_idx]
+                                    {
                                         *idx = index + 1;
                                     }
                                 }
@@ -993,15 +1213,22 @@ impl VM {
                                 let index = *index;
                                 let len = if let HeapObject::Tuple(items) = &self.heap[tuple_idx] {
                                     items.len()
-                                } else { 0 };
+                                } else {
+                                    0
+                                };
                                 if index >= len {
                                     self.frames[frame_idx].ip = operand as usize;
                                 } else {
-                                    let val = if let HeapObject::Tuple(items) = &self.heap[tuple_idx] {
-                                        items[index]
-                                    } else { Value::none() };
+                                    let val =
+                                        if let HeapObject::Tuple(items) = &self.heap[tuple_idx] {
+                                            items[index]
+                                        } else {
+                                            Value::none()
+                                        };
                                     self.frames[frame_idx].push(val);
-                                    if let HeapObject::TupleIter { index: idx, .. } = &mut self.heap[obj_idx] {
+                                    if let HeapObject::TupleIter { index: idx, .. } =
+                                        &mut self.heap[obj_idx]
+                                    {
                                         *idx = index + 1;
                                     }
                                 }
@@ -1018,7 +1245,9 @@ impl VM {
                                     let new_idx = self.heap.len();
                                     self.heap.push(HeapObject::Str(ch.into()));
                                     self.frames[frame_idx].push(Value::str_ref(new_idx));
-                                    if let HeapObject::StringIter { index: idx, .. } = &mut self.heap[obj_idx] {
+                                    if let HeapObject::StringIter { index: idx, .. } =
+                                        &mut self.heap[obj_idx]
+                                    {
                                         *idx = index + 1;
                                     }
                                 }
@@ -1026,17 +1255,26 @@ impl VM {
                             HeapObject::DictKeyIter { dict_idx, index } => {
                                 let dict_idx = *dict_idx;
                                 let index = *index;
-                                let len = if let HeapObject::Dict { keys, .. } = &self.heap[dict_idx] {
-                                    keys.len()
-                                } else { 0 };
+                                let len =
+                                    if let HeapObject::Dict { keys, .. } = &self.heap[dict_idx] {
+                                        keys.len()
+                                    } else {
+                                        0
+                                    };
                                 if index >= len {
                                     self.frames[frame_idx].ip = operand as usize;
                                 } else {
-                                    let val = if let HeapObject::Dict { keys, .. } = &self.heap[dict_idx] {
+                                    let val = if let HeapObject::Dict { keys, .. } =
+                                        &self.heap[dict_idx]
+                                    {
                                         keys[index]
-                                    } else { Value::none() };
+                                    } else {
+                                        Value::none()
+                                    };
                                     self.frames[frame_idx].push(val);
-                                    if let HeapObject::DictKeyIter { index: idx, .. } = &mut self.heap[obj_idx] {
+                                    if let HeapObject::DictKeyIter { index: idx, .. } =
+                                        &mut self.heap[obj_idx]
+                                    {
                                         *idx = index + 1;
                                     }
                                 }
@@ -1054,7 +1292,9 @@ impl VM {
                             HeapObject::Instance { class_idx, .. } => {
                                 // Call __next__ on the instance
                                 let class_idx = *class_idx;
-                                if let Some(next_method) = self.lookup_attr_on_class(class_idx, "__next__") {
+                                if let Some(next_method) =
+                                    self.lookup_attr_on_class(class_idx, "__next__")
+                                {
                                     let call_args = vec![iter_val];
                                     // We need to save the iterator for the next iteration
                                     // Store iter_val back first, we'll re-push it later
@@ -1064,7 +1304,10 @@ impl VM {
                                     }
                                     // Builtin returned directly
                                 } else {
-                                    return Err(PythonError::runtime("iterator has no __next__ method", line));
+                                    return Err(PythonError::runtime(
+                                        "iterator has no __next__ method",
+                                        line,
+                                    ));
                                 }
                             }
                             _ => {
@@ -1110,10 +1353,76 @@ impl VM {
                 op::LIST_APPEND => {
                     let val = self.frames[frame_idx].pop();
                     let list_val = self.frames[frame_idx].pop();
-                    if let Some(heap_idx) = list_val.as_list_ref() && let HeapObject::List(items) = &mut self.heap[heap_idx] {
+                    if let Some(heap_idx) = list_val.as_list_ref()
+                        && let HeapObject::List(items) = &mut self.heap[heap_idx]
+                    {
                         items.push(val);
                     }
                     self.frames[frame_idx].push(list_val);
+                }
+                op::SET_ADD => {
+                    let val = self.frames[frame_idx].pop();
+                    let set_val = self.frames[frame_idx].pop();
+                    if let Some(heap_idx) = set_val.as_object_ref() {
+                        // Hash → index lookup with linear-scan collision
+                        // fallback. Mirrors the Dict insert pattern; see
+                        // src/object.rs for the storage invariants.
+                        let h = value_hash(val, &self.heap);
+                        let exists = if let HeapObject::Set { items, index_map } =
+                            &self.heap[heap_idx]
+                        {
+                            match index_map.get(&h) {
+                                Some(&i) if values_equal(items[i], val, &self.heap) => true,
+                                Some(_) => items.iter().any(|e| values_equal(*e, val, &self.heap)),
+                                None => false,
+                            }
+                        } else {
+                            true
+                        };
+                        if !exists
+                            && let HeapObject::Set { items, index_map } = &mut self.heap[heap_idx]
+                        {
+                            let i = items.len();
+                            items.push(val);
+                            index_map.insert(h, i);
+                        }
+                    }
+                    self.frames[frame_idx].push(set_val);
+                }
+                op::MAP_ADD => {
+                    let key = self.frames[frame_idx].pop();
+                    let val = self.frames[frame_idx].pop();
+                    let dict_val = self.frames[frame_idx].pop();
+                    if let Some(obj_idx) = dict_val.as_object_ref() {
+                        // value_hash + values_equal need an immutable
+                        // borrow of heap, so compute lookup state before
+                        // taking the mutable borrow for the update.
+                        let h = value_hash(key, &self.heap);
+                        let existing = if let HeapObject::Dict { keys, .. } = &self.heap[obj_idx] {
+                            keys.iter().position(|k| {
+                                value_hash(*k, &self.heap) == h && values_equal(*k, key, &self.heap)
+                            })
+                        } else {
+                            None
+                        };
+                        if let HeapObject::Dict {
+                            keys,
+                            values,
+                            index_map,
+                        } = &mut self.heap[obj_idx]
+                        {
+                            match existing {
+                                Some(i) => values[i] = val,
+                                None => {
+                                    let i = keys.len();
+                                    keys.push(key);
+                                    values.push(val);
+                                    index_map.insert(h, i);
+                                }
+                            }
+                        }
+                    }
+                    self.frames[frame_idx].push(dict_val);
                 }
                 op::BUILD_TUPLE => {
                     let count = operand as usize;
@@ -1145,18 +1454,36 @@ impl VM {
                         values.push(v);
                     }
                     let heap_idx = self.heap.len();
-                    self.heap.push(HeapObject::Dict { keys, values, index_map });
+                    self.heap.push(HeapObject::Dict {
+                        keys,
+                        values,
+                        index_map,
+                    });
                     self.frames[frame_idx].push(Value::object_ref(heap_idx));
                 }
                 op::BUILD_SET => {
                     let count = operand as usize;
-                    let mut elements = Vec::with_capacity(count);
+                    let mut raw = Vec::with_capacity(count);
                     for _ in 0..count {
-                        elements.push(self.frames[frame_idx].pop());
+                        raw.push(self.frames[frame_idx].pop());
                     }
-                    elements.reverse();
+                    raw.reverse();
+                    let mut items: Vec<Value> = Vec::with_capacity(count);
+                    let mut index_map: HashMap<u64, usize> = HashMap::with_capacity(count);
+                    for v in raw {
+                        let h = value_hash(v, &self.heap);
+                        let exists = if let Some(&i) = index_map.get(&h) {
+                            values_equal(items[i], v, &self.heap)
+                        } else {
+                            false
+                        };
+                        if !exists && !items.iter().any(|e| values_equal(*e, v, &self.heap)) {
+                            index_map.insert(h, items.len());
+                            items.push(v);
+                        }
+                    }
                     let heap_idx = self.heap.len();
-                    self.heap.push(HeapObject::Set(elements));
+                    self.heap.push(HeapObject::Set { items, index_map });
                     self.frames[frame_idx].push(Value::object_ref(heap_idx));
                 }
                 op::SUBSCRIPT => {
@@ -1164,7 +1491,23 @@ impl VM {
                     let obj = self.frames[frame_idx].pop();
                     match self.subscript_get(obj, index, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
-                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
+                    }
+                }
+                op::SLICE_SUBSCRIPT => {
+                    let step = self.frames[frame_idx].pop();
+                    let stop = self.frames[frame_idx].pop();
+                    let start = self.frames[frame_idx].pop();
+                    let obj = self.frames[frame_idx].pop();
+                    match self.slice_get(obj, start, stop, step, line) {
+                        Ok(result) => self.frames[frame_idx].push(result),
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::STORE_SUBSCRIPT => {
@@ -1184,7 +1527,10 @@ impl VM {
                     let attr_name = attr_name.clone();
                     match self.load_attr(obj, &attr_name, line) {
                         Ok(result) => self.frames[frame_idx].push(result),
-                        Err(e) => { self.try_handle_error(e, line)?; continue; }
+                        Err(e) => {
+                            self.try_handle_error(e, line)?;
+                            continue;
+                        }
                     }
                 }
                 op::STORE_ATTR => {
@@ -1221,7 +1567,10 @@ impl VM {
                                 self.raise_exception(exc, line)?;
                                 continue;
                             } else {
-                                return Err(PythonError::runtime("No active exception to re-raise", line));
+                                return Err(PythonError::runtime(
+                                    "No active exception to re-raise",
+                                    line,
+                                ));
                             }
                         }
                         1 => {
@@ -1234,7 +1583,10 @@ impl VM {
                                         self.raise_exception(exc_val, line)?;
                                         continue;
                                     }
-                                    HeapObject::BuiltinFn { id: BuiltinId::ExcConstructor(et), .. } => {
+                                    HeapObject::BuiltinFn {
+                                        id: BuiltinId::ExcConstructor(et),
+                                        ..
+                                    } => {
                                         let et = *et;
                                         let idx = self.heap.len();
                                         self.heap.push(HeapObject::ExceptionObj {
@@ -1286,9 +1638,12 @@ impl VM {
                     let num_bases = operand as usize;
                     let co_idx_val = self.frames[frame_idx].pop();
                     let name_val = self.frames[frame_idx].pop();
-                    let class_co_idx = co_idx_val.as_int().ok_or_else(||
-                        PythonError::runtime("internal: BUILD_CLASS code-object index isn't a small int", line))?
-                        as usize;
+                    let class_co_idx = co_idx_val.as_int().ok_or_else(|| {
+                        PythonError::runtime(
+                            "internal: BUILD_CLASS code-object index isn't a small int",
+                            line,
+                        )
+                    })? as usize;
                     let class_name = name_val.display(&self.heap);
 
                     let mut base_indices = Vec::with_capacity(num_bases);
@@ -1303,7 +1658,11 @@ impl VM {
                     // Execute class body to get attributes — class body runs in
                     // the same module as its enclosing scope.
                     let parent_module_idx = self.frames[frame_idx].module_idx;
-                    let class_frame = Frame::new_for_code(class_co_idx, self.code_objects[class_co_idx].num_locals, parent_module_idx);
+                    let class_frame = Frame::new_for_code(
+                        class_co_idx,
+                        self.code_objects[class_co_idx].num_locals,
+                        parent_module_idx,
+                    );
                     self.frames.push(class_frame);
 
                     // Run class body
@@ -1330,33 +1689,48 @@ impl VM {
 
                         match cop {
                             op::LOAD_CONST => {
-                                let val = self.code_objects[co_index].constants[co_operand as usize];
+                                let val =
+                                    self.code_objects[co_index].constants[co_operand as usize];
                                 self.frames[cf_idx].push(val);
                             }
                             op::STORE_FAST => {
                                 let val = self.frames[cf_idx].pop();
-                                unsafe { *self.frames[cf_idx].locals.get_unchecked_mut(co_operand as usize) = val; }
+                                unsafe {
+                                    *self.frames[cf_idx]
+                                        .locals
+                                        .get_unchecked_mut(co_operand as usize) = val;
+                                }
                             }
                             op::LOAD_FAST => {
-                                let val = unsafe { *self.frames[cf_idx].locals.get_unchecked(co_operand as usize) };
+                                let val = unsafe {
+                                    *self.frames[cf_idx]
+                                        .locals
+                                        .get_unchecked(co_operand as usize)
+                                };
                                 self.frames[cf_idx].push(val);
                             }
                             op::LOAD_GLOBAL => {
-                                let name = self.code_objects[co_index].names[co_operand as usize].clone();
+                                let name =
+                                    self.code_objects[co_index].names[co_operand as usize].clone();
                                 match self.frame_globals_get(cf_idx, &name) {
                                     Some(val) => self.frames[cf_idx].push(val),
-                                    None => return Err(PythonError::runtime(
-                                        format!("name '{name}' is not defined"), cl,
-                                    )),
+                                    None => {
+                                        return Err(PythonError::runtime(
+                                            format!("name '{name}' is not defined"),
+                                            cl,
+                                        ));
+                                    }
                                 }
                             }
                             op::STORE_GLOBAL => {
                                 let val = self.frames[cf_idx].pop();
-                                let name = self.code_objects[co_index].names[co_operand as usize].clone();
+                                let name =
+                                    self.code_objects[co_index].names[co_operand as usize].clone();
                                 self.frame_globals_insert(cf_idx, name, val);
                             }
                             op::MAKE_FUNCTION => {
-                                let code_idx_v = self.code_objects[co_index].constants[co_operand as usize];
+                                let code_idx_v =
+                                    self.code_objects[co_index].constants[co_operand as usize];
                                 let fci = code_idx_v.as_int().ok_or_else(||
                                     PythonError::runtime("internal: class-body MAKE_FUNCTION operand isn't a small int", line))?
                                     as usize;
@@ -1384,8 +1758,12 @@ impl VM {
                     }
 
                     // Extract locals as class attributes
-                    let class_frame = self.frames.pop().ok_or_else(||
-                        PythonError::runtime("internal: class-body frame missing on completion", line))?;
+                    let class_frame = self.frames.pop().ok_or_else(|| {
+                        PythonError::runtime(
+                            "internal: class-body frame missing on completion",
+                            line,
+                        )
+                    })?;
                     let mut attrs = HashMap::new();
                     let local_names = &self.code_objects[class_co_idx].local_names;
                     for (i, name) in local_names.iter().enumerate() {
@@ -1433,7 +1811,8 @@ impl VM {
                         let frame = &self.frames[frame_idx];
                         let ip = frame.ip;
                         let sp = frame.sp;
-                        let mut locals = vec![Value::none(); self.code_objects[frame.code_index].num_locals];
+                        let mut locals =
+                            vec![Value::none(); self.code_objects[frame.code_index].num_locals];
                         for (i, l) in locals.iter_mut().enumerate() {
                             if i < frame.locals.len() {
                                 *l = frame.locals[i];
@@ -1445,7 +1824,15 @@ impl VM {
                         }
                         let cells = frame.cells.clone();
 
-                        if let HeapObject::Generator { ip: gip, locals: gl, stack: gs, state, cells: gc, .. } = &mut self.heap[gi] {
+                        if let HeapObject::Generator {
+                            ip: gip,
+                            locals: gl,
+                            stack: gs,
+                            state,
+                            cells: gc,
+                            ..
+                        } = &mut self.heap[gi]
+                        {
                             *gip = ip;
                             *gl = locals;
                             *gs = stack;
@@ -1461,8 +1848,9 @@ impl VM {
                         }
 
                         // Push yielded value to caller
-                        let caller = self.frames.last_mut().ok_or_else(||
-                            PythonError::runtime("internal: caller frame missing after yield", line))?;
+                        let caller = self.frames.last_mut().ok_or_else(|| {
+                            PythonError::runtime("internal: caller frame missing after yield", line)
+                        })?;
                         caller.push(yielded);
                         continue;
                     } else {
@@ -1477,7 +1865,7 @@ impl VM {
                     //   path; when fromlist is non-None (a tuple), return
                     //   the leaf module. Matches Python semantics.
                     let fromlist = self.frames[frame_idx].pop();
-                    let level    = self.frames[frame_idx].pop();
+                    let level = self.frames[frame_idx].pop();
                     let level_u32 = level.as_int().unwrap_or(0).max(0) as u32;
                     // Borrow the raw name; resolve_relative_name takes &self, so
                     // we don't need to clone. The returned `abs_name` is an
@@ -1498,7 +1886,9 @@ impl VM {
                         } else {
                             self.sys_modules.get(top).copied().ok_or_else(|| {
                                 PythonError::runtime(
-                                    format!("internal: top module '{top}' missing from sys.modules"),
+                                    format!(
+                                        "internal: top module '{top}' missing from sys.modules"
+                                    ),
                                     line,
                                 )
                             })?
@@ -1555,6 +1945,23 @@ impl VM {
         None
     }
 
+    /// MRO walk for `super()`: skips `class_idx` itself and only consults
+    /// strict ancestors. The borrow stays inside the method so callers
+    /// don't need to clone the MRO.
+    fn lookup_attr_in_mro_skipping_self(&self, class_idx: usize, attr: &str) -> Option<Value> {
+        let HeapObject::Class { mro, .. } = &self.heap[class_idx] else {
+            return None;
+        };
+        for &m in mro.iter().skip(1) {
+            if let HeapObject::Class { attrs, .. } = &self.heap[m]
+                && let Some(&val) = attrs.get(attr)
+            {
+                return Some(val);
+            }
+        }
+        None
+    }
+
     fn load_attr(&mut self, obj: Value, attr: &str, line: u32) -> Result<Value, PythonError> {
         // Instance attribute access
         if let Some(obj_idx) = obj.as_object_ref() {
@@ -1569,8 +1976,10 @@ impl VM {
                     if let Some(method) = self.lookup_attr_on_class(class_idx, attr) {
                         // If it's a function (or closure/function on the heap), bind it.
                         let is_callable = method.is_func()
-                            || matches!(method.as_object_ref().and_then(|i| self.heap.get(i)),
-                                Some(HeapObject::Closure { .. } | HeapObject::Function { .. }));
+                            || matches!(
+                                method.as_object_ref().and_then(|i| self.heap.get(i)),
+                                Some(HeapObject::Closure { .. } | HeapObject::Function { .. })
+                            );
                         if is_callable {
                             let bound_idx = self.heap.len();
                             self.heap.push(HeapObject::BoundMethod {
@@ -1582,10 +1991,45 @@ impl VM {
                         return Ok(method);
                     }
                     return Err(PythonError::runtime(
-                        format!("'{}' object has no attribute '{attr}'",
-                            if let HeapObject::Class { name, .. } = &self.heap[class_idx] { name.as_str() } else { "object" }),
+                        format!(
+                            "'{}' object has no attribute '{attr}'",
+                            if let HeapObject::Class { name, .. } = &self.heap[class_idx] {
+                                name.as_str()
+                            } else {
+                                "object"
+                            }
+                        ),
                         line,
                     ));
+                }
+                HeapObject::SuperProxy {
+                    class_idx,
+                    instance,
+                } => {
+                    let class_idx = *class_idx;
+                    let instance = *instance;
+                    // super() resolves through the proxied class's MRO
+                    // starting one level UP (mro[1..]). Found methods
+                    // bind to the original instance, not the proxy.
+                    let method = self
+                        .lookup_attr_in_mro_skipping_self(class_idx, attr)
+                        .ok_or_else(|| {
+                            PythonError::runtime(
+                                format!("'super' object has no attribute '{attr}'"),
+                                line,
+                            )
+                        })?;
+                    let is_callable = method.is_func()
+                        || matches!(
+                            method.as_object_ref().and_then(|i| self.heap.get(i)),
+                            Some(HeapObject::Closure { .. } | HeapObject::Function { .. })
+                        );
+                    if is_callable {
+                        let bound_idx = self.heap.len();
+                        self.heap.push(HeapObject::BoundMethod { instance, method });
+                        return Ok(Value::object_ref(bound_idx));
+                    }
+                    return Ok(method);
                 }
                 HeapObject::Class { attrs, name, .. } => {
                     if let Some(&val) = attrs.get(attr) {
@@ -1597,35 +2041,40 @@ impl VM {
                         return Ok(val);
                     }
                     return Err(PythonError::runtime(
-                        format!("type '{name}' has no attribute '{attr}'"), line,
+                        format!("type '{name}' has no attribute '{attr}'"),
+                        line,
                     ));
                 }
-                HeapObject::ExceptionObj { exc_type, message, args } => {
-                    match attr {
-                        "args" => {
-                            if args.is_empty() {
-                                let msg_idx = self.heap.len();
-                                self.heap.push(HeapObject::Str(message.clone().into()));
-                                let tuple_idx = self.heap.len();
-                                self.heap.push(HeapObject::Tuple(vec![Value::str_ref(msg_idx)]));
-                                return Ok(Value::object_ref(tuple_idx));
-                            }
+                HeapObject::ExceptionObj {
+                    exc_type,
+                    message,
+                    args,
+                } => match attr {
+                    "args" => {
+                        if args.is_empty() {
+                            let msg_idx = self.heap.len();
+                            self.heap.push(HeapObject::Str(message.clone().into()));
                             let tuple_idx = self.heap.len();
-                            self.heap.push(HeapObject::Tuple(args.clone()));
+                            self.heap
+                                .push(HeapObject::Tuple(vec![Value::str_ref(msg_idx)]));
                             return Ok(Value::object_ref(tuple_idx));
                         }
-                        "message" => {
-                            let str_idx = self.heap.len();
-                            self.heap.push(HeapObject::Str(message.clone().into()));
-                            return Ok(Value::str_ref(str_idx));
-                        }
-                        _ => {
-                            return Err(PythonError::runtime(
-                                format!("'{}' object has no attribute '{attr}'", exc_type.name()), line,
-                            ));
-                        }
+                        let tuple_idx = self.heap.len();
+                        self.heap.push(HeapObject::Tuple(args.clone()));
+                        return Ok(Value::object_ref(tuple_idx));
                     }
-                }
+                    "message" => {
+                        let str_idx = self.heap.len();
+                        self.heap.push(HeapObject::Str(message.clone().into()));
+                        return Ok(Value::str_ref(str_idx));
+                    }
+                    _ => {
+                        return Err(PythonError::runtime(
+                            format!("'{}' object has no attribute '{attr}'", exc_type.name()),
+                            line,
+                        ));
+                    }
+                },
                 HeapObject::Dict { .. } => {
                     return self.dict_method_dispatch(obj_idx, attr, line);
                 }
@@ -1650,7 +2099,8 @@ impl VM {
                         return Ok(val);
                     }
                     return Err(PythonError::runtime(
-                        format!("module '{name}' has no attribute '{attr}'"), line,
+                        format!("module '{name}' has no attribute '{attr}'"),
+                        line,
                     ));
                 }
                 _ => {}
@@ -1668,11 +2118,18 @@ impl VM {
         }
 
         Err(PythonError::runtime(
-            format!("'{}' has no attribute '{attr}'", obj.display(&self.heap)), line,
+            format!("'{}' has no attribute '{attr}'", obj.display(&self.heap)),
+            line,
         ))
     }
 
-    fn store_attr(&mut self, obj: Value, attr: &str, val: Value, line: u32) -> Result<(), PythonError> {
+    fn store_attr(
+        &mut self,
+        obj: Value,
+        attr: &str,
+        val: Value,
+        line: u32,
+    ) -> Result<(), PythonError> {
         if let Some(obj_idx) = obj.as_object_ref() {
             match &mut self.heap[obj_idx] {
                 HeapObject::Instance { attrs, .. } => {
@@ -1687,11 +2144,15 @@ impl VM {
             }
         }
         Err(PythonError::runtime(
-            format!("cannot set attribute '{attr}' on {}", obj.display(&self.heap)), line,
+            format!(
+                "cannot set attribute '{attr}' on {}",
+                obj.display(&self.heap)
+            ),
+            line,
         ))
     }
 
-    fn subscript_get(&self, obj: Value, index: Value, line: u32) -> Result<Value, PythonError> {
+    fn subscript_get(&mut self, obj: Value, index: Value, line: u32) -> Result<Value, PythonError> {
         if let Some(heap_idx) = obj.as_list_ref() {
             if let Some(i) = index.as_int()
                 && let HeapObject::List(items) = &self.heap[heap_idx]
@@ -1706,18 +2167,24 @@ impl VM {
         }
         if let Some(heap_idx) = obj.as_str_ref() {
             if let Some(i) = index.as_int() {
-                let s = heap_str(&self.heap, heap_idx)?;
-                let chars: Vec<char> = s.chars().collect();
-                let idx = if i < 0 { chars.len() as i64 + i } else { i } as usize;
-                if idx < chars.len() {
-                    // Need mutable access to create string — use a workaround
-                    // Actually we can't push to heap here because we only have &self
-                    // Return the char's code point as int for now? No, let's fix the signature
-                    return Err(PythonError::runtime("string subscript needs mutable heap", line));
-                }
-                return Err(PythonError::runtime("string index out of range", line));
+                // Allocate the single-char substring as a new heap Str.
+                // Python str[i] returns a length-1 string, not a char/int.
+                let (idx, ch) = {
+                    let s = heap_str(&self.heap, heap_idx)?;
+                    let chars: Vec<char> = s.chars().collect();
+                    let idx = if i < 0 { chars.len() as i64 + i } else { i } as usize;
+                    if idx >= chars.len() {
+                        return Err(PythonError::runtime("string index out of range", line));
+                    }
+                    (idx, chars[idx])
+                };
+                let _ = idx; // already used above
+                return Ok(alloc_str(&mut self.heap, ch.to_string().as_str()));
             }
-            return Err(PythonError::runtime("string indices must be integers", line));
+            return Err(PythonError::runtime(
+                "string indices must be integers",
+                line,
+            ));
         }
         if let Some(obj_idx) = obj.as_object_ref() {
             match &self.heap[obj_idx] {
@@ -1731,7 +2198,11 @@ impl VM {
                     }
                     return Err(PythonError::runtime("tuple indices must be integers", line));
                 }
-                HeapObject::Dict { keys, values, index_map } => {
+                HeapObject::Dict {
+                    keys,
+                    values,
+                    index_map,
+                } => {
                     let h = value_hash(index, &self.heap);
                     // Fast path: hash → key-index via index_map. Verify the
                     // key matches (the index_map only stores one entry per
@@ -1756,7 +2227,168 @@ impl VM {
         Err(PythonError::runtime("object is not subscriptable", line))
     }
 
-    fn subscript_set(&mut self, obj: Value, index: Value, val: Value, line: u32) -> Result<(), PythonError> {
+    /// Implements `obj[start:stop:step]` for list, tuple, and string. Each
+    /// of `start`/`stop`/`step` may be `None` (use default) or an int.
+    /// Negative indices and negative step both supported.
+    fn slice_get(
+        &mut self,
+        obj: Value,
+        start: Value,
+        stop: Value,
+        step: Value,
+        line: u32,
+    ) -> Result<Value, PythonError> {
+        // Resolve step first because the start/stop defaults flip on sign.
+        let step_i = if step.is_none() {
+            1
+        } else {
+            match step.as_int() {
+                Some(0) => return Err(PythonError::runtime("slice step cannot be zero", line)),
+                Some(s) => s,
+                None => return Err(PythonError::runtime("slice indices must be integers", line)),
+            }
+        };
+
+        let (len, kind) = if let Some(idx) = obj.as_list_ref() {
+            let len = if let HeapObject::List(items) = &self.heap[idx] {
+                items.len()
+            } else {
+                0
+            };
+            (len, SliceKind::List(idx))
+        } else if let Some(idx) = obj.as_str_ref() {
+            let chars: Vec<char> = heap_str(&self.heap, idx)?.chars().collect();
+            (chars.len(), SliceKind::Str(chars))
+        } else if let Some(idx) = obj.as_object_ref() {
+            match &self.heap[idx] {
+                HeapObject::Tuple(items) => (items.len(), SliceKind::Tuple(idx)),
+                _ => return Err(PythonError::runtime("object is not sliceable", line)),
+            }
+        } else {
+            return Err(PythonError::runtime("object is not sliceable", line));
+        };
+
+        let len_i = len as i64;
+        let resolve = |v: Value, default: i64| -> Result<i64, PythonError> {
+            if v.is_none() {
+                return Ok(default);
+            }
+            v.as_int()
+                .ok_or_else(|| PythonError::runtime("slice indices must be integers", line))
+        };
+        // Python semantics: defaults depend on step sign.
+        let (default_start, default_stop) = if step_i > 0 {
+            (0, len_i)
+        } else {
+            (len_i - 1, -len_i - 1)
+        };
+        let mut start_i = resolve(start, default_start)?;
+        let mut stop_i = resolve(stop, default_stop)?;
+
+        // Negative-index normalization, then clamp to valid range. The
+        // clamping bounds flip with step sign.
+        let normalize = |mut i: i64, step_positive: bool| -> i64 {
+            if i < 0 {
+                i += len_i;
+            }
+            if step_positive {
+                if i < 0 {
+                    0
+                } else if i > len_i {
+                    len_i
+                } else {
+                    i
+                }
+            } else if i < -1 {
+                -1
+            } else if i >= len_i {
+                len_i - 1
+            } else {
+                i
+            }
+        };
+        start_i = normalize(start_i, step_i > 0);
+        stop_i = normalize(stop_i, step_i > 0);
+
+        // Fast path: contiguous positive-step slice (the dominant case).
+        // Skips the index-vector materialization entirely and just copies
+        // a range out of the source.
+        if step_i == 1 {
+            let lo = start_i.max(0) as usize;
+            let hi = stop_i.max(start_i) as usize;
+            return Ok(match kind {
+                SliceKind::List(idx) => {
+                    let out: Vec<Value> = if let HeapObject::List(items) = &self.heap[idx] {
+                        items[lo..hi.min(items.len())].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    alloc_list(&mut self.heap, out)
+                }
+                SliceKind::Tuple(idx) => {
+                    let out: Vec<Value> = if let HeapObject::Tuple(items) = &self.heap[idx] {
+                        items[lo..hi.min(items.len())].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    alloc_tuple(&mut self.heap, out)
+                }
+                SliceKind::Str(chars) => {
+                    let s: String = chars[lo..hi.min(chars.len())].iter().collect();
+                    alloc_str(&mut self.heap, s.as_str())
+                }
+            });
+        }
+
+        // General path: arbitrary step, including reversed slices.
+        let indices: Vec<i64> = {
+            let mut out = Vec::new();
+            let mut i = start_i;
+            if step_i > 0 {
+                while i < stop_i {
+                    out.push(i);
+                    i += step_i;
+                }
+            } else {
+                while i > stop_i {
+                    out.push(i);
+                    i += step_i;
+                }
+            }
+            out
+        };
+
+        match kind {
+            SliceKind::List(idx) => {
+                let collected: Vec<Value> = if let HeapObject::List(items) = &self.heap[idx] {
+                    indices.iter().map(|&i| items[i as usize]).collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(alloc_list(&mut self.heap, collected))
+            }
+            SliceKind::Tuple(idx) => {
+                let collected: Vec<Value> = if let HeapObject::Tuple(items) = &self.heap[idx] {
+                    indices.iter().map(|&i| items[i as usize]).collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(alloc_tuple(&mut self.heap, collected))
+            }
+            SliceKind::Str(chars) => {
+                let result: String = indices.iter().map(|&i| chars[i as usize]).collect();
+                Ok(alloc_str(&mut self.heap, result.as_str()))
+            }
+        }
+    }
+
+    fn subscript_set(
+        &mut self,
+        obj: Value,
+        index: Value,
+        val: Value,
+        line: u32,
+    ) -> Result<(), PythonError> {
         if let Some(heap_idx) = obj.as_list_ref() {
             if let Some(i) = index.as_int()
                 && let HeapObject::List(items) = &mut self.heap[heap_idx]
@@ -1766,7 +2398,10 @@ impl VM {
                     items[idx] = val;
                     return Ok(());
                 }
-                return Err(PythonError::runtime("list assignment index out of range", line));
+                return Err(PythonError::runtime(
+                    "list assignment index out of range",
+                    line,
+                ));
             }
             return Err(PythonError::runtime("list indices must be integers", line));
         }
@@ -1774,15 +2409,29 @@ impl VM {
             // Compute hash before borrowing mutably
             let h = value_hash(index, &self.heap);
             // Check if key exists (read-only pass)
-            let existing = if let HeapObject::Dict { keys, index_map, .. } = &self.heap[obj_idx] {
+            let existing = if let HeapObject::Dict {
+                keys, index_map, ..
+            } = &self.heap[obj_idx]
+            {
                 if let Some(&ei) = index_map.get(&h) {
                     if ei < keys.len() && values_equal(keys[ei], index, &self.heap) {
                         Some(ei)
-                    } else { None }
-                } else { None }
-            } else { None };
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-            if let HeapObject::Dict { keys, values, index_map } = &mut self.heap[obj_idx] {
+            if let HeapObject::Dict {
+                keys,
+                values,
+                index_map,
+            } = &mut self.heap[obj_idx]
+            {
                 if let Some(ei) = existing {
                     values[ei] = val;
                 } else {
@@ -1794,7 +2443,10 @@ impl VM {
                 return Ok(());
             }
         }
-        Err(PythonError::runtime("object does not support item assignment", line))
+        Err(PythonError::runtime(
+            "object does not support item assignment",
+            line,
+        ))
     }
 
     fn subscript_delete(&mut self, obj: Value, index: Value, line: u32) -> Result<(), PythonError> {
@@ -1807,12 +2459,23 @@ impl VM {
                 items.remove(idx);
                 return Ok(());
             }
-            return Err(PythonError::runtime("list assignment index out of range", line));
+            return Err(PythonError::runtime(
+                "list assignment index out of range",
+                line,
+            ));
         }
-        Err(PythonError::runtime("object does not support item deletion", line))
+        Err(PythonError::runtime(
+            "object does not support item deletion",
+            line,
+        ))
     }
 
-    fn unpack_sequence(&self, seq: Value, count: usize, line: u32) -> Result<Vec<Value>, PythonError> {
+    fn unpack_sequence(
+        &self,
+        seq: Value,
+        count: usize,
+        line: u32,
+    ) -> Result<Vec<Value>, PythonError> {
         if let Some(list_idx) = seq.as_list_ref()
             && let HeapObject::List(items) = &self.heap[list_idx]
         {
@@ -1820,7 +2483,11 @@ impl VM {
                 return Ok(items.clone());
             }
             return Err(PythonError::runtime(
-                format!("not enough values to unpack (expected {count}, got {})", items.len()), line,
+                format!(
+                    "not enough values to unpack (expected {count}, got {})",
+                    items.len()
+                ),
+                line,
             ));
         }
         if let Some(obj_idx) = seq.as_object_ref()
@@ -1830,13 +2497,23 @@ impl VM {
                 return Ok(items.clone());
             }
             return Err(PythonError::runtime(
-                format!("not enough values to unpack (expected {count}, got {})", items.len()), line,
+                format!(
+                    "not enough values to unpack (expected {count}, got {})",
+                    items.len()
+                ),
+                line,
             ));
         }
         Err(PythonError::runtime("cannot unpack non-sequence", line))
     }
 
-    fn call_class(&mut self, frame_idx: usize, class_idx: usize, args: &[Value], line: u32) -> Result<(), PythonError> {
+    fn call_class(
+        &mut self,
+        frame_idx: usize,
+        class_idx: usize,
+        args: &[Value],
+        line: u32,
+    ) -> Result<(), PythonError> {
         // Create instance
         let inst_idx = self.heap.len();
         self.heap.push(HeapObject::Instance {
@@ -1868,11 +2545,23 @@ impl VM {
     }
 
     /// Call a value as a function, managing frame setup.
-    fn call_value(&mut self, caller_frame_idx: usize, func_val: Value, args: &[Value], line: u32) -> Result<(), PythonError> {
+    fn call_value(
+        &mut self,
+        caller_frame_idx: usize,
+        func_val: Value,
+        args: &[Value],
+        line: u32,
+    ) -> Result<(), PythonError> {
         let argc = args.len();
 
         if let Some(heap_idx) = func_val.as_func_ref() {
-            let (func_code_index, arity, func_module_idx) = if let HeapObject::Function { code_index, arity, module_idx, .. } = &self.heap[heap_idx] {
+            let (func_code_index, arity, func_module_idx) = if let HeapObject::Function {
+                code_index,
+                arity,
+                module_idx,
+                ..
+            } = &self.heap[heap_idx]
+            {
                 (*code_index, *arity as usize, *module_idx)
             } else {
                 return Err(PythonError::runtime("not a callable", line));
@@ -1880,12 +2569,19 @@ impl VM {
             if argc != arity {
                 let name = if let HeapObject::Function { name, .. } = &self.heap[heap_idx] {
                     name.clone()
-                } else { "???".to_string() };
+                } else {
+                    "???".to_string()
+                };
                 return Err(PythonError::runtime(
-                    format!("{name}() takes {arity} argument(s) but {argc} were given"), line,
+                    format!("{name}() takes {arity} argument(s) but {argc} were given"),
+                    line,
                 ));
             }
-            let mut new_frame = Frame::new_for_code(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
+            let mut new_frame = Frame::new_for_code(
+                func_code_index,
+                self.code_objects[func_code_index].num_locals,
+                func_module_idx,
+            );
             for (i, arg) in args.iter().enumerate() {
                 new_frame.locals[i] = *arg;
             }
@@ -1896,7 +2592,8 @@ impl VM {
                 self.heap.push(HeapObject::Cell(Value::none()));
                 new_frame.cells.push(ci);
             }
-            let cell_var_names: Vec<String> = self.code_objects[func_code_index].cell_var_names.clone();
+            let cell_var_names: Vec<String> =
+                self.code_objects[func_code_index].cell_var_names.clone();
             for (ci, cv_name) in cell_var_names.iter().enumerate() {
                 let local_names = &self.code_objects[func_code_index].local_names;
                 if let Some(li) = local_names.iter().position(|n| n == cv_name) {
@@ -1908,10 +2605,22 @@ impl VM {
             match &self.heap[heap_idx] {
                 HeapObject::BuiltinFn { id, .. } => {
                     let id = *id;
-                    let result = builtins::call_builtin(id, args, &mut self.heap, &mut self.output, &self.globals)?;
+                    let result = builtins::call_builtin(
+                        id,
+                        args,
+                        &mut self.heap,
+                        &mut self.output,
+                        &self.globals,
+                    )?;
                     self.frames[caller_frame_idx].push(result);
                 }
-                HeapObject::Closure { code_index, arity, cells, module_idx, .. } => {
+                HeapObject::Closure {
+                    code_index,
+                    arity,
+                    cells,
+                    module_idx,
+                    ..
+                } => {
                     let func_code_index = *code_index;
                     let arity = *arity as usize;
                     let cells = cells.clone();
@@ -1919,7 +2628,11 @@ impl VM {
                     if argc != arity {
                         return Err(PythonError::runtime("wrong number of arguments", line));
                     }
-                    let mut new_frame = Frame::new_for_code(func_code_index, self.code_objects[func_code_index].num_locals, func_module_idx);
+                    let mut new_frame = Frame::new_for_code(
+                        func_code_index,
+                        self.code_objects[func_code_index].num_locals,
+                        func_module_idx,
+                    );
                     for (i, arg) in args.iter().enumerate() {
                         new_frame.locals[i] = *arg;
                     }
@@ -1929,7 +2642,8 @@ impl VM {
                         self.heap.push(HeapObject::Cell(Value::none()));
                         new_frame.cells.push(ci);
                     }
-                    let cell_var_names: Vec<String> = self.code_objects[func_code_index].cell_var_names.clone();
+                    let cell_var_names: Vec<String> =
+                        self.code_objects[func_code_index].cell_var_names.clone();
                     for (ci, cv_name) in cell_var_names.iter().enumerate() {
                         let local_names = &self.code_objects[func_code_index].local_names;
                         if let Some(li) = local_names.iter().position(|n| n == cv_name) {
@@ -1954,16 +2668,108 @@ impl VM {
         Ok(())
     }
 
-    fn resume_generator(&mut self, _caller_frame_idx: usize, gen_heap_idx: usize, line: u32) -> Result<(), PythonError> {
+    /// Call `func_val(args)` and synchronously return the result. Handles
+    /// both builtin functions (which return inline) and Python functions
+    /// (which push a frame and require running the dispatch loop until
+    /// the frame returns). Used by `__repr__`/`__str__` dispatch where we
+    /// need the resulting string value, not just to leave it on the
+    /// caller's stack.
+    fn call_and_get_result(
+        &mut self,
+        caller_frame_idx: usize,
+        func_val: Value,
+        args: &[Value],
+        line: u32,
+    ) -> Result<Value, PythonError> {
+        let target_depth = self.frames.len();
+        self.call_value(caller_frame_idx, func_val, args, line)?;
+        if self.frames.len() > target_depth {
+            self.execute_until_depth(target_depth)?;
+        }
+        // Whether the result came from a builtin (pushed inline) or a
+        // returned Python frame, it now sits at the top of the caller's
+        // stack — pop and return it.
+        Ok(self.frames[caller_frame_idx].pop())
+    }
+
+    /// If `val` is a user-class instance with `method_name` defined, call
+    /// it and return `Some(result)`. Otherwise `None` so the caller can
+    /// fall through to default formatting.
+    fn try_call_dunder_unary(
+        &mut self,
+        caller_frame_idx: usize,
+        val: Value,
+        method_name: &str,
+        line: u32,
+    ) -> Result<Option<Value>, PythonError> {
+        let Some(obj_idx) = val.as_object_ref() else {
+            return Ok(None);
+        };
+        let class_idx = if let HeapObject::Instance { class_idx, .. } = &self.heap[obj_idx] {
+            *class_idx
+        } else {
+            return Ok(None);
+        };
+        let Some(method) = self.lookup_attr_on_class(class_idx, method_name) else {
+            return Ok(None);
+        };
+        let result = self.call_and_get_result(caller_frame_idx, method, &[val], line)?;
+        Ok(Some(result))
+    }
+
+    /// Try `__str__`/`__repr__` (with `__str__` → `__repr__` fallback)
+    /// for the print/str/repr dispatch path. Returns the formatted value
+    /// when a dunder fires, `None` when nothing is defined so the caller
+    /// can apply default formatting.
+    fn dispatch_dunder_format(
+        &mut self,
+        caller_frame_idx: usize,
+        val: Value,
+        kind: DunderKind,
+        line: u32,
+    ) -> Result<Option<Value>, PythonError> {
+        let primary = match kind {
+            DunderKind::Str => "__str__",
+            DunderKind::Repr => "__repr__",
+        };
+        let found = self.try_call_dunder_unary(caller_frame_idx, val, primary, line)?;
+        if found.is_some() || matches!(kind, DunderKind::Repr) {
+            return Ok(found);
+        }
+        // __str__ falls back to __repr__ per the Python data model.
+        self.try_call_dunder_unary(caller_frame_idx, val, "__repr__", line)
+    }
+
+    fn resume_generator(
+        &mut self,
+        _caller_frame_idx: usize,
+        gen_heap_idx: usize,
+        line: u32,
+    ) -> Result<(), PythonError> {
         // Extract generator state
-        let (code_index, ip, locals, stack, cells) = if let HeapObject::Generator {
-            code_index, ip, locals, stack, cells, state,
-        } = &mut self.heap[gen_heap_idx] {
+        let (code_index, ip, locals, stack, cells, was_suspended) = if let HeapObject::Generator {
+            code_index,
+            ip,
+            locals,
+            stack,
+            cells,
+            state,
+        } =
+            &mut self.heap[gen_heap_idx]
+        {
             if *state == GeneratorState::Completed {
                 return Err(PythonError::runtime("StopIteration", line));
             }
+            let was_suspended = *state == GeneratorState::Suspended;
             *state = GeneratorState::Running;
-            (*code_index, *ip, locals.clone(), stack.clone(), cells.clone())
+            (
+                *code_index,
+                *ip,
+                locals.clone(),
+                stack.clone(),
+                cells.clone(),
+                was_suspended,
+            )
         } else {
             return Err(PythonError::runtime("not a generator", line));
         };
@@ -1989,11 +2795,25 @@ impl VM {
             gen_frame.push(*val);
         }
 
+        // Resume contract: bytecode after YIELD_VALUE assumes the
+        // .send() value is on the stack (None for plain iteration since
+        // .send is not yet supported). On the first call (state was
+        // Created) the generator starts from the top with no pushed
+        // value — that's why this is gated on `was_suspended`.
+        if was_suspended {
+            gen_frame.push(Value::none());
+        }
+
         self.frames.push(gen_frame);
         Ok(())
     }
 
-    fn list_method_dispatch(&mut self, list_idx: usize, attr: &str, line: u32) -> Result<Value, PythonError> {
+    fn list_method_dispatch(
+        &mut self,
+        list_idx: usize,
+        attr: &str,
+        line: u32,
+    ) -> Result<Value, PythonError> {
         let method_id = match attr {
             "append" => BuiltinId::ListAppend,
             "pop" => BuiltinId::ListPop,
@@ -2001,9 +2821,12 @@ impl VM {
             "reverse" => BuiltinId::ListReverse,
             "insert" => BuiltinId::ListInsert,
             "extend" => BuiltinId::ListExtend,
-            _ => return Err(PythonError::runtime(
-                format!("'list' object has no attribute '{attr}'"), line,
-            )),
+            _ => {
+                return Err(PythonError::runtime(
+                    format!("'list' object has no attribute '{attr}'"),
+                    line,
+                ));
+            }
         };
         let bound_idx = self.heap.len();
         self.heap.push(HeapObject::BuiltinFn {
@@ -2022,7 +2845,12 @@ impl VM {
         Ok(Value::object_ref(bm_idx))
     }
 
-    fn str_method_dispatch(&mut self, str_idx: usize, attr: &str, line: u32) -> Result<Value, PythonError> {
+    fn str_method_dispatch(
+        &mut self,
+        str_idx: usize,
+        attr: &str,
+        line: u32,
+    ) -> Result<Value, PythonError> {
         let method_id = match attr {
             "upper" => BuiltinId::StrUpper,
             "lower" => BuiltinId::StrLower,
@@ -2034,9 +2862,12 @@ impl VM {
             "find" => BuiltinId::StrFind,
             "strip" => BuiltinId::StrStrip,
             "format" => BuiltinId::StrFormat,
-            _ => return Err(PythonError::runtime(
-                format!("'str' object has no attribute '{attr}'"), line,
-            )),
+            _ => {
+                return Err(PythonError::runtime(
+                    format!("'str' object has no attribute '{attr}'"),
+                    line,
+                ));
+            }
         };
         let bound_idx = self.heap.len();
         self.heap.push(HeapObject::BuiltinFn {
@@ -2053,16 +2884,24 @@ impl VM {
         Ok(Value::object_ref(bm_idx))
     }
 
-    fn dict_method_dispatch(&mut self, dict_idx: usize, attr: &str, line: u32) -> Result<Value, PythonError> {
+    fn dict_method_dispatch(
+        &mut self,
+        dict_idx: usize,
+        attr: &str,
+        line: u32,
+    ) -> Result<Value, PythonError> {
         let method_id = match attr {
             "keys" => BuiltinId::DictKeys,
             "values" => BuiltinId::DictValues,
             "items" => BuiltinId::DictItems,
             "get" => BuiltinId::DictGet,
             "pop" => BuiltinId::DictPop,
-            _ => return Err(PythonError::runtime(
-                format!("'dict' object has no attribute '{attr}'"), line,
-            )),
+            _ => {
+                return Err(PythonError::runtime(
+                    format!("'dict' object has no attribute '{attr}'"),
+                    line,
+                ));
+            }
         };
         let bound_idx = self.heap.len();
         self.heap.push(HeapObject::BuiltinFn {
@@ -2095,7 +2934,7 @@ impl VM {
         // Ensure parent package is loaded first (recursive).
         let parent_module = match parent_name {
             Some(p) => Some(self.resolve_import(p, line)?),
-            None    => None,
+            None => None,
         };
 
         // Submodule lookup is restricted to the parent package's directory;
@@ -2123,7 +2962,10 @@ impl VM {
             return self.load_source_module(name, file_path, false, parent_module, line);
         }
 
-        Err(PythonError::runtime(format!("No module named '{name}'"), line))
+        Err(PythonError::runtime(
+            format!("No module named '{name}'"),
+            line,
+        ))
     }
 
     /// Resolve a relative-import name into an absolute one.
@@ -2143,15 +2985,18 @@ impl VM {
         // via the Frame::module_idx routing. For top-level scripts,
         // module_idx is None and __package__ doesn't exist → error.
         let frame_idx = self.frames.len() - 1;
-        let pkg_value = self.frame_globals_get(frame_idx, "__package__").unwrap_or(Value::none());
+        let pkg_value = self
+            .frame_globals_get(frame_idx, "__package__")
+            .unwrap_or(Value::none());
         if pkg_value.is_none() {
             return Err(PythonError::runtime(
-                "attempted relative import with no known parent package", line,
+                "attempted relative import with no known parent package",
+                line,
             ));
         }
-        let pkg_str_idx = pkg_value.as_str_ref().ok_or_else(|| {
-            PythonError::runtime("internal: __package__ is not a string", line)
-        })?;
+        let pkg_str_idx = pkg_value
+            .as_str_ref()
+            .ok_or_else(|| PythonError::runtime("internal: __package__ is not a string", line))?;
         let pkg = heap_str(&self.heap, pkg_str_idx)?;
         // Walk `level - 1` segments up from `pkg`. (A single dot means
         // "current package", so we drop level-1 segments, not level.)
@@ -2161,7 +3006,8 @@ impl VM {
         for _ in 1..level {
             if parts.is_empty() {
                 return Err(PythonError::runtime(
-                    "attempted relative import beyond top-level package", line,
+                    "attempted relative import beyond top-level package",
+                    line,
                 ));
             }
             parts.pop();
@@ -2187,24 +3033,28 @@ impl VM {
         line: u32,
     ) -> Result<std::path::PathBuf, PythonError> {
         let idx = module.as_object_ref().ok_or_else(|| {
-            PythonError::runtime(format!("internal: '{module_name}' module is not a heap ref"), line)
+            PythonError::runtime(
+                format!("internal: '{module_name}' module is not a heap ref"),
+                line,
+            )
         })?;
         match &self.heap[idx] {
-            HeapObject::Module { file: Some(f), .. } => {
-                std::path::Path::new(f).parent()
-                    .map(|p| p.to_path_buf())
-                    .ok_or_else(|| PythonError::runtime(
-                        format!("internal: '{module_name}' has no parent dir"), line,
-                    ))
-            }
-            HeapObject::Module { file: None, .. } => {
-                Err(PythonError::runtime(
-                    format!("module '{module_name}' is not a package — cannot resolve submodule"),
-                    line,
-                ))
-            }
+            HeapObject::Module { file: Some(f), .. } => std::path::Path::new(f)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| {
+                    PythonError::runtime(
+                        format!("internal: '{module_name}' has no parent dir"),
+                        line,
+                    )
+                }),
+            HeapObject::Module { file: None, .. } => Err(PythonError::runtime(
+                format!("module '{module_name}' is not a package — cannot resolve submodule"),
+                line,
+            )),
             _ => Err(PythonError::runtime(
-                format!("internal: '{module_name}' is not a Module"), line,
+                format!("internal: '{module_name}' is not a Module"),
+                line,
             )),
         }
     }
@@ -2262,7 +3112,8 @@ impl VM {
     ) -> Result<Value, PythonError> {
         let source = std::fs::read_to_string(&file_path).map_err(|e| {
             PythonError::runtime(
-                format!("could not read '{}': {e}", file_path.display()), line,
+                format!("could not read '{}': {e}", file_path.display()),
+                line,
             )
         })?;
         let tokens = crate::lexer::tokenize(&source)?;
@@ -2280,19 +3131,24 @@ impl VM {
         let file_value = alloc_str(&mut self.heap, file_str.as_str());
         let package_value = match package.as_deref() {
             Some(p) => alloc_str(&mut self.heap, p),
-            None    => Value::none(),
+            None => Value::none(),
         };
         let mut globals: HashMap<String, Value> = HashMap::new();
-        globals.insert("__name__".into(),    name_value);
-        globals.insert("__file__".into(),    file_value);
-        globals.insert("__doc__".into(),     Value::none());
+        globals.insert("__name__".into(), name_value);
+        globals.insert("__file__".into(), file_value);
+        globals.insert("__doc__".into(), Value::none());
         globals.insert("__package__".into(), package_value);
 
         // Capture the heap idx before alloc_module's push so we don't need to
         // round-trip through Value::as_object_ref afterwards.
         let module_idx = self.heap.len();
         let module_value = alloc_module(
-            &mut self.heap, name.to_string(), globals, Some(file_str), package, false,
+            &mut self.heap,
+            name.to_string(),
+            globals,
+            Some(file_str),
+            package,
+            false,
         );
         // Cache BEFORE execution so a circular self-import sees the
         // (partial) module from cache rather than infinite-recursing.
@@ -2302,7 +3158,11 @@ impl VM {
         // inside the body route through heap[module_idx].globals via the
         // Frame::module_idx mechanism — no globals swap needed.
         let target_depth = self.frames.len();
-        self.frames.push(Frame::new_for_code(body_code_idx, self.code_objects[body_code_idx].num_locals, Some(module_idx)));
+        self.frames.push(Frame::new_for_code(
+            body_code_idx,
+            self.code_objects[body_code_idx].num_locals,
+            Some(module_idx),
+        ));
         let exec_result = self.execute_until_depth(target_depth);
 
         // The compiler always terminates module bodies with HALT (see
@@ -2327,7 +3187,12 @@ impl VM {
     /// if the name isn't there, attempts a sub-import of `module.attr`
     /// (Python's documented fallback for `from pkg import sub` where sub
     /// is a submodule rather than an attribute).
-    fn module_get_attr(&mut self, module: Value, attr: &str, line: u32) -> Result<Value, PythonError> {
+    fn module_get_attr(
+        &mut self,
+        module: Value,
+        attr: &str,
+        line: u32,
+    ) -> Result<Value, PythonError> {
         let idx = module.as_object_ref().ok_or_else(|| {
             PythonError::runtime("internal: IMPORT_FROM TOS is not an object ref", line)
         })?;
@@ -2340,16 +3205,20 @@ impl VM {
         // Submodule fallback: try `module_name.attr` as a sub-import.
         let module_name = match &self.heap[idx] {
             HeapObject::Module { name, .. } => name.clone(),
-            _ => return Err(PythonError::runtime(
-                "internal: IMPORT_FROM TOS is not a Module", line,
-            )),
+            _ => {
+                return Err(PythonError::runtime(
+                    "internal: IMPORT_FROM TOS is not a Module",
+                    line,
+                ));
+            }
         };
         let submodule_name = format!("{module_name}.{attr}");
         if let Ok(sub) = self.resolve_import(&submodule_name, line) {
             return Ok(sub);
         }
         Err(PythonError::runtime(
-            format!("cannot import name '{attr}' from '{module_name}'"), line,
+            format!("cannot import name '{attr}' from '{module_name}'"),
+            line,
         ))
     }
 
@@ -2361,20 +3230,26 @@ impl VM {
         let idx = module.as_object_ref().ok_or_else(|| {
             PythonError::runtime("internal: IMPORT_STAR TOS is not an object ref", line)
         })?;
-        let (all_list, bindings): (Option<Vec<String>>, Vec<(String, Value)>) = match &self.heap[idx] {
-            HeapObject::Module { all, globals, .. } => {
-                (all.clone(),
-                 globals.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            }
-            other => return Err(PythonError::runtime(
-                format!("internal: IMPORT_STAR TOS is not a Module (got {other:?})"), line,
-            )),
-        };
+        let (all_list, bindings): (Option<Vec<String>>, Vec<(String, Value)>) =
+            match &self.heap[idx] {
+                HeapObject::Module { all, globals, .. } => (
+                    all.clone(),
+                    globals.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                ),
+                other => {
+                    return Err(PythonError::runtime(
+                        format!("internal: IMPORT_STAR TOS is not a Module (got {other:?})"),
+                        line,
+                    ));
+                }
+            };
         let bindings_to_apply: Vec<(String, Value)> = match all_list {
-            Some(names) => bindings.into_iter()
+            Some(names) => bindings
+                .into_iter()
                 .filter(|(k, _)| names.contains(k))
                 .collect(),
-            None => bindings.into_iter()
+            None => bindings
+                .into_iter()
                 .filter(|(k, _)| !k.starts_with('_'))
                 .collect(),
         };
@@ -2389,17 +3264,21 @@ impl VM {
 // --- Free functions for arithmetic/comparison ---
 
 fn is_truthy(val: Value, heap: &[HeapObject]) -> bool {
-    if let Some(idx) = val.as_str_ref() && let Some(s) = heap[idx].as_str() {
+    if let Some(idx) = val.as_str_ref()
+        && let Some(s) = heap[idx].as_str()
+    {
         return !s.is_empty();
     }
-    if let Some(idx) = val.as_list_ref() && let HeapObject::List(items) = &heap[idx] {
+    if let Some(idx) = val.as_list_ref()
+        && let HeapObject::List(items) = &heap[idx]
+    {
         return !items.is_empty();
     }
     if let Some(idx) = val.as_object_ref() {
         match &heap[idx] {
             HeapObject::Tuple(items) => return !items.is_empty(),
             HeapObject::Dict { keys, .. } => return !keys.is_empty(),
-            HeapObject::Set(items) => return !items.is_empty(),
+            HeapObject::Set { items, .. } => return !items.is_empty(),
             _ => return true,
         }
     }
@@ -2410,20 +3289,37 @@ fn values_equal(left: Value, right: Value, heap: &[HeapObject]) -> bool {
     // Defer Python value equality (cross-representation int, float coercion,
     // bool widening, string content) to Value::py_eq. Anything it accepts is
     // already equal under Python `==`.
-    if left.py_eq(right, heap) { return true; }
+    if left.py_eq(right, heap) {
+        return true;
+    }
     // Exception type matching (for except handlers) — vm-specific layer on
     // top of plain Python equality.
     if let (Some(a_idx), Some(b_idx)) = (left.as_object_ref(), right.as_object_ref()) {
         // If one is an ExceptionObj and the other is an ExcConstructor builtin,
         // compare types
         match (&heap[a_idx], &heap[b_idx]) {
-            (HeapObject::ExceptionObj { exc_type: et1, .. }, HeapObject::ExceptionObj { exc_type: et2, .. }) => {
+            (
+                HeapObject::ExceptionObj { exc_type: et1, .. },
+                HeapObject::ExceptionObj { exc_type: et2, .. },
+            ) => {
                 return et1.is_subtype(*et2);
             }
-            (HeapObject::ExceptionObj { exc_type, .. }, HeapObject::BuiltinFn { id: BuiltinId::ExcConstructor(target), .. }) => {
+            (
+                HeapObject::ExceptionObj { exc_type, .. },
+                HeapObject::BuiltinFn {
+                    id: BuiltinId::ExcConstructor(target),
+                    ..
+                },
+            ) => {
                 return exc_type.is_subtype(*target);
             }
-            (HeapObject::BuiltinFn { id: BuiltinId::ExcConstructor(target), .. }, HeapObject::ExceptionObj { exc_type, .. }) => {
+            (
+                HeapObject::BuiltinFn {
+                    id: BuiltinId::ExcConstructor(target),
+                    ..
+                },
+                HeapObject::ExceptionObj { exc_type, .. },
+            ) => {
                 return exc_type.is_subtype(*target);
             }
             _ => {}
@@ -2437,9 +3333,11 @@ fn values_equal(left: Value, right: Value, heap: &[HeapObject]) -> bool {
 /// proper ZeroDivisionError / ValueError dispatch.
 fn arith_to_runtime(err: ArithError, op_msg: &str, line: u32) -> PythonError {
     let msg = match err {
-        ArithError::DivByZero      => format!("{op_msg} by zero"),
-        ArithError::NegativeShift  => "negative shift count".to_string(),
-        ArithError::NegativePower  => "pow() 2nd argument cannot be negative when 3rd argument specified".to_string(),
+        ArithError::DivByZero => format!("{op_msg} by zero"),
+        ArithError::NegativeShift => "negative shift count".to_string(),
+        ArithError::NegativePower => {
+            "pow() 2nd argument cannot be negative when 3rd argument specified".to_string()
+        }
     };
     PythonError::runtime(msg, line)
 }
@@ -2451,14 +3349,21 @@ fn pyint_pair<'a>(
     right: Value,
     heap: &'a [HeapObject],
 ) -> Option<(PyInt<'a>, PyInt<'a>)> {
-    if left.is_float() || right.is_float() { return None; }
+    if left.is_float() || right.is_float() {
+        return None;
+    }
     Some((
         PyInt::from_value_or_bool(left, heap)?,
         PyInt::from_value_or_bool(right, heap)?,
     ))
 }
 
-fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+fn binary_add(
+    left: Value,
+    right: Value,
+    heap: &mut Vec<HeapObject>,
+    line: u32,
+) -> Result<Value, PythonError> {
     if let Some((a, b)) = pyint_pair(left, right, heap) {
         return Ok(a.add(b).into_value(heap));
     }
@@ -2486,8 +3391,16 @@ fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
         // Single allocation sized for both halves; extend_from_slice avoids
         // the previous double-clone of both source lists.
         let result = {
-            let a = if let HeapObject::List(items) = &heap[a_idx] { items.as_slice() } else { &[] };
-            let b = if let HeapObject::List(items) = &heap[b_idx] { items.as_slice() } else { &[] };
+            let a = if let HeapObject::List(items) = &heap[a_idx] {
+                items.as_slice()
+            } else {
+                &[]
+            };
+            let b = if let HeapObject::List(items) = &heap[b_idx] {
+                items.as_slice()
+            } else {
+                &[]
+            };
             let mut out = Vec::with_capacity(a.len() + b.len());
             out.extend_from_slice(a);
             out.extend_from_slice(b);
@@ -2497,20 +3410,36 @@ fn binary_add(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
         heap.push(HeapObject::List(result));
         return Ok(Value::list_ref(heap_idx));
     }
-    Err(PythonError::runtime("unsupported operand type(s) for +", line))
+    Err(PythonError::runtime(
+        "unsupported operand type(s) for +",
+        line,
+    ))
 }
 
-fn binary_sub(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+fn binary_sub(
+    left: Value,
+    right: Value,
+    heap: &mut Vec<HeapObject>,
+    line: u32,
+) -> Result<Value, PythonError> {
     if let Some((a, b)) = pyint_pair(left, right, heap) {
         return Ok(a.sub(b).into_value(heap));
     }
     if let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap)) {
         return Ok(Value::float(a - b));
     }
-    Err(PythonError::runtime("unsupported operand type(s) for -", line))
+    Err(PythonError::runtime(
+        "unsupported operand type(s) for -",
+        line,
+    ))
 }
 
-fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+fn binary_mul(
+    left: Value,
+    right: Value,
+    heap: &mut Vec<HeapObject>,
+    line: u32,
+) -> Result<Value, PythonError> {
     if let Some((a, b)) = pyint_pair(left, right, heap) {
         return Ok(a.mul(b).into_value(heap));
     }
@@ -2520,39 +3449,59 @@ fn binary_mul(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
         return Ok(Value::float(a * b));
     }
     // String repetition — count comes from the int side (small only for now).
-    if let Some(s_idx) = left.as_str_ref() && let Some(n) = right.as_int() {
+    if let Some(s_idx) = left.as_str_ref()
+        && let Some(n) = right.as_int()
+    {
         let s = heap_str(heap, s_idx)?;
         let heap_idx = heap.len();
         heap.push(HeapObject::Str(s.repeat(n.max(0) as usize).into()));
         return Ok(Value::str_ref(heap_idx));
     }
-    if let Some(n) = left.as_int() && let Some(s_idx) = right.as_str_ref() {
+    if let Some(n) = left.as_int()
+        && let Some(s_idx) = right.as_str_ref()
+    {
         let s = heap_str(heap, s_idx)?;
         let heap_idx = heap.len();
         heap.push(HeapObject::Str(s.repeat(n.max(0) as usize).into()));
         return Ok(Value::str_ref(heap_idx));
     }
-    Err(PythonError::runtime("unsupported operand type(s) for *", line))
+    Err(PythonError::runtime(
+        "unsupported operand type(s) for *",
+        line,
+    ))
 }
 
-fn binary_div(left: Value, right: Value, heap: &[HeapObject], line: u32) -> Result<Value, PythonError> {
+fn binary_div(
+    left: Value,
+    right: Value,
+    heap: &[HeapObject],
+    line: u32,
+) -> Result<Value, PythonError> {
     // Python `/` is always true-division, returns float.
     if let Some((a, b)) = pyint_pair(left, right, heap) {
         return pyint_truediv(a, b)
             .map(Value::float)
             .map_err(|e| arith_to_runtime(e, "division", line));
     }
-    let af = value_to_f64(left, heap).ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
-    let bf = value_to_f64(right, heap).ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
+    let af = value_to_f64(left, heap)
+        .ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
+    let bf = value_to_f64(right, heap)
+        .ok_or_else(|| PythonError::runtime("unsupported operand type(s) for /", line))?;
     if bf == 0.0 {
         return Err(PythonError::runtime("division by zero", line));
     }
     Ok(Value::float(af / bf))
 }
 
-fn binary_floor_div(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+fn binary_floor_div(
+    left: Value,
+    right: Value,
+    heap: &mut Vec<HeapObject>,
+    line: u32,
+) -> Result<Value, PythonError> {
     if let Some((a, b)) = pyint_pair(left, right, heap) {
-        return a.floordiv(b)
+        return a
+            .floordiv(b)
             .map(|r| r.into_value(heap))
             .map_err(|e| arith_to_runtime(e, "integer division or modulo", line));
     }
@@ -2562,12 +3511,21 @@ fn binary_floor_div(left: Value, right: Value, heap: &mut Vec<HeapObject>, line:
         }
         return Ok(Value::float((a / b).floor()));
     }
-    Err(PythonError::runtime("unsupported operand type(s) for //", line))
+    Err(PythonError::runtime(
+        "unsupported operand type(s) for //",
+        line,
+    ))
 }
 
-fn binary_mod(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+fn binary_mod(
+    left: Value,
+    right: Value,
+    heap: &mut Vec<HeapObject>,
+    line: u32,
+) -> Result<Value, PythonError> {
     if let Some((a, b)) = pyint_pair(left, right, heap) {
-        return a.mod_(b)
+        return a
+            .mod_(b)
             .map(|r| r.into_value(heap))
             .map_err(|e| arith_to_runtime(e, "integer division or modulo", line));
     }
@@ -2577,20 +3535,31 @@ fn binary_mod(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) 
         }
         return Ok(Value::float(((a % b) + b) % b));
     }
-    Err(PythonError::runtime("unsupported operand type(s) for %", line))
+    Err(PythonError::runtime(
+        "unsupported operand type(s) for %",
+        line,
+    ))
 }
 
-fn binary_pow(left: Value, right: Value, heap: &mut Vec<HeapObject>, line: u32) -> Result<Value, PythonError> {
+fn binary_pow(
+    left: Value,
+    right: Value,
+    heap: &mut Vec<HeapObject>,
+    line: u32,
+) -> Result<Value, PythonError> {
     if let Some((a, b)) = pyint_pair(left, right, heap) {
         return Ok(match a.pow(b) {
-            PyPowResult::Int(o)   => o.into_value(heap),
+            PyPowResult::Int(o) => o.into_value(heap),
             PyPowResult::Float(f) => Value::float(f),
         });
     }
     if let (Some(a), Some(b)) = (value_to_f64(left, heap), value_to_f64(right, heap)) {
         return Ok(Value::float(a.powf(b)));
     }
-    Err(PythonError::runtime("unsupported operand type(s) for **", line))
+    Err(PythonError::runtime(
+        "unsupported operand type(s) for **",
+        line,
+    ))
 }
 
 fn compare(
@@ -2638,7 +3607,9 @@ fn contains(item: &Value, container: &Value, heap: &[HeapObject]) -> Result<bool
             HeapObject::Tuple(items) => {
                 return Ok(items.iter().any(|v| values_equal(*item, *v, heap)));
             }
-            HeapObject::Dict { keys, index_map, .. } => {
+            HeapObject::Dict {
+                keys, index_map, ..
+            } => {
                 let h = value_hash(*item, heap);
                 if let Some(&i) = index_map.get(&h)
                     && i < keys.len()
@@ -2647,9 +3618,17 @@ fn contains(item: &Value, container: &Value, heap: &[HeapObject]) -> Result<bool
                     return Ok(true);
                 }
                 // Hash-collision fallback.
-                return Ok(keys.iter().any(|k| value_hash(*k, heap) == h && values_equal(*item, *k, heap)));
+                return Ok(keys
+                    .iter()
+                    .any(|k| value_hash(*k, heap) == h && values_equal(*item, *k, heap)));
             }
-            HeapObject::Set(items) => {
+            HeapObject::Set { items, index_map } => {
+                let h = value_hash(*item, heap);
+                if let Some(&i) = index_map.get(&h)
+                    && values_equal(*item, items[i], heap)
+                {
+                    return Ok(true);
+                }
                 return Ok(items.iter().any(|v| values_equal(*item, *v, heap)));
             }
             _ => {}
@@ -2711,7 +3690,8 @@ mod tests {
 
     #[test]
     fn test_if_else() {
-        let output = run_and_capture("x = 5\nif x > 3:\n    print(\"yes\")\nelse:\n    print(\"no\")\n");
+        let output =
+            run_and_capture("x = 5\nif x > 3:\n    print(\"yes\")\nelse:\n    print(\"no\")\n");
         assert_eq!(output, vec!["yes"]);
     }
 
@@ -2754,8 +3734,8 @@ mod tests {
 "#;
         let output = run_and_capture(src);
         let expected = vec![
-            "1", "2", "Fizz", "4", "Buzz", "Fizz", "7", "8", "Fizz", "Buzz",
-            "11", "Fizz", "13", "14", "FizzBuzz", "16", "17", "Fizz", "19", "Buzz",
+            "1", "2", "Fizz", "4", "Buzz", "Fizz", "7", "8", "Fizz", "Buzz", "11", "Fizz", "13",
+            "14", "FizzBuzz", "16", "17", "Fizz", "19", "Buzz",
         ];
         assert_eq!(output, expected);
     }
@@ -2808,10 +3788,13 @@ print(fib(10))
         assert_eq!(output[0], "13");
         assert_eq!(output[1], "True");
         let fizzbuzz = &output[2..22];
-        assert_eq!(fizzbuzz, &[
-            "1", "2", "Fizz", "4", "Buzz", "Fizz", "7", "8", "Fizz", "Buzz",
-            "11", "Fizz", "13", "14", "FizzBuzz", "16", "17", "Fizz", "19", "Buzz",
-        ]);
+        assert_eq!(
+            fizzbuzz,
+            &[
+                "1", "2", "Fizz", "4", "Buzz", "Fizz", "7", "8", "Fizz", "Buzz", "11", "Fizz",
+                "13", "14", "FizzBuzz", "16", "17", "Fizz", "19", "Buzz",
+            ]
+        );
         assert_eq!(output[22], "55");
     }
 
@@ -2844,9 +3827,7 @@ print(fib(10))
     fn bigint_subtraction_demotes_to_small() {
         // Difference of two big ints that fits in i48 — verify demote works
         // end-to-end (result prints as a small int).
-        let out = run_and_capture(
-            "x = 100 ** 10\ny = 100 ** 10 - 7\nprint(x - y)\n"
-        );
+        let out = run_and_capture("x = 100 ** 10\ny = 100 ** 10 - 7\nprint(x - y)\n");
         assert_eq!(out, vec!["7"]);
     }
 
@@ -2883,7 +3864,10 @@ print(fib(10))
     #[test]
     fn bigint_division_by_zero_errors() {
         let err = run_expect_err("print(1 // 0)\n");
-        assert!(err.contains("by zero"), "expected division-by-zero error, got: {err}");
+        assert!(
+            err.contains("by zero"),
+            "expected division-by-zero error, got: {err}"
+        );
     }
 
     #[test]
@@ -2916,7 +3900,7 @@ print(fib(10))
         // The real cross-rep test: keep one side BigInt by not subtracting
         // all the way back.
         let out = run_and_capture(
-            "a = 7\nb = (1 << 80) - ((1 << 80) - 7)\nprint(a == b)\nprint(a < b)\n"
+            "a = 7\nb = (1 << 80) - ((1 << 80) - 7)\nprint(a == b)\nprint(a < b)\n",
         );
         assert_eq!(out, vec!["True", "False"]);
     }
@@ -2924,9 +3908,7 @@ print(fib(10))
     #[test]
     fn bigint_dict_key_hashes_correctly() {
         // Hash dispatch through PyInt::hash — BigInt key in a dict.
-        let out = run_and_capture(
-            "x = 2 ** 100\nd = {x: \"hello\"}\nprint(d[2 ** 100])\n"
-        );
+        let out = run_and_capture("x = 2 ** 100\nd = {x: \"hello\"}\nprint(d[2 ** 100])\n");
         assert_eq!(out, vec!["hello"]);
     }
 
@@ -2935,9 +3917,7 @@ print(fib(10))
         // hash(True) == hash(1) AND True == 1, so d[True] should find the
         // entry stored at key 1. (BUILD_DICT dedup of duplicate-equal keys
         // is a separate concern, not exercised here.)
-        let out = run_and_capture(
-            "d = {1: \"hello\"}\nprint(d[True])\n"
-        );
+        let out = run_and_capture("d = {1: \"hello\"}\nprint(d[True])\n");
         assert_eq!(out, vec!["hello"]);
     }
 
@@ -2946,7 +3926,7 @@ print(fib(10))
         // BigInt 7 (constructed via overflow path then demoted, then promoted
         // again) hashes and compares equal to small int 7.
         let out = run_and_capture(
-            "d = {7: \"hello\"}\nbig_seven = (10 ** 20) // (10 ** 20 // 7)\nprint(d[big_seven])\n"
+            "d = {7: \"hello\"}\nbig_seven = (10 ** 20) // (10 ** 20 // 7)\nprint(d[big_seven])\n",
         );
         assert_eq!(out, vec!["hello"]);
     }
@@ -2971,8 +3951,8 @@ print(fib(10))
     fn bigint_literal_huge() {
         // 100-digit literal — well past anything i64 can express.
         let huge = "1".to_owned() + &"0".repeat(99);
-        let src  = format!("print({huge})\n");
-        let out  = run_and_capture(&src);
+        let src = format!("print({huge})\n");
+        let out = run_and_capture(&src);
         assert_eq!(out, vec![huge]);
     }
 
@@ -3105,22 +4085,26 @@ print(fib(10))
     #[test]
     fn import_sys_twice_returns_same_module() {
         // Both binds should refer to the same module Value (sys.modules cache hit).
-        let out = run_and_capture(
-            "import sys\na = sys\nimport sys\nprint(a is sys)\n"
-        );
+        let out = run_and_capture("import sys\na = sys\nimport sys\nprint(a is sys)\n");
         assert_eq!(out, vec!["True"]);
     }
 
     #[test]
     fn import_missing_module_errors_with_clear_message() {
         let err = run_expect_err("import does_not_exist_module\n");
-        assert!(err.contains("No module named 'does_not_exist_module'"), "got: {err}");
+        assert!(
+            err.contains("No module named 'does_not_exist_module'"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn from_sys_import_missing_attribute_errors() {
         let err = run_expect_err("from sys import nonexistent_attribute\n");
-        assert!(err.contains("cannot import name 'nonexistent_attribute' from 'sys'"), "got: {err}");
+        assert!(
+            err.contains("cannot import name 'nonexistent_attribute' from 'sys'"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -3177,7 +4161,8 @@ print(fib(10))
         std::fs::write(
             dir.path().join("noisy.py"),
             "print('body executed')\nv = 1\n",
-        ).unwrap();
+        )
+        .unwrap();
         let out = run_with_sys_path(
             "import noisy\nimport noisy\nprint(noisy.v)\n",
             vec![dir.path().to_path_buf()],
@@ -3193,7 +4178,8 @@ print(fib(10))
         std::fs::write(
             dir.path().join("strings.py"),
             "GREETING = 'hello'\nFAREWELL = 'goodbye'\n",
-        ).unwrap();
+        )
+        .unwrap();
         let out = run_with_sys_path(
             "from strings import GREETING, FAREWELL as bye\nprint(GREETING)\nprint(bye)\n",
             vec![dir.path().to_path_buf()],
@@ -3208,7 +4194,10 @@ print(fib(10))
             "import not_a_real_module\n",
             vec![dir.path().to_path_buf()],
         );
-        assert!(err.contains("No module named 'not_a_real_module'"), "got: {err}");
+        assert!(
+            err.contains("No module named 'not_a_real_module'"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -3219,7 +4208,8 @@ print(fib(10))
         std::fs::write(
             dir.path().join("computed.py"),
             "a = 1\nb = 2\nsum_ab = a + b\n",
-        ).unwrap();
+        )
+        .unwrap();
         let out = run_with_sys_path(
             "import computed\nprint(computed.sum_ab)\n",
             vec![dir.path().to_path_buf()],
@@ -3235,7 +4225,10 @@ print(fib(10))
             "import partial\nprint(partial.undefined)\n",
             vec![dir.path().to_path_buf()],
         );
-        assert!(err.contains("module 'partial' has no attribute 'undefined'"), "got: {err}");
+        assert!(
+            err.contains("module 'partial' has no attribute 'undefined'"),
+            "got: {err}"
+        );
     }
 
     // ---------- M3 commit 6: packages, relative imports, cycles ----------
@@ -3317,11 +4310,11 @@ print(fib(10))
     fn relative_import_at_module_level_errors() {
         let dir = tempfile::tempdir().unwrap();
         // Script at top level uses relative import — should fail.
-        let err = run_with_sys_path_expect_err(
-            "from . import x\n",
-            vec![dir.path().to_path_buf()],
+        let err = run_with_sys_path_expect_err("from . import x\n", vec![dir.path().to_path_buf()]);
+        assert!(
+            err.contains("attempted relative import with no known parent package"),
+            "got: {err}"
         );
-        assert!(err.contains("attempted relative import with no known parent package"), "got: {err}");
     }
 
     #[test]
@@ -3344,10 +4337,8 @@ print(fib(10))
         // a imports b which imports a. Both bodies complete via cache-
         // before-execute. Post-cycle attributes are readable.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.py"),
-            "import b\nx = 1\n").unwrap();
-        std::fs::write(dir.path().join("b.py"),
-            "import a\ny = 2\n").unwrap();
+        std::fs::write(dir.path().join("a.py"), "import b\nx = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "import a\ny = 2\n").unwrap();
         let out = run_with_sys_path(
             "import a\nimport b\nprint(a.x)\nprint(b.y)\n",
             vec![dir.path().to_path_buf()],
@@ -3363,10 +4354,8 @@ print(fib(10))
         // Frame::module_idx routing makes the live module's globals the
         // single source of truth, so partial-attribute access works.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.py"),
-            "x = 1\nimport b\ny = 2\n").unwrap();
-        std::fs::write(dir.path().join("b.py"),
-            "import a\nobserved_x = a.x\n").unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\nimport b\ny = 2\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "import a\nobserved_x = a.x\n").unwrap();
         let out = run_with_sys_path(
             "import a\nimport b\nprint(a.x)\nprint(a.y)\nprint(b.observed_x)\n",
             vec![dir.path().to_path_buf()],
@@ -3387,7 +4376,8 @@ print(fib(10))
             "PREFIX = 'mod-says: '\n\
              def greet(name):\n    \
                  return PREFIX + name\n",
-        ).unwrap();
+        )
+        .unwrap();
         let out = run_with_sys_path(
             "import helpers\nprint(helpers.greet('world'))\n",
             vec![dir.path().to_path_buf()],
@@ -3403,7 +4393,8 @@ print(fib(10))
         std::fs::write(
             dir.path().join("isolated.py"),
             "def fetch():\n    return main_secret\n",
-        ).unwrap();
+        )
+        .unwrap();
         let err = run_with_sys_path_expect_err(
             "main_secret = 'leaked'\nimport isolated\nprint(isolated.fetch())\n",
             vec![dir.path().to_path_buf()],
@@ -3423,7 +4414,8 @@ print(fib(10))
         std::fs::write(
             dir.path().join("uses_builtins.py"),
             "def make_three():\n    return len('abc')\n",
-        ).unwrap();
+        )
+        .unwrap();
         let out = run_with_sys_path(
             "import uses_builtins\nprint(uses_builtins.make_three())\n",
             vec![dir.path().to_path_buf()],
@@ -3440,7 +4432,11 @@ print(fib(10))
         let (cos, heap) = compile("def f(a, b, c):\n    return a + b + c\n");
         // Find the function's code object (compiler emits it after the module).
         let f_co = cos.iter().find(|c| c.name == "f").expect("f code object");
-        assert_eq!(f_co.num_locals, 3, "expected 3 locals (a, b, c); got {}", f_co.num_locals);
+        assert_eq!(
+            f_co.num_locals, 3,
+            "expected 3 locals (a, b, c); got {}",
+            f_co.num_locals
+        );
 
         // Push a frame for it and verify locals box length matches.
         let vm = VM::new(cos.clone(), heap);
@@ -3459,7 +4455,7 @@ print(fib(10))
              print(len([1, 2, 3]))\n\
              print(len((1, 2, 3, 4)))\n\
              print(len({1: 'a', 2: 'b'}))\n\
-             print(len({1, 2, 3, 4, 5}))\n"
+             print(len({1, 2, 3, 4, 5}))\n",
         );
         assert_eq!(out, vec!["5", "3", "4", "2", "5"]);
     }
@@ -3469,7 +4465,7 @@ print(fib(10))
         let out = run_and_capture(
             "for i in range(3):\n    print(i)\n\
              for i in range(2, 5):\n    print(i)\n\
-             for i in range(0, 10, 3):\n    print(i)\n"
+             for i in range(0, 10, 3):\n    print(i)\n",
         );
         assert_eq!(out, vec!["0", "1", "2", "2", "3", "4", "0", "3", "6", "9"]);
     }
@@ -3478,7 +4474,7 @@ print(fib(10))
     fn builtin_type_on_various() {
         let out = run_and_capture(
             "print(type(1))\nprint(type(1.5))\nprint(type('a'))\n\
-             print(type(True))\nprint(type(None))\nprint(type([1]))\n"
+             print(type(True))\nprint(type(None))\nprint(type([1]))\n",
         );
         assert!(out[0].contains("int"));
         assert!(out[1].contains("float"));
@@ -3494,14 +4490,14 @@ print(fib(10))
             "print(int(3.7))\nprint(int('42'))\nprint(int(True))\n\
              print(str(123))\nprint(str(True))\n\
              print(float(3))\nprint(float('1.5'))\n\
-             print(bool(0))\nprint(bool(1))\nprint(bool(''))\nprint(bool('x'))\n"
+             print(bool(0))\nprint(bool(1))\nprint(bool(''))\nprint(bool('x'))\n",
         );
-        assert_eq!(out, vec![
-            "3", "42", "1",
-            "123", "True",
-            "3.0", "1.5",
-            "False", "True", "False", "True",
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                "3", "42", "1", "123", "True", "3.0", "1.5", "False", "True", "False", "True",
+            ]
+        );
     }
 
     #[test]
@@ -3509,7 +4505,7 @@ print(fib(10))
         let out = run_and_capture(
             "print(abs(-5))\nprint(abs(3.14))\n\
              print(min(1, 2, 3))\nprint(max(1, 2, 3))\n\
-             print(min(-1, -2, -3))\nprint(max(-1, -2, -3))\n"
+             print(min(-1, -2, -3))\nprint(max(-1, -2, -3))\n",
         );
         assert_eq!(out, vec!["5", "3.14", "1", "3", "-3", "-1"]);
     }
@@ -3523,7 +4519,7 @@ print(fib(10))
              print(isinstance(d, Dog))\n\
              print(isinstance(d, Animal))\n\
              print(issubclass(Dog, Animal))\n\
-             print(issubclass(Animal, Dog))\n"
+             print(issubclass(Animal, Dog))\n",
         );
         assert_eq!(out, vec!["True", "True", "True", "False"]);
     }
@@ -3537,16 +4533,15 @@ print(fib(10))
              print(hasattr(c, 'y'))\n\
              print(getattr(c, 'x'))\n\
              setattr(c, 'y', 20)\n\
-             print(c.y)\n"
+             print(c.y)\n",
         );
         assert_eq!(out, vec!["True", "False", "10", "20"]);
     }
 
     #[test]
     fn builtin_id_returns_distinct_for_different_objects() {
-        let out = run_and_capture(
-            "a = [1]\nb = [1]\nprint(id(a) == id(b))\nprint(id(a) == id(a))\n"
-        );
+        let out =
+            run_and_capture("a = [1]\nb = [1]\nprint(id(a) == id(b))\nprint(id(a) == id(a))\n");
         assert_eq!(out, vec!["False", "True"]);
     }
 
@@ -3558,17 +4553,20 @@ print(fib(10))
              x.reverse()\nprint(x)\n\
              y = x.pop()\nprint(y)\nprint(x)\n\
              x.insert(0, 99)\nprint(x)\n\
-             x.extend([100, 101])\nprint(x)\n"
+             x.extend([100, 101])\nprint(x)\n",
         );
-        assert_eq!(out, vec![
-            "[3, 1, 2, 4]",
-            "[1, 2, 3, 4]",
-            "[4, 3, 2, 1]",
-            "1",
-            "[4, 3, 2]",
-            "[99, 4, 3, 2]",
-            "[99, 4, 3, 2, 100, 101]",
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                "[3, 1, 2, 4]",
+                "[1, 2, 3, 4]",
+                "[4, 3, 2, 1]",
+                "1",
+                "[4, 3, 2]",
+                "[99, 4, 3, 2]",
+                "[99, 4, 3, 2, 100, 101]",
+            ]
+        );
     }
 
     #[test]
@@ -3581,40 +4579,51 @@ print(fib(10))
              print(s.replace('World', 'Rust'))\n\
              print(s.startswith('Hello'))\nprint(s.endswith('World'))\n\
              print(s.find('World'))\nprint(s.find('Bar'))\n\
-             print('  hi  '.strip())\n"
+             print('  hi  '.strip())\n",
         );
-        assert_eq!(out, vec![
-            "HELLO WORLD",
-            "hello world",
-            "['Hello', 'World']",
-            "a-b-c",
-            "Hello Rust",
-            "True", "True",
-            "6", "-1",
-            "hi",
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                "HELLO WORLD",
+                "hello world",
+                "['Hello', 'World']",
+                "a-b-c",
+                "Hello Rust",
+                "True",
+                "True",
+                "6",
+                "-1",
+                "hi",
+            ]
+        );
     }
 
     #[test]
     fn builtin_dict_methods() {
         // Dict iteration order is insertion order. No sorted() yet so we
-        // assert directly. dict.pop is excluded — has a pre-existing bug
-        // (passes empty heap to value_hash, broken for string keys).
+        // assert directly.
         let out = run_and_capture(
             "d = {'a': 1, 'b': 2}\n\
              print(d.keys())\n\
              print(d.values())\n\
              print(d.get('a'))\n\
              print(d.get('missing'))\n\
-             print(d.get('missing', 99))\n"
+             print(d.get('missing', 99))\n\
+             v = d.pop('a')\nprint(v)\nprint('a' in d)\nprint('b' in d)\n",
         );
-        assert_eq!(out, vec![
-            "['a', 'b']",
-            "[1, 2]",
-            "1",
-            "None",
-            "99",
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                "['a', 'b']",
+                "[1, 2]",
+                "1",
+                "None",
+                "99",
+                "1",
+                "False",
+                "True",
+            ]
+        );
     }
 
     // ---------- Coverage batch: opcodes and control flow ----------
@@ -3628,7 +4637,7 @@ print(fib(10))
              print(12 ^ 10)\n\
              print(~5)\n\
              print(1 << 4)\n\
-             print(256 >> 3)\n"
+             print(256 >> 3)\n",
         );
         assert_eq!(out, vec!["8", "14", "6", "-6", "16", "32"]);
     }
@@ -3637,16 +4646,17 @@ print(fib(10))
     fn unary_not_and_pos() {
         let out = run_and_capture(
             "print(not True)\nprint(not False)\nprint(not 0)\nprint(not [])\nprint(not 'x')\n\
-             print(+5)\nprint(+3.14)\n"
+             print(+5)\nprint(+3.14)\n",
         );
-        assert_eq!(out, vec!["False", "True", "True", "True", "False", "5", "3.14"]);
+        assert_eq!(
+            out,
+            vec!["False", "True", "True", "True", "False", "5", "3.14"]
+        );
     }
 
     #[test]
     fn is_and_is_not_operators() {
-        let out = run_and_capture(
-            "a = None\nb = None\nprint(a is b)\nprint(a is not 1)\n"
-        );
+        let out = run_and_capture("a = None\nb = None\nprint(a is b)\nprint(a is not 1)\n");
         assert_eq!(out, vec!["True", "True"]);
     }
 
@@ -3654,7 +4664,7 @@ print(fib(10))
     fn lambda_basic() {
         let out = run_and_capture(
             "f = lambda x: x * 2\nprint(f(7))\n\
-             g = lambda a, b: a + b\nprint(g(3, 4))\n"
+             g = lambda a, b: a + b\nprint(g(3, 4))\n",
         );
         assert_eq!(out, vec!["14", "7"]);
     }
@@ -3670,17 +4680,21 @@ print(fib(10))
                  except ValueError as e:\n        \
                      return 'caught'\n\
              print(f(0))\n\
-             print(f(1))\n"
+             print(f(1))\n",
         );
         assert_eq!(out, vec!["caught", "ok"]);
     }
 
     #[test]
     fn list_indexing_basic() {
-        let out = run_and_capture(
-            "x = [1, 2, 3, 4, 5]\nprint(x[0])\nprint(x[-1])\nprint(x[2])\n"
-        );
+        let out = run_and_capture("x = [1, 2, 3, 4, 5]\nprint(x[0])\nprint(x[-1])\nprint(x[2])\n");
         assert_eq!(out, vec!["1", "5", "3"]);
+    }
+
+    #[test]
+    fn string_indexing_basic() {
+        let out = run_and_capture("s = 'hello'\nprint(s[0])\nprint(s[-1])\nprint(s[2])\n");
+        assert_eq!(out, vec!["h", "o", "l"]);
     }
 
     #[test]
@@ -3689,7 +4703,7 @@ print(fib(10))
             "d = {'a': 1, 'b': 2, 'c': 3}\n\
              for k in d:\n    \
                  print(k)\n\
-             print('a' in d)\nprint('z' in d)\n"
+             print('a' in d)\nprint('z' in d)\n",
         );
         assert!(out.len() == 5);
         assert_eq!(out[3], "True");
@@ -3703,7 +4717,7 @@ print(fib(10))
              x -= 3\nprint(x)\n\
              x *= 2\nprint(x)\n\
              x //= 4\nprint(x)\n\
-             x %= 3\nprint(x)\n"
+             x %= 3\nprint(x)\n",
         );
         assert_eq!(out, vec!["15", "12", "24", "6", "0"]);
     }
@@ -3713,7 +4727,7 @@ print(fib(10))
         let out = run_and_capture(
             "def add(a, b):\n    return a + b\n\
              def mul(a, b):\n    return a * b\n\
-             print(add(mul(2, 3), mul(4, 5)))\n"
+             print(add(mul(2, 3), mul(4, 5)))\n",
         );
         assert_eq!(out, vec!["26"]);
     }
@@ -3726,7 +4740,7 @@ print(fib(10))
                      continue\n    \
                  if i == 6:\n        \
                      break\n    \
-                 print(i)\n"
+                 print(i)\n",
         );
         assert_eq!(out, vec!["0", "1", "2", "4", "5"]);
     }
@@ -3774,7 +4788,7 @@ print(fib(10))
     #[test]
     fn raise_custom_exception_caught() {
         let out = run_and_capture(
-            "try:\n    raise RuntimeError('boom')\nexcept RuntimeError as e:\n    print('handled')\n"
+            "try:\n    raise RuntimeError('boom')\nexcept RuntimeError as e:\n    print('handled')\n",
         );
         assert_eq!(out, vec!["handled"]);
     }
@@ -3782,7 +4796,7 @@ print(fib(10))
     #[test]
     fn raise_subclass_catches_base() {
         let out = run_and_capture(
-            "try:\n    raise ValueError('bad')\nexcept Exception:\n    print('caught')\n"
+            "try:\n    raise ValueError('bad')\nexcept Exception:\n    print('caught')\n",
         );
         assert_eq!(out, vec!["caught"]);
     }
@@ -3793,7 +4807,7 @@ print(fib(10))
         // with all args provided + missing trailing works.
         let out = run_and_capture(
             "def greet(name):\n    return 'hi ' + name\n\
-             print(greet('alice'))\n"
+             print(greet('alice'))\n",
         );
         assert_eq!(out, vec!["hi alice"]);
     }
@@ -3804,7 +4818,7 @@ print(fib(10))
             "def a():\n    return b()\n\
              def b():\n    return c()\n\
              def c():\n    return 42\n\
-             print(a())\n"
+             print(a())\n",
         );
         assert_eq!(out, vec!["42"]);
     }
@@ -3817,7 +4831,7 @@ print(fib(10))
                  if i == 3:\n        \
                      break\n    \
                  i += 1\n\
-             print(i)\n"
+             print(i)\n",
         );
         assert_eq!(out, vec!["3"]);
     }
@@ -3829,7 +4843,7 @@ print(fib(10))
                  for j in range(3):\n        \
                      if j == 2:\n            \
                          break\n        \
-                     print(i, j)\n"
+                     print(i, j)\n",
         );
         assert_eq!(out.len(), 6); // 3 * 2 inner iterations
     }
@@ -3838,7 +4852,7 @@ print(fib(10))
     fn ternary_expression() {
         let out = run_and_capture(
             "x = 'positive' if 5 > 0 else 'negative'\nprint(x)\n\
-             y = 'negative' if -3 > 0 else 'non-positive'\nprint(y)\n"
+             y = 'negative' if -3 > 0 else 'non-positive'\nprint(y)\n",
         );
         assert_eq!(out, vec!["positive", "non-positive"]);
     }
@@ -3848,7 +4862,7 @@ print(fib(10))
         let out = run_and_capture(
             "print(True and 'a')\nprint(False and 'a')\n\
              print(True or 'a')\nprint(False or 'a')\n\
-             print(0 or 'fallback')\nprint(1 and 'used')\n"
+             print(0 or 'fallback')\nprint(1 and 'used')\n",
         );
         assert_eq!(out, vec!["a", "False", "True", "a", "fallback", "used"]);
     }
@@ -3857,16 +4871,14 @@ print(fib(10))
     fn multi_target_assignment() {
         let out = run_and_capture(
             "a, b = 1, 2\nprint(a)\nprint(b)\n\
-             x, y, z = [10, 20, 30]\nprint(x)\nprint(z)\n"
+             x, y, z = [10, 20, 30]\nprint(x)\nprint(z)\n",
         );
         assert_eq!(out, vec!["1", "2", "10", "30"]);
     }
 
     #[test]
     fn unicode_strings() {
-        let out = run_and_capture(
-            "print('héllo')\nprint(len('世界'))\n"
-        );
+        let out = run_and_capture("print('héllo')\nprint(len('世界'))\n");
         assert_eq!(out[0], "héllo");
     }
 
@@ -3882,19 +4894,38 @@ print(fib(10))
                      return self.n * 2\n    \
                  def triple(self):\n        \
                      return self.n * 3\n\
-             c = C(7)\nprint(c.double())\nprint(c.triple())\n"
+             c = C(7)\nprint(c.double())\nprint(c.triple())\n",
         );
         assert_eq!(out, vec!["14", "21"]);
     }
 
     #[test]
     fn class_instance_default_repr() {
-        // __repr__ dunder dispatch through print() isn't wired yet; default
-        // <Class instance> format is what we get. Pin that.
-        let out = run_and_capture(
-            "class Point:\n    pass\np = Point()\nprint(p)\n"
-        );
+        // No __repr__/__str__ defined → falls back to the default
+        // "<ClassName instance>" formatter.
+        let out = run_and_capture("class Point:\n    pass\np = Point()\nprint(p)\n");
         assert_eq!(out, vec!["<Point instance>"]);
+    }
+
+    #[test]
+    fn class_instance_dunder_repr_and_str() {
+        let out = run_and_capture(
+            "class P:\n    \
+                def __repr__(self):\n        return 'P-repr'\n    \
+                def __str__(self):\n        return 'P-str'\n\
+             p = P()\nprint(p)\nprint(repr(p))\nprint(str(p))\n",
+        );
+        assert_eq!(out, vec!["P-str", "P-repr", "P-str"]);
+    }
+
+    #[test]
+    fn class_instance_str_falls_back_to_repr() {
+        let out = run_and_capture(
+            "class O:\n    \
+                def __repr__(self):\n        return 'only-repr'\n\
+             o = O()\nprint(o)\nprint(str(o))\nprint(repr(o))\n",
+        );
+        assert_eq!(out, vec!["only-repr", "only-repr", "only-repr"]);
     }
 
     #[test]
@@ -3907,7 +4938,7 @@ print(fib(10))
     fn arithmetic_with_bigint_explicit() {
         let out = run_and_capture(
             "x = 1\nfor _ in range(20):\n    x = x * 10\n\
-             print(x)\n"
+             print(x)\n",
         );
         // 10^20 = 100000000000000000000
         assert_eq!(out, vec!["100000000000000000000"]);
@@ -3922,7 +4953,7 @@ print(fib(10))
                  yield 1\n    \
                  yield 2\n\
              g = gen()\n\
-             print('ok')\n"
+             print('ok')\n",
         );
         assert_eq!(out, vec!["ok"]);
     }
@@ -3936,17 +4967,24 @@ print(fib(10))
                          return 'big'\n        \
                      return 'small'\n    \
                  return 'non-positive'\n\
-             print(classify(5))\nprint(classify(200))\nprint(classify(-3))\n"
+             print(classify(5))\nprint(classify(200))\nprint(classify(-3))\n",
         );
         assert_eq!(out, vec!["small", "big", "non-positive"]);
     }
 
     #[test]
     fn multi_arg_min_max_with_floats() {
-        let out = run_and_capture(
-            "print(min(1.5, 0.5, 2.5))\nprint(max(1.5, 0.5, 2.5))\n"
-        );
+        let out = run_and_capture("print(min(1.5, 0.5, 2.5))\nprint(max(1.5, 0.5, 2.5))\n");
         assert_eq!(out, vec!["0.5", "2.5"]);
+    }
+
+    #[test]
+    fn min_max_with_strings() {
+        let out = run_and_capture(
+            "print(min('banana', 'apple', 'cherry'))\n\
+             print(max('banana', 'apple', 'cherry'))\n",
+        );
+        assert_eq!(out, vec!["apple", "cherry"]);
     }
 
     #[test]
@@ -3955,7 +4993,7 @@ print(fib(10))
             "pairs = [(1, 'a'), (2, 'b'), (3, 'c')]\n\
              for n, s in pairs:\n    \
                  print(n)\n    \
-                 print(s)\n"
+                 print(s)\n",
         );
         assert_eq!(out, vec!["1", "a", "2", "b", "3", "c"]);
     }
@@ -3980,7 +5018,7 @@ print(fib(10))
                  def inner(y):\n        \
                      return y * 2\n    \
                  return inner(x) + 1\n\
-             print(outer(5))\n"
+             print(outer(5))\n",
         );
         assert_eq!(out, vec!["11"]);
     }
@@ -3993,7 +5031,7 @@ print(fib(10))
              c.a = 1\n\
              c.b = 'hello'\n\
              c.c = [1, 2]\n\
-             print(c.a)\nprint(c.b)\nprint(c.c)\n"
+             print(c.a)\nprint(c.b)\nprint(c.c)\n",
         );
         assert_eq!(out, vec!["1", "hello", "[1, 2]"]);
     }
@@ -4003,7 +5041,7 @@ print(fib(10))
         let out = run_and_capture(
             "try:\n    raise ValueError('msg')\nexcept ValueError as e:\n    print('caught')\n\
              try:\n    raise KeyError('k')\nexcept KeyError:\n    print('key')\n\
-             try:\n    raise TypeError()\nexcept TypeError:\n    print('type')\n"
+             try:\n    raise TypeError()\nexcept TypeError:\n    print('type')\n",
         );
         assert_eq!(out, vec!["caught", "key", "type"]);
     }

@@ -55,6 +55,24 @@ struct LoopContext {
     continue_target: usize,
 }
 
+/// Backpatch handles returned by `emit_iter_loop_open` and consumed by
+/// `emit_iter_loop_close`. Carries the loop-back target and the FOR_ITER
+/// exit-jump offset that needs patching to land after the loop body.
+struct IterLoopFrame {
+    loop_start: usize,
+    for_iter_off: usize,
+}
+
+/// What kind of comprehension is being compiled, with the per-iteration
+/// element expressions bundled. `Copy` because every variant is just
+/// shared references into the AST.
+#[derive(Clone, Copy)]
+enum CompKind<'a> {
+    List(&'a Expr),
+    Set(&'a Expr),
+    Dict(&'a Expr, &'a Expr),
+}
+
 #[derive(Clone, Default)]
 struct ScopeInfo {
     globals: HashSet<String>,
@@ -62,6 +80,10 @@ struct ScopeInfo {
     cell_vars: HashSet<String>,
     free_vars: HashSet<String>,
     locals: HashSet<String>,
+    /// Parent scope's index in `scope_info`. None for the module-level
+    /// scope (root). Used to walk up the enclosing-scope chain when
+    /// resolving implicit free-variable captures.
+    parent: Option<usize>,
 }
 
 impl Compiler {
@@ -149,7 +171,10 @@ impl Compiler {
     fn find_local(&self, name: &str) -> Option<u32> {
         let idx = *self.code_stack.last().unwrap_or(&0);
         let code = &self.code_objects[idx];
-        code.local_names.iter().position(|n| n == name).map(|i| i as u32)
+        code.local_names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| i as u32)
     }
 
     fn is_module_level(&self) -> bool {
@@ -218,7 +243,8 @@ impl Compiler {
     fn has_closures(&self) -> bool {
         let co_idx = self.current_code_index();
         if co_idx < self.scope_info.len() {
-            !self.scope_info[co_idx].cell_vars.is_empty() || !self.scope_info[co_idx].free_vars.is_empty()
+            !self.scope_info[co_idx].cell_vars.is_empty()
+                || !self.scope_info[co_idx].free_vars.is_empty()
         } else {
             false
         }
@@ -244,75 +270,158 @@ impl Compiler {
 
     /// Simple scope analysis: find cell_vars and free_vars for closures.
     fn analyze_all_scopes(&mut self, module: &Module) {
-        // For module level
+        // For module level — root scope with no parent.
         self.scope_info.push(ScopeInfo::default());
-        // We do a simple analysis: scan for nested functions and their variable usage
         self.analyze_scope_stmts(&module.body, 0);
     }
 
-    fn analyze_scope_stmts(&mut self, stmts: &[Stmt], _parent_scope: usize) {
+    fn analyze_scope_stmts(&mut self, stmts: &[Stmt], parent_scope: usize) {
         for stmt in stmts {
-            if let Stmt::FunctionDef { body, .. } | Stmt::ClassDef { body, .. } = stmt {
-                let co_idx = self.scope_info.len();
-                let mut scope = ScopeInfo::default();
-
-                // Collect globals and nonlocals
-                collect_declarations(body, &mut scope);
-                // Collect assignment targets as locals
-                collect_locals(body, &mut scope);
-
-                // For function defs, add params as locals
-                if let Stmt::FunctionDef { params, .. } = stmt {
+            match stmt {
+                Stmt::FunctionDef { body, params, .. } => {
+                    let co_idx = self.scope_info.len();
+                    let mut scope = ScopeInfo {
+                        parent: Some(parent_scope),
+                        ..ScopeInfo::default()
+                    };
+                    collect_declarations(body, &mut scope);
+                    collect_locals(body, &mut scope);
                     for p in params {
                         scope.locals.insert(p.clone());
                     }
+                    self.scope_info.push(scope);
+                    self.analyze_scope_stmts(body, co_idx);
+                    self.compute_free_vars(co_idx, body);
                 }
-
-                self.scope_info.push(scope);
-
-                // Recurse into body
-                self.analyze_scope_stmts(body, co_idx);
-
-                // After analyzing children, compute free_vars and cell_vars
-                self.compute_free_vars(co_idx);
+                Stmt::ClassDef { body, .. } => {
+                    let co_idx = self.scope_info.len();
+                    let mut scope = ScopeInfo {
+                        parent: Some(parent_scope),
+                        ..ScopeInfo::default()
+                    };
+                    collect_declarations(body, &mut scope);
+                    collect_locals(body, &mut scope);
+                    self.scope_info.push(scope);
+                    self.analyze_scope_stmts(body, co_idx);
+                    self.compute_free_vars(co_idx, body);
+                }
+                // FunctionDef can be nested inside any control-flow body;
+                // recurse so its scope analysis still runs with the
+                // enclosing function's scope as parent.
+                Stmt::If {
+                    body,
+                    elif_clauses,
+                    else_body,
+                    ..
+                } => {
+                    self.analyze_scope_stmts(body, parent_scope);
+                    for (_, b) in elif_clauses {
+                        self.analyze_scope_stmts(b, parent_scope);
+                    }
+                    self.analyze_scope_stmts(else_body, parent_scope);
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                    self.analyze_scope_stmts(body, parent_scope);
+                }
+                Stmt::Try {
+                    body,
+                    handlers,
+                    else_body,
+                    finally_body,
+                    ..
+                } => {
+                    self.analyze_scope_stmts(body, parent_scope);
+                    for h in handlers {
+                        self.analyze_scope_stmts(&h.body, parent_scope);
+                    }
+                    self.analyze_scope_stmts(else_body, parent_scope);
+                    self.analyze_scope_stmts(finally_body, parent_scope);
+                }
+                _ => {}
             }
         }
     }
 
-    fn compute_free_vars(&mut self, scope_idx: usize) {
-        // Find variables referenced in inner scopes that are local to this scope
-        // This is simplified: we just look at nonlocal declarations
-        let scope = &self.scope_info[scope_idx];
-        let nonlocals: Vec<String> = scope.nonlocals.iter().cloned().collect();
-
-        // Mark nonlocals as free vars in this scope
+    fn compute_free_vars(&mut self, scope_idx: usize, body: &[Stmt]) {
+        // 1. Explicit `nonlocal` declarations always create cell/free pairs.
+        let nonlocals: Vec<String> = self.scope_info[scope_idx]
+            .nonlocals
+            .iter()
+            .cloned()
+            .collect();
         for name in &nonlocals {
             self.scope_info[scope_idx].free_vars.insert(name.clone());
-        }
-
-        // Find the enclosing scope that has these as locals and mark them as cell vars
-        // For simplicity, check all previous scopes
-        for name in &nonlocals {
-            for i in (0..scope_idx).rev() {
-                if self.scope_info[i].locals.contains(name) {
-                    self.scope_info[i].cell_vars.insert(name.clone());
+            // Find the nearest enclosing scope that owns this name and
+            // mark it as a cell variable there.
+            let mut cur = self.scope_info[scope_idx].parent;
+            while let Some(parent_idx) = cur {
+                if self.scope_info[parent_idx].locals.contains(name) {
+                    self.scope_info[parent_idx].cell_vars.insert(name.clone());
                     break;
                 }
+                cur = self.scope_info[parent_idx].parent;
             }
         }
 
-        // Also detect closures: inner function references outer locals
-        // Scan body of functions at this scope level for references to locals
-        // This is a simplified version - we just handle explicit nonlocal declarations
+        // 2. Implicit closure capture — walk the body for Name references
+        //    that are NOT locals/globals/nonlocals/params in THIS scope but ARE
+        //    locals in some enclosing scope (other than the module root, where
+        //    they would resolve via LOAD_GLOBAL instead).
+        let mut referenced = HashSet::new();
+        collect_name_refs(body, &mut referenced);
+        let scope = &self.scope_info[scope_idx];
+        let local_or_declared: HashSet<String> = scope
+            .locals
+            .iter()
+            .chain(scope.globals.iter())
+            .chain(scope.nonlocals.iter())
+            .cloned()
+            .collect();
+        let candidates: Vec<String> = referenced
+            .iter()
+            .filter(|n| !local_or_declared.contains(*n))
+            .cloned()
+            .collect();
+        for name in candidates {
+            // Any function scope strictly between this one and the owner
+            // must ALSO carry the name as a free var so MAKE_CLOSURE can
+            // thread it through. `chain` collects those pass-throughs.
+            let mut cur = self.scope_info[scope_idx].parent;
+            let mut chain: Vec<usize> = Vec::new();
+            while let Some(parent_idx) = cur {
+                if parent_idx == 0 {
+                    break;
+                }
+                if self.scope_info[parent_idx].locals.contains(&name) {
+                    self.scope_info[parent_idx].cell_vars.insert(name.clone());
+                    self.scope_info[scope_idx].free_vars.insert(name.clone());
+                    for inter in &chain {
+                        self.scope_info[*inter].free_vars.insert(name.clone());
+                    }
+                    break;
+                }
+                chain.push(parent_idx);
+                cur = self.scope_info[parent_idx].parent;
+            }
+        }
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), PythonError> {
         match stmt {
-            Stmt::Assign { target, value, line } => {
+            Stmt::Assign {
+                target,
+                value,
+                line,
+            } => {
                 self.compile_expr(value)?;
                 self.compile_store_target(target, *line)?;
             }
-            Stmt::AugAssign { target, op, value, line } => {
+            Stmt::AugAssign {
+                target,
+                op,
+                value,
+                line,
+            } => {
                 self.compile_load_target(target, *line)?;
                 self.compile_expr(value)?;
                 let binop = self.binop_to_opcode(op);
@@ -323,16 +432,37 @@ impl Compiler {
                 self.compile_expr(expr)?;
                 self.emit(op::POP_TOP, 0, *line);
             }
-            Stmt::If { condition, body, elif_clauses, else_body, line } => {
+            Stmt::If {
+                condition,
+                body,
+                elif_clauses,
+                else_body,
+                line,
+            } => {
                 self.compile_if(condition, body, elif_clauses, else_body, *line)?;
             }
-            Stmt::While { condition, body, line } => {
+            Stmt::While {
+                condition,
+                body,
+                line,
+            } => {
                 self.compile_while(condition, body, *line)?;
             }
-            Stmt::For { target, iter, body, line } => {
+            Stmt::For {
+                target,
+                iter,
+                body,
+                line,
+            } => {
                 self.compile_for(target, iter, body, *line)?;
             }
-            Stmt::FunctionDef { name, params, body, decorators, line } => {
+            Stmt::FunctionDef {
+                name,
+                params,
+                body,
+                decorators,
+                line,
+            } => {
                 self.compile_function_def(name, params, body, decorators, *line)?;
             }
             Stmt::Return { value, line } => {
@@ -358,10 +488,22 @@ impl Compiler {
                     self.emit(op::JUMP, target, *line);
                 }
             }
-            Stmt::ClassDef { name, bases, body, decorators: _, line } => {
+            Stmt::ClassDef {
+                name,
+                bases,
+                body,
+                decorators: _,
+                line,
+            } => {
                 self.compile_class_def(name, bases, body, *line)?;
             }
-            Stmt::Try { body, handlers, else_body, finally_body, line } => {
+            Stmt::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+                line,
+            } => {
                 self.compile_try(body, handlers, else_body, finally_body, *line)?;
             }
             Stmt::Raise { exc, line } => {
@@ -393,7 +535,13 @@ impl Compiler {
                 // Declarations are handled by scope analysis, no runtime code needed
             }
             Stmt::Import { names, line } => self.compile_import(names, *line)?,
-            Stmt::ImportFrom { module, names, level, is_star, line } => {
+            Stmt::ImportFrom {
+                module,
+                names,
+                level,
+                is_star,
+                line,
+            } => {
                 self.compile_import_from(module.as_deref(), names, *level, *is_star, *line)?;
             }
         }
@@ -535,13 +683,20 @@ impl Compiler {
                 self.emit(op::SUBSCRIPT, 0, line);
             }
             AssignTarget::Tuple(_) => {
-                return Err(PythonError::compile("cannot augmented-assign to tuple", line));
+                return Err(PythonError::compile(
+                    "cannot augmented-assign to tuple",
+                    line,
+                ));
             }
         }
         Ok(())
     }
 
-    fn compile_store_target(&mut self, target: &AssignTarget, line: u32) -> Result<(), PythonError> {
+    fn compile_store_target(
+        &mut self,
+        target: &AssignTarget,
+        line: u32,
+    ) -> Result<(), PythonError> {
         match target {
             AssignTarget::Name(name) => {
                 self.compile_store_name(name, line);
@@ -658,7 +813,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_while(&mut self, condition: &Expr, body: &[Stmt], line: u32) -> Result<(), PythonError> {
+    fn compile_while(
+        &mut self,
+        condition: &Expr,
+        body: &[Stmt],
+        line: u32,
+    ) -> Result<(), PythonError> {
         let loop_start = self.current_offset();
 
         self.loop_stack.push(LoopContext {
@@ -677,8 +837,9 @@ impl Compiler {
         self.emit(op::JUMP, loop_start as u32, line);
         self.patch_jump(exit_jump);
 
-        let ctx = self.loop_stack.pop()
-            .ok_or_else(|| PythonError::compile("internal: while-loop context missing on pop", line))?;
+        let ctx = self.loop_stack.pop().ok_or_else(|| {
+            PythonError::compile("internal: while-loop context missing on pop", line)
+        })?;
         for bp in ctx.break_patches {
             self.patch_jump(bp);
         }
@@ -686,59 +847,146 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_for(&mut self, target: &AssignTarget, iter: &Expr, body: &[Stmt], line: u32) -> Result<(), PythonError> {
-        self.compile_expr(iter)?;
-        self.emit(op::GET_ITER, 0, line);
-
-        // Store iterator in a temporary
+    fn compile_for(
+        &mut self,
+        target: &AssignTarget,
+        iter: &Expr,
+        body: &[Stmt],
+        line: u32,
+    ) -> Result<(), PythonError> {
         let iter_name = format!("__iter_{}__", target_name(target));
-        if self.is_module_level() {
-            let name_idx = self.add_name(&iter_name);
-            self.emit(op::STORE_GLOBAL, name_idx, line);
-        } else {
-            let local_idx = self.add_local(&iter_name);
-            self.emit(op::STORE_FAST, local_idx, line);
-        }
-
-        let loop_start = self.current_offset();
+        let frame = self.emit_iter_loop_open(iter, target, &iter_name, line)?;
 
         self.loop_stack.push(LoopContext {
             break_patches: Vec::new(),
-            continue_target: loop_start,
+            continue_target: frame.loop_start,
         });
-
-        // Load iterator and call FOR_ITER
-        if self.is_module_level() {
-            let name_idx = self.add_name(&iter_name);
-            self.emit(op::LOAD_GLOBAL, name_idx, line);
-        } else {
-            let local_idx = self.find_local(&iter_name)
-                .ok_or_else(|| PythonError::compile(
-                    format!("internal: for-loop iterator local '{iter_name}' missing"), line,
-                ))?;
-            self.emit(op::LOAD_FAST, local_idx, line);
-        }
-
-        let for_iter = self.current_offset();
-        self.emit(op::FOR_ITER, 0, line);
-
-        // Store current value in target variable(s)
-        self.compile_store_target(target, line)?;
 
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
 
-        self.emit(op::JUMP, loop_start as u32, line);
-        self.patch_jump(for_iter);
+        self.emit_iter_loop_close(&frame, line);
 
-        let ctx = self.loop_stack.pop()
-            .ok_or_else(|| PythonError::compile("internal: for-loop context missing on pop", line))?;
+        let ctx = self.loop_stack.pop().ok_or_else(|| {
+            PythonError::compile("internal: for-loop context missing on pop", line)
+        })?;
         for bp in ctx.break_patches {
             self.patch_jump(bp);
         }
 
         Ok(())
+    }
+
+    /// Compile the for/if/recurse part of a comprehension. The container
+    /// (list/set/dict) is already on the stack and stays there across
+    /// every iteration. `clauses[clause_idx..]` are the remaining
+    /// for-clauses (outermost at `clause_idx`); when exhausted we emit
+    /// the element append.
+    fn compile_comprehension(
+        &mut self,
+        clauses: &[ComprehensionClause],
+        clause_idx: usize,
+        kind: CompKind,
+        line: u32,
+    ) -> Result<(), PythonError> {
+        if clause_idx == clauses.len() {
+            // Innermost body: emit the element(s) and the *_ADD opcode.
+            // The container is below the element(s) on the stack — every
+            // *_ADD op pops them, mutates, and pushes the container back
+            // so it stays TOS for the next iteration.
+            match kind {
+                CompKind::List(elt) => {
+                    self.compile_expr(elt)?;
+                    self.emit(op::LIST_APPEND, 0, line);
+                }
+                CompKind::Set(elt) => {
+                    self.compile_expr(elt)?;
+                    self.emit(op::SET_ADD, 0, line);
+                }
+                CompKind::Dict(key, value) => {
+                    // MAP_ADD pops in order [key, value], so push value first.
+                    self.compile_expr(value)?;
+                    self.compile_expr(key)?;
+                    self.emit(op::MAP_ADD, 0, line);
+                }
+            }
+            return Ok(());
+        }
+
+        let clause = &clauses[clause_idx];
+        // Unique-per-comprehension name; the bytecode offset already
+        // distinguishes nested comprehensions in the same scope.
+        let iter_name = format!("__comp_iter_{}__", self.current_offset());
+        let frame = self.emit_iter_loop_open(&clause.iter, &clause.target, &iter_name, line)?;
+
+        let mut cond_jumps = Vec::new();
+        for cond in &clause.conditions {
+            self.compile_expr(cond)?;
+            let off = self.current_offset();
+            self.emit(op::JUMP_IF_FALSE, 0, line);
+            cond_jumps.push(off);
+        }
+
+        self.compile_comprehension(clauses, clause_idx + 1, kind, line)?;
+
+        // Filter misses land here so the loop-back JUMP carries them
+        // forward to the next iteration without escaping outer clauses.
+        for off in cond_jumps {
+            self.patch_jump(off);
+        }
+        self.emit_iter_loop_close(&frame, line);
+
+        Ok(())
+    }
+
+    /// Emits the iterator-store + loop-start + load + FOR_ITER + target-
+    /// store prologue shared by `compile_for` and `compile_comprehension`.
+    /// `iter_name` is the temporary slot used to keep the iterator alive
+    /// across iterations (FOR_ITER pops it each loop).
+    fn emit_iter_loop_open(
+        &mut self,
+        iter: &Expr,
+        target: &AssignTarget,
+        iter_name: &str,
+        line: u32,
+    ) -> Result<IterLoopFrame, PythonError> {
+        self.compile_expr(iter)?;
+        self.emit(op::GET_ITER, 0, line);
+        let is_module = self.is_module_level();
+        if is_module {
+            let name_idx = self.add_name(iter_name);
+            self.emit(op::STORE_GLOBAL, name_idx, line);
+        } else {
+            let local_idx = self.add_local(iter_name);
+            self.emit(op::STORE_FAST, local_idx, line);
+        }
+
+        let loop_start = self.current_offset();
+        if is_module {
+            let name_idx = self.add_name(iter_name);
+            self.emit(op::LOAD_GLOBAL, name_idx, line);
+        } else {
+            let local_idx = self.find_local(iter_name).ok_or_else(|| {
+                PythonError::compile(format!("internal: iter local '{iter_name}' missing"), line)
+            })?;
+            self.emit(op::LOAD_FAST, local_idx, line);
+        }
+
+        let for_iter_off = self.current_offset();
+        self.emit(op::FOR_ITER, 0, line);
+        self.compile_store_target(target, line)?;
+        Ok(IterLoopFrame {
+            loop_start,
+            for_iter_off,
+        })
+    }
+
+    /// Pair to `emit_iter_loop_open`: emits the loop-back JUMP and patches
+    /// the FOR_ITER exit to land immediately after it.
+    fn emit_iter_loop_close(&mut self, frame: &IterLoopFrame, line: u32) {
+        self.emit(op::JUMP, frame.loop_start as u32, line);
+        self.patch_jump(frame.for_iter_off);
     }
 
     fn compile_function_def(
@@ -1012,7 +1260,12 @@ impl Compiler {
                     }
                     self.prescan_locals(co, body);
                 }
-                Stmt::If { body, elif_clauses, else_body, .. } => {
+                Stmt::If {
+                    body,
+                    elif_clauses,
+                    else_body,
+                    ..
+                } => {
                     self.prescan_locals(co, body);
                     for (_, elif_body) in elif_clauses {
                         self.prescan_locals(co, elif_body);
@@ -1022,7 +1275,13 @@ impl Compiler {
                 Stmt::While { body, .. } => {
                     self.prescan_locals(co, body);
                 }
-                Stmt::Try { body, handlers, else_body, finally_body, .. } => {
+                Stmt::Try {
+                    body,
+                    handlers,
+                    else_body,
+                    finally_body,
+                    ..
+                } => {
                     self.prescan_locals(co, body);
                     for h in handlers {
                         if let Some(name) = &h.name
@@ -1088,13 +1347,22 @@ impl Compiler {
             Expr::Name { id, line } => {
                 self.compile_load_name(id, *line);
             }
-            Expr::BinOp { left, op: binop, right, line } => {
+            Expr::BinOp {
+                left,
+                op: binop,
+                right,
+                line,
+            } => {
                 self.compile_expr(left)?;
                 self.compile_expr(right)?;
                 let opcode = self.binop_to_opcode(binop);
                 self.emit(opcode, 0, *line);
             }
-            Expr::UnaryOp { op: unop, operand, line } => {
+            Expr::UnaryOp {
+                op: unop,
+                operand,
+                line,
+            } => {
                 self.compile_expr(operand)?;
                 let opcode = match unop {
                     UnaryOp::Neg => op::UNARY_NEG,
@@ -1104,10 +1372,20 @@ impl Compiler {
                 };
                 self.emit(opcode, 0, *line);
             }
-            Expr::Compare { left, ops, comparators, line } => {
+            Expr::Compare {
+                left,
+                ops,
+                comparators,
+                line,
+            } => {
                 self.compile_comparison(left, ops, comparators, *line)?;
             }
-            Expr::BoolOp { op: boolop, left, right, line } => {
+            Expr::BoolOp {
+                op: boolop,
+                left,
+                right,
+                line,
+            } => {
                 self.compile_expr(left)?;
                 match boolop {
                     BoolOpKind::And => {
@@ -1138,8 +1416,50 @@ impl Compiler {
             }
             Expr::Subscript { value, index, line } => {
                 self.compile_expr(value)?;
-                self.compile_expr(index)?;
-                self.emit(op::SUBSCRIPT, 0, *line);
+                if let Expr::Slice {
+                    start, stop, step, ..
+                } = index.as_ref()
+                {
+                    let none_const = self.add_const(Value::none());
+                    let emit_part =
+                        |co: &mut Self, part: &Option<Box<Expr>>| -> Result<(), PythonError> {
+                            match part {
+                                Some(e) => co.compile_expr(e)?,
+                                None => co.emit(op::LOAD_CONST, none_const, *line),
+                            }
+                            Ok(())
+                        };
+                    emit_part(self, start)?;
+                    emit_part(self, stop)?;
+                    emit_part(self, step)?;
+                    self.emit(op::SLICE_SUBSCRIPT, 0, *line);
+                } else {
+                    self.compile_expr(index)?;
+                    self.emit(op::SUBSCRIPT, 0, *line);
+                }
+            }
+            Expr::Slice { line, .. } => {
+                return Err(PythonError::compile(
+                    "slice syntax is only valid inside `[]`",
+                    *line,
+                ));
+            }
+            Expr::ListComp { elt, clauses, line } => {
+                self.emit(op::BUILD_LIST, 0, *line);
+                self.compile_comprehension(clauses, 0, CompKind::List(elt), *line)?;
+            }
+            Expr::SetComp { elt, clauses, line } => {
+                self.emit(op::BUILD_SET, 0, *line);
+                self.compile_comprehension(clauses, 0, CompKind::Set(elt), *line)?;
+            }
+            Expr::DictComp {
+                key,
+                value,
+                clauses,
+                line,
+            } => {
+                self.emit(op::BUILD_DICT, 0, *line);
+                self.compile_comprehension(clauses, 0, CompKind::Dict(key, value), *line)?;
             }
             Expr::List { elements, line } => {
                 for elem in elements {
@@ -1193,7 +1513,12 @@ impl Compiler {
                 let func_idx_const = self.add_const(Value::small_int_unchecked(func_co_idx as i64));
                 self.emit(op::MAKE_FUNCTION, func_idx_const, *line);
             }
-            Expr::IfExpr { body, test, orelse, line } => {
+            Expr::IfExpr {
+                body,
+                test,
+                orelse,
+                line,
+            } => {
                 self.compile_expr(test)?;
                 let jump_false = self.current_offset();
                 self.emit(op::JUMP_IF_FALSE, 0, *line);
@@ -1329,21 +1654,37 @@ fn collect_declarations(stmts: &[Stmt], scope: &mut ScopeInfo) {
 fn collect_locals(stmts: &[Stmt], scope: &mut ScopeInfo) {
     for stmt in stmts {
         match stmt {
-            Stmt::Assign { target, .. } | Stmt::AugAssign { target, .. } => {
+            Stmt::Assign { target, value, .. } | Stmt::AugAssign { target, value, .. } => {
                 collect_target_names(target, scope);
+                collect_comp_targets_in_expr(value, scope);
             }
-            Stmt::For { target, body, .. } => {
+            Stmt::ExprStmt { expr, .. } => collect_comp_targets_in_expr(expr, scope),
+            Stmt::For {
+                target, iter, body, ..
+            } => {
                 collect_target_names(target, scope);
+                collect_comp_targets_in_expr(iter, scope);
                 collect_locals(body, scope);
             }
-            Stmt::If { body, elif_clauses, else_body, .. } => {
+            Stmt::If {
+                condition,
+                body,
+                elif_clauses,
+                else_body,
+                ..
+            } => {
+                collect_comp_targets_in_expr(condition, scope);
                 collect_locals(body, scope);
-                for (_, b) in elif_clauses {
+                for (c, b) in elif_clauses {
+                    collect_comp_targets_in_expr(c, scope);
                     collect_locals(b, scope);
                 }
                 collect_locals(else_body, scope);
             }
-            Stmt::While { body, .. } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_comp_targets_in_expr(condition, scope);
                 collect_locals(body, scope);
             }
             Stmt::FunctionDef { name, .. } => {
@@ -1352,8 +1693,108 @@ fn collect_locals(stmts: &[Stmt], scope: &mut ScopeInfo) {
             Stmt::ClassDef { name, .. } => {
                 scope.locals.insert(name.clone());
             }
+            Stmt::Return { value: Some(v), .. } | Stmt::Raise { exc: Some(v), .. } => {
+                collect_comp_targets_in_expr(v, scope);
+            }
             _ => {}
         }
+    }
+}
+
+/// Walk an expression collecting any comprehension's loop-target names.
+/// Comprehensions share the enclosing scope (we do not emit a hidden
+/// function frame), so their targets are assignments at this level and
+/// must be recorded as locals for closure analysis to see them.
+fn collect_comp_targets_in_expr(expr: &Expr, scope: &mut ScopeInfo) {
+    match expr {
+        Expr::ListComp { elt, clauses, .. } | Expr::SetComp { elt, clauses, .. } => {
+            for c in clauses {
+                collect_target_names(&c.target, scope);
+                collect_comp_targets_in_expr(&c.iter, scope);
+                for cond in &c.conditions {
+                    collect_comp_targets_in_expr(cond, scope);
+                }
+            }
+            collect_comp_targets_in_expr(elt, scope);
+        }
+        Expr::DictComp {
+            key,
+            value,
+            clauses,
+            ..
+        } => {
+            for c in clauses {
+                collect_target_names(&c.target, scope);
+                collect_comp_targets_in_expr(&c.iter, scope);
+                for cond in &c.conditions {
+                    collect_comp_targets_in_expr(cond, scope);
+                }
+            }
+            collect_comp_targets_in_expr(key, scope);
+            collect_comp_targets_in_expr(value, scope);
+        }
+        Expr::BinOp { left, right, .. } | Expr::BoolOp { left, right, .. } => {
+            collect_comp_targets_in_expr(left, scope);
+            collect_comp_targets_in_expr(right, scope);
+        }
+        Expr::UnaryOp { operand, .. } => collect_comp_targets_in_expr(operand, scope),
+        Expr::Compare {
+            left, comparators, ..
+        } => {
+            collect_comp_targets_in_expr(left, scope);
+            for c in comparators {
+                collect_comp_targets_in_expr(c, scope);
+            }
+        }
+        Expr::Call { func, args, .. } => {
+            collect_comp_targets_in_expr(func, scope);
+            for a in args {
+                collect_comp_targets_in_expr(a, scope);
+            }
+        }
+        Expr::Subscript { value, index, .. } => {
+            collect_comp_targets_in_expr(value, scope);
+            collect_comp_targets_in_expr(index, scope);
+        }
+        Expr::Attribute { value, .. } | Expr::Starred { value, .. } => {
+            collect_comp_targets_in_expr(value, scope);
+        }
+        Expr::List { elements, .. } | Expr::Tuple { elements, .. } | Expr::Set { elements, .. } => {
+            for e in elements {
+                collect_comp_targets_in_expr(e, scope);
+            }
+        }
+        Expr::Dict { keys, values, .. } => {
+            for k in keys {
+                collect_comp_targets_in_expr(k, scope);
+            }
+            for v in values {
+                collect_comp_targets_in_expr(v, scope);
+            }
+        }
+        Expr::IfExpr {
+            body, test, orelse, ..
+        } => {
+            collect_comp_targets_in_expr(body, scope);
+            collect_comp_targets_in_expr(test, scope);
+            collect_comp_targets_in_expr(orelse, scope);
+        }
+        Expr::Slice {
+            start, stop, step, ..
+        } => {
+            if let Some(s) = start {
+                collect_comp_targets_in_expr(s, scope);
+            }
+            if let Some(s) = stop {
+                collect_comp_targets_in_expr(s, scope);
+            }
+            if let Some(s) = step {
+                collect_comp_targets_in_expr(s, scope);
+            }
+        }
+        Expr::Yield { value: Some(v), .. } => collect_comp_targets_in_expr(v, scope),
+        // Lambda has its own scope; do not descend.
+        _ => {}
     }
 }
 
@@ -1373,6 +1814,178 @@ fn collect_target_names(target: &AssignTarget, scope: &mut ScopeInfo) {
     }
 }
 
+/// Walk a function body collecting every Name reference. Used to detect
+/// implicit free-variable captures: any name referenced here that's not
+/// local to this scope but is local in an enclosing scope becomes a
+/// closure cell.
+///
+/// Does NOT recurse into nested function/class bodies — their captures
+/// are computed by their own `compute_free_vars` pass.
+fn collect_name_refs(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Assign { value, .. }
+            | Stmt::AugAssign { value, .. }
+            | Stmt::ExprStmt { expr: value, .. } => expr_collect_names(value, out),
+            Stmt::If {
+                condition,
+                body,
+                elif_clauses,
+                else_body,
+                ..
+            } => {
+                expr_collect_names(condition, out);
+                collect_name_refs(body, out);
+                for (c, b) in elif_clauses {
+                    expr_collect_names(c, out);
+                    collect_name_refs(b, out);
+                }
+                collect_name_refs(else_body, out);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                expr_collect_names(condition, out);
+                collect_name_refs(body, out);
+            }
+            Stmt::For { iter, body, .. } => {
+                expr_collect_names(iter, out);
+                collect_name_refs(body, out);
+            }
+            Stmt::Return { value: Some(v), .. } => expr_collect_names(v, out),
+            Stmt::Raise { exc: Some(v), .. } => expr_collect_names(v, out),
+            Stmt::Assert { test, msg, .. } => {
+                expr_collect_names(test, out);
+                if let Some(m) = msg {
+                    expr_collect_names(m, out);
+                }
+            }
+            Stmt::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+                ..
+            } => {
+                collect_name_refs(body, out);
+                for h in handlers {
+                    if let Some(t) = &h.exc_type {
+                        expr_collect_names(t, out);
+                    }
+                    collect_name_refs(&h.body, out);
+                }
+                collect_name_refs(else_body, out);
+                collect_name_refs(finally_body, out);
+            }
+            // Nested function/class — params + bodies are their own scope;
+            // skip recursion. The nested function's own compute_free_vars
+            // will detect what IT captures.
+            _ => {}
+        }
+    }
+}
+
+fn expr_collect_names(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Name { id, .. } => {
+            out.insert(id.clone());
+        }
+        Expr::BinOp { left, right, .. } => {
+            expr_collect_names(left, out);
+            expr_collect_names(right, out);
+        }
+        Expr::UnaryOp { operand, .. } => expr_collect_names(operand, out),
+        Expr::Compare {
+            left, comparators, ..
+        } => {
+            expr_collect_names(left, out);
+            for c in comparators {
+                expr_collect_names(c, out);
+            }
+        }
+        Expr::BoolOp { left, right, .. } => {
+            expr_collect_names(left, out);
+            expr_collect_names(right, out);
+        }
+        Expr::Call { func, args, .. } => {
+            expr_collect_names(func, out);
+            for a in args {
+                expr_collect_names(a, out);
+            }
+        }
+        Expr::Subscript { value, index, .. } => {
+            expr_collect_names(value, out);
+            expr_collect_names(index, out);
+        }
+        Expr::Attribute { value, .. } => expr_collect_names(value, out),
+        Expr::List { elements, .. } | Expr::Tuple { elements, .. } | Expr::Set { elements, .. } => {
+            for e in elements {
+                expr_collect_names(e, out);
+            }
+        }
+        Expr::Dict { keys, values, .. } => {
+            for k in keys {
+                expr_collect_names(k, out);
+            }
+            for v in values {
+                expr_collect_names(v, out);
+            }
+        }
+        Expr::IfExpr {
+            body, test, orelse, ..
+        } => {
+            expr_collect_names(body, out);
+            expr_collect_names(test, out);
+            expr_collect_names(orelse, out);
+        }
+        Expr::Yield { value: Some(v), .. } => expr_collect_names(v, out),
+        Expr::Starred { value, .. } => expr_collect_names(value, out),
+        Expr::Slice {
+            start, stop, step, ..
+        } => {
+            if let Some(s) = start {
+                expr_collect_names(s, out);
+            }
+            if let Some(s) = stop {
+                expr_collect_names(s, out);
+            }
+            if let Some(s) = step {
+                expr_collect_names(s, out);
+            }
+        }
+        // Comprehensions share the enclosing scope (no hidden function
+        // frame yet), so referenced names inside leak out for closure
+        // analysis. Targets are intentionally NOT walked: they're bound
+        // by the comp's STORE_FAST, not by capture.
+        Expr::ListComp { elt, clauses, .. } | Expr::SetComp { elt, clauses, .. } => {
+            expr_collect_names(elt, out);
+            for c in clauses {
+                expr_collect_names(&c.iter, out);
+                for cond in &c.conditions {
+                    expr_collect_names(cond, out);
+                }
+            }
+        }
+        Expr::DictComp {
+            key,
+            value,
+            clauses,
+            ..
+        } => {
+            expr_collect_names(key, out);
+            expr_collect_names(value, out);
+            for c in clauses {
+                expr_collect_names(&c.iter, out);
+                for cond in &c.conditions {
+                    expr_collect_names(cond, out);
+                }
+            }
+        }
+        // Lambdas have their own scope; skip recursion.
+        _ => {}
+    }
+}
+
 /// Check if a function body contains yield expressions.
 fn contains_yield(stmts: &[Stmt]) -> bool {
     for stmt in stmts {
@@ -1382,12 +1995,19 @@ fn contains_yield(stmts: &[Stmt]) -> bool {
                     return true;
                 }
             }
-            Stmt::Return { value: Some(expr), .. } => {
+            Stmt::Return {
+                value: Some(expr), ..
+            } => {
                 if expr_contains_yield(expr) {
                     return true;
                 }
             }
-            Stmt::If { body, elif_clauses, else_body, .. } => {
+            Stmt::If {
+                body,
+                elif_clauses,
+                else_body,
+                ..
+            } => {
                 if contains_yield(body) || contains_yield(else_body) {
                     return true;
                 }
@@ -1402,8 +2022,15 @@ fn contains_yield(stmts: &[Stmt]) -> bool {
                     return true;
                 }
             }
-            Stmt::Try { body, handlers, else_body, finally_body, .. } => {
-                if contains_yield(body) || contains_yield(else_body) || contains_yield(finally_body) {
+            Stmt::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+                ..
+            } => {
+                if contains_yield(body) || contains_yield(else_body) || contains_yield(finally_body)
+                {
                     return true;
                 }
                 for h in handlers {
@@ -1424,22 +2051,18 @@ fn expr_contains_yield(expr: &Expr) -> bool {
         Expr::Call { func, args, .. } => {
             expr_contains_yield(func) || args.iter().any(expr_contains_yield)
         }
-        Expr::BinOp { left, right, .. } => {
-            expr_contains_yield(left) || expr_contains_yield(right)
-        }
+        Expr::BinOp { left, right, .. } => expr_contains_yield(left) || expr_contains_yield(right),
         Expr::UnaryOp { operand, .. } => expr_contains_yield(operand),
-        Expr::BoolOp { left, right, .. } => {
-            expr_contains_yield(left) || expr_contains_yield(right)
-        }
-        Expr::Compare { left, comparators, .. } => {
-            expr_contains_yield(left) || comparators.iter().any(expr_contains_yield)
-        }
-        Expr::IfExpr { body, test, orelse, .. } => {
-            expr_contains_yield(body) || expr_contains_yield(test) || expr_contains_yield(orelse)
-        }
-        Expr::Attribute { value, .. } | Expr::Subscript { value, .. } | Expr::Starred { value, .. } => {
-            expr_contains_yield(value)
-        }
+        Expr::BoolOp { left, right, .. } => expr_contains_yield(left) || expr_contains_yield(right),
+        Expr::Compare {
+            left, comparators, ..
+        } => expr_contains_yield(left) || comparators.iter().any(expr_contains_yield),
+        Expr::IfExpr {
+            body, test, orelse, ..
+        } => expr_contains_yield(body) || expr_contains_yield(test) || expr_contains_yield(orelse),
+        Expr::Attribute { value, .. }
+        | Expr::Subscript { value, .. }
+        | Expr::Starred { value, .. } => expr_contains_yield(value),
         Expr::Tuple { elements, .. } | Expr::List { elements, .. } | Expr::Set { elements, .. } => {
             elements.iter().any(expr_contains_yield)
         }
@@ -1481,7 +2104,11 @@ mod tests {
     fn compile_for_loop() {
         let (cos, _) = compile_src("for i in range(10):\n    print(i)\n");
         assert_eq!(cos.len(), 1);
-        let ops: Vec<u8> = cos[0].instructions.iter().map(|i| bytecode::decode_op(*i)).collect();
+        let ops: Vec<u8> = cos[0]
+            .instructions
+            .iter()
+            .map(|i| bytecode::decode_op(*i))
+            .collect();
         assert!(ops.contains(&op::GET_ITER));
         assert!(ops.contains(&op::FOR_ITER));
     }
@@ -1491,10 +2118,15 @@ mod tests {
         // Three occurrences of the literal 0 must collapse to one constant.
         // Verifies the HashMap-backed dedup in add_const works end-to-end.
         let (cos, _) = compile_src("x = 0\ny = 0\nz = 0\n");
-        let zeros = cos[0].constants.iter()
+        let zeros = cos[0]
+            .constants
+            .iter()
             .filter(|c| c.as_int() == Some(0))
             .count();
-        assert_eq!(zeros, 1, "expected the constant 0 to appear exactly once in the pool");
+        assert_eq!(
+            zeros, 1,
+            "expected the constant 0 to appear exactly once in the pool"
+        );
     }
 
     #[test]
@@ -1502,11 +2134,13 @@ mod tests {
         // Counterpart to the dedup test: a hash-key collision that lost the
         // value comparison would erroneously dedupe these into one entry.
         let (cos, _) = compile_src("x = 0\ny = 1\nz = 2\n");
-        let mut ints: Vec<i64> = cos[0].constants.iter()
-            .filter_map(|c| c.as_int())
-            .collect();
+        let mut ints: Vec<i64> = cos[0].constants.iter().filter_map(|c| c.as_int()).collect();
         ints.sort();
-        assert_eq!(ints, vec![0, 1, 2], "distinct int literals must not be deduped");
+        assert_eq!(
+            ints,
+            vec![0, 1, 2],
+            "distinct int literals must not be deduped"
+        );
     }
 
     #[test]
@@ -1518,7 +2152,11 @@ mod tests {
     #[test]
     fn compile_try_except() {
         let (cos, _) = compile_src("try:\n    pass\nexcept:\n    pass\n");
-        let ops: Vec<u8> = cos[0].instructions.iter().map(|i| bytecode::decode_op(*i)).collect();
+        let ops: Vec<u8> = cos[0]
+            .instructions
+            .iter()
+            .map(|i| bytecode::decode_op(*i))
+            .collect();
         assert!(ops.contains(&op::SETUP_EXCEPT));
     }
 
@@ -1533,7 +2171,11 @@ mod tests {
     #[test]
     fn compile_import_emits_import_name_and_store() {
         let (cos, _) = compile_src("import foo\n");
-        let ops: Vec<u8> = cos[0].instructions.iter().map(|i| bytecode::decode_op(*i)).collect();
+        let ops: Vec<u8> = cos[0]
+            .instructions
+            .iter()
+            .map(|i| bytecode::decode_op(*i))
+            .collect();
         assert!(ops.contains(&op::IMPORT_NAME));
         assert!(ops.contains(&op::STORE_GLOBAL));
     }
@@ -1541,7 +2183,11 @@ mod tests {
     #[test]
     fn compile_from_import_emits_from_and_pop() {
         let (cos, _) = compile_src("from foo import a, b\n");
-        let ops: Vec<u8> = cos[0].instructions.iter().map(|i| bytecode::decode_op(*i)).collect();
+        let ops: Vec<u8> = cos[0]
+            .instructions
+            .iter()
+            .map(|i| bytecode::decode_op(*i))
+            .collect();
         assert!(ops.contains(&op::IMPORT_NAME));
         assert_eq!(ops.iter().filter(|&&o| o == op::IMPORT_FROM).count(), 2);
         assert!(ops.contains(&op::POP_TOP));
@@ -1550,7 +2196,11 @@ mod tests {
     #[test]
     fn compile_from_import_star_emits_import_star() {
         let (cos, _) = compile_src("from foo import *\n");
-        let ops: Vec<u8> = cos[0].instructions.iter().map(|i| bytecode::decode_op(*i)).collect();
+        let ops: Vec<u8> = cos[0]
+            .instructions
+            .iter()
+            .map(|i| bytecode::decode_op(*i))
+            .collect();
         assert!(ops.contains(&op::IMPORT_STAR));
         // Star imports do NOT emit a trailing POP_TOP — IMPORT_STAR consumes the module.
         assert!(!ops.contains(&op::IMPORT_FROM));
@@ -1560,7 +2210,13 @@ mod tests {
     fn compile_import_dotted_binds_top_level() {
         // `import foo.bar` should bind `foo`, not `foo.bar`, in the current scope.
         let (cos, _) = compile_src("import foo.bar\n");
-        assert!(cos[0].names.contains(&"foo.bar".to_string()), "expected 'foo.bar' in names for IMPORT_NAME operand");
-        assert!(cos[0].names.contains(&"foo".to_string()), "expected 'foo' in names for STORE_GLOBAL bind");
+        assert!(
+            cos[0].names.contains(&"foo.bar".to_string()),
+            "expected 'foo.bar' in names for IMPORT_NAME operand"
+        );
+        assert!(
+            cos[0].names.contains(&"foo".to_string()),
+            "expected 'foo' in names for STORE_GLOBAL bind"
+        );
     }
 }
