@@ -14,7 +14,5 @@ use crate::object::CModule;
 
 /// Full set of cmodules built into this VM. Called once at VM startup.
 pub fn registry() -> Vec<Box<dyn CModule>> {
-    vec![
-        Box::new(sys::Sys),
-    ]
+    vec![Box::new(sys::Sys)]
 }

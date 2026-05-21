@@ -14,12 +14,17 @@ use crate::object::{CModule, HeapObject, Value, alloc_str, alloc_tuple};
 pub struct Sys;
 
 impl CModule for Sys {
-    fn name(&self) -> &'static str { "sys" }
+    fn name(&self) -> &'static str {
+        "sys"
+    }
 
     fn build_globals(&self, heap: &mut Vec<HeapObject>) -> HashMap<String, Value> {
         let mut g = HashMap::new();
 
-        g.insert("version".into(),  alloc_str(heap, "3.0.1 (python-rs, compatibility target)"));
+        g.insert(
+            "version".into(),
+            alloc_str(heap, "3.0.1 (python-rs, compatibility target)"),
+        );
 
         let releaselevel = alloc_str(heap, "final");
         let version_info_items = vec![
@@ -34,24 +39,37 @@ impl CModule for Sys {
         g.insert("platform".into(), alloc_str(heap, platform_string()));
         // sys.maxsize — largest positive integer supported by the platform's
         // Py_ssize_t. Matches our i48 small-int max.
-        g.insert("maxsize".into(),  Value::small_int_unchecked((1i64 << 47) - 1));
+        g.insert(
+            "maxsize".into(),
+            Value::small_int_unchecked((1i64 << 47) - 1),
+        );
         // sys.hash_info — partial; just modulus for now, matches our hash impl.
         let hash_info_items = vec![
             Value::small_int_unchecked(64),
-            Value::small_int_unchecked((1i64 << 61) - 1),  // modulus
-            Value::small_int_unchecked(314_159),           // inf hash (placeholder)
-            Value::small_int_unchecked(0),                 // nan hash
+            Value::small_int_unchecked((1i64 << 61) - 1), // modulus
+            Value::small_int_unchecked(314_159),          // inf hash (placeholder)
+            Value::small_int_unchecked(0),                // nan hash
         ];
         g.insert("hash_info".into(), alloc_tuple(heap, hash_info_items));
-        g.insert("byteorder".into(), alloc_str(heap, if cfg!(target_endian = "little") { "little" } else { "big" }));
+        g.insert(
+            "byteorder".into(),
+            alloc_str(
+                heap,
+                if cfg!(target_endian = "little") {
+                    "little"
+                } else {
+                    "big"
+                },
+            ),
+        );
 
         // Patched by the VM after registration:
-        g.insert("argv".into(),    Value::none());
-        g.insert("path".into(),    Value::none());
+        g.insert("argv".into(), Value::none());
+        g.insert("path".into(), Value::none());
         g.insert("modules".into(), Value::none());
-        g.insert("stdout".into(),  Value::none());
-        g.insert("stderr".into(),  Value::none());
-        g.insert("stdin".into(),   Value::none());
+        g.insert("stdout".into(), Value::none());
+        g.insert("stderr".into(), Value::none());
+        g.insert("stdin".into(), Value::none());
         // sys.executable — VM patches with std::env::current_exe() at bootstrap.
         g.insert("executable".into(), Value::none());
 
@@ -61,10 +79,10 @@ impl CModule for Sys {
 
 fn platform_string() -> &'static str {
     match std::env::consts::OS {
-        "linux"   => "linux",
-        "macos"   => "darwin",
+        "linux" => "linux",
+        "macos" => "darwin",
         "windows" => "win32",
-        other     => other,
+        other => other,
     }
 }
 
@@ -82,9 +100,19 @@ mod tests {
         let mut heap = Vec::new();
         let g = Sys.build_globals(&mut heap);
         for key in [
-            "version", "version_info", "platform", "maxsize", "hash_info",
-            "byteorder", "argv", "path", "modules", "stdout", "stderr",
-            "stdin", "executable",
+            "version",
+            "version_info",
+            "platform",
+            "maxsize",
+            "hash_info",
+            "byteorder",
+            "argv",
+            "path",
+            "modules",
+            "stdout",
+            "stderr",
+            "stdin",
+            "executable",
         ] {
             assert!(g.contains_key(key), "missing key: {key}");
         }

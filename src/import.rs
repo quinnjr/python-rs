@@ -46,14 +46,17 @@ impl ImportSystem {
     /// Try to build a HeapObject::Module from a registered cmodule. Returns
     /// None if no cmodule with this name is registered (caller falls through
     /// to the source-file finder).
-    pub fn try_load_cmodule(
-        &self,
-        name: &str,
-        heap: &mut Vec<HeapObject>,
-    ) -> Option<Value> {
+    pub fn try_load_cmodule(&self, name: &str, heap: &mut Vec<HeapObject>) -> Option<Value> {
         let cmod = self.cmodules.get(name)?;
         let globals = cmod.build_globals(heap);
-        Some(alloc_module(heap, name.to_string(), globals, None, None, true))
+        Some(alloc_module(
+            heap,
+            name.to_string(),
+            globals,
+            None,
+            None,
+            true,
+        ))
     }
 
     /// True if a cmodule with this name is registered. Reserved for the
@@ -67,10 +70,18 @@ impl ImportSystem {
     /// Locate `<leaf>.py` in `dir` (or in any sys.path entry if `dir` is
     /// None). Used by both the flat-module case (sys.path search) and the
     /// submodule case (where the parent package's directory is passed).
-    pub fn find_source_file_in(&self, dir: Option<&std::path::Path>, leaf: &str) -> Option<PathBuf> {
+    pub fn find_source_file_in(
+        &self,
+        dir: Option<&std::path::Path>,
+        leaf: &str,
+    ) -> Option<PathBuf> {
         let dirs: Vec<&std::path::Path> = match dir {
             Some(d) => vec![d],
-            None    => self.sys_path.iter().map(std::path::PathBuf::as_path).collect(),
+            None => self
+                .sys_path
+                .iter()
+                .map(std::path::PathBuf::as_path)
+                .collect(),
         };
         for d in dirs {
             let candidate = d.join(format!("{leaf}.py"));
@@ -87,7 +98,11 @@ impl ImportSystem {
     pub fn find_package_in(&self, dir: Option<&std::path::Path>, leaf: &str) -> Option<PathBuf> {
         let dirs: Vec<&std::path::Path> = match dir {
             Some(d) => vec![d],
-            None    => self.sys_path.iter().map(std::path::PathBuf::as_path).collect(),
+            None => self
+                .sys_path
+                .iter()
+                .map(std::path::PathBuf::as_path)
+                .collect(),
         };
         for d in dirs {
             let init = d.join(leaf).join("__init__.py");
@@ -97,7 +112,6 @@ impl ImportSystem {
         }
         None
     }
-
 }
 
 #[cfg(test)]
@@ -115,15 +129,24 @@ mod tests {
     fn try_load_cmodule_builds_module() {
         let sys = ImportSystem::new();
         let mut heap = Vec::new();
-        let v = sys.try_load_cmodule("sys", &mut heap).expect("sys cmodule loads");
+        let v = sys
+            .try_load_cmodule("sys", &mut heap)
+            .expect("sys cmodule loads");
         // Module variant lives in heap.
         let idx = v.as_object_ref().expect("module is heap ref");
         match &heap[idx] {
-            HeapObject::Module { name, file, package, initialized, globals, .. } => {
+            HeapObject::Module {
+                name,
+                file,
+                package,
+                initialized,
+                globals,
+                ..
+            } => {
                 assert_eq!(name, "sys");
-                assert!(file.is_none());        // cmodule
-                assert!(package.is_none());     // top-level
-                assert!(*initialized);          // cmodules are init'd at build time
+                assert!(file.is_none()); // cmodule
+                assert!(package.is_none()); // top-level
+                assert!(*initialized); // cmodules are init'd at build time
                 assert!(globals.contains_key("version"));
                 assert!(globals.contains_key("maxsize"));
             }
