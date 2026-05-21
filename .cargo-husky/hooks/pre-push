@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+#
+# Installed by cargo-husky on `cargo test`. Runs the full test suite
+# before allowing a push so red builds don't leave the laptop.
+#
+# Use --release because the project's CPython-compatibility runs and
+# any timing-adjacent tests already assume release-mode behaviour.
+
+set -e
+
+echo "[pre-push] cargo test --release"
+cargo test --release
+
+echo "[pre-push] OK"

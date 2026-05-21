@@ -678,8 +678,8 @@ mod tests {
 
     #[test]
     fn float_literal() {
-        let k = kinds("3.14\n");
-        assert_eq!(k[0], TokenKind::FloatLit(3.14));
+        let k = kinds("2.5\n");
+        assert_eq!(k[0], TokenKind::FloatLit(2.5));
     }
 
     #[test]

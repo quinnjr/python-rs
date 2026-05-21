@@ -1466,7 +1466,7 @@ mod tests {
 
     #[test]
     fn float_roundtrip() {
-        for v in [0.0, 1.5, -3.14, f64::INFINITY, f64::NEG_INFINITY] {
+        for v in [0.0, 1.5, -2.5, f64::INFINITY, f64::NEG_INFINITY] {
             let val = Value::float(v);
             assert!(val.is_float(), "expected float for {v}");
             assert_eq!(val.as_float(), Some(v));
@@ -1525,7 +1525,7 @@ mod tests {
     fn display_values() {
         let heap = vec![HeapObject::Str("hello".into())];
         assert_eq!(Value::small_int_unchecked(42).display(&heap), "42");
-        assert_eq!(Value::float(3.14).display(&heap), "3.14");
+        assert_eq!(Value::float(2.5).display(&heap), "2.5");
         assert_eq!(Value::bool_val(true).display(&heap), "True");
         assert_eq!(Value::none().display(&heap), "None");
         assert_eq!(Value::str_ref(0).display(&heap), "hello");
@@ -1533,7 +1533,7 @@ mod tests {
 
     #[test]
     fn tags_dont_collide() {
-        let values = vec![
+        let values = [
             Value::small_int_unchecked(0),
             Value::bool_val(false),
             Value::none(),

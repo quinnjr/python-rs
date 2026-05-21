@@ -34,6 +34,9 @@ num-traits = "0.2"
 [dev-dependencies]
 # Temp directories for import-system tests that need real .py files on disk.
 tempfile = "3"
+# Installs git hooks (pre-commit lint, pre-push test) from .cargo-husky/.
+# `user-hooks` feature disables the default and uses our custom scripts.
+cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 
 # Release-profile tuning for the final interpreter binary:
 # - lto = "fat" enables cross-crate inlining (helps the hot dispatch loop).

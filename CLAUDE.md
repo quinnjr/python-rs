@@ -50,6 +50,12 @@ cargo clippy -- -D warnings          # required clean before commit
 cargo fmt                            # required before commit
 cargo fmt --check                    # CI check
 
+# Git hooks are installed automatically by cargo-husky when `cargo test`
+# runs. `pre-commit` runs `cargo fmt --check` + `cargo clippy --all-targets
+# -- -D warnings`; `pre-push` runs `cargo test --release`. The hook source
+# lives in `.cargo-husky/hooks/`; bypass with `--no-verify` only in
+# documented emergencies.
+
 # CPython compatibility suite (fails until M3 — that is expected)
 scripts/run-cpython-tests.sh         # full Lib/test/ run
 scripts/run-cpython-tests.sh --fast  # tier-1 smoke list (~10 files)
