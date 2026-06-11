@@ -1,11 +1,51 @@
 [package]
 name = "python-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
-description = "A stackless Python 3 interpreter written in Rust — NaN-boxed values, zero dependencies"
+description = "A stackless Python 3 interpreter written in Rust — academic/hobby AI-assisted port of CPython. Pre-release; not usable yet."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pegasusheavy/python-rs"
+repository = "https://github.com/quinnjr/python-rs"
+homepage = "https://github.com/quinnjr/python-rs"
+readme = "README.md"
 keywords = ["python", "interpreter", "vm", "bytecode", "stackless"]
 categories = ["compilers", "command-line-utilities"]
+# Keep the published crate small: omit the vendored CPython 3.0.1 tree
+# (~22 MB, PSF-licensed, used only at development/test time) and other
+# files irrelevant to crate consumers.
+exclude = [
+    "vendor/**",
+    "docs/**",
+    "tests/cpython-3.0/**",
+    "scripts/**",
+    ".claude/**",
+    ".gitattributes",
+    "test_fizzbuzz.py",
+]
 
 [dependencies]
+# Arbitrary-precision integers backing HeapObject::BigInt and the PyInt
+# overflow path. Required for Python 3 int semantics — see M2 design spec.
+num-bigint = "0.4"
+# div_floor / mod_floor / div_mod_floor on BigInt; sister crate to num-bigint.
+num-integer = "0.1"
+# Sign extraction and unsigned-to-signed bridges for the hash algorithm.
+num-traits = "0.2"
+
+[dev-dependencies]
+# Temp directories for import-system tests that need real .py files on disk.
+tempfile = "3"
+# Installs git hooks (pre-commit lint, pre-push test) from .cargo-husky/.
+# `user-hooks` feature disables the default and uses our custom scripts.
+cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+
+# Release-profile tuning for the final interpreter binary:
+# - lto = "fat" enables cross-crate inlining (helps the hot dispatch loop).
+# - codegen-units = 1 lets LLVM see the whole crate in one IR module.
+# - strip = "symbols" drops debug symbols — smaller binary.
+# - panic = "abort" removes unwinding overhead; the project bans .unwrap()
+#   in production code so panics are by definition unrecoverable.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

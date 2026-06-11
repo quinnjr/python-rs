@@ -14,22 +14,34 @@ pub enum PythonError {
 impl PythonError {
     /// Create a lex error.
     pub fn lex(msg: impl Into<String>, line: u32) -> Self {
-        Self::LexError { msg: msg.into(), line }
+        Self::LexError {
+            msg: msg.into(),
+            line,
+        }
     }
 
     /// Create a parse error.
     pub fn parse(msg: impl Into<String>, line: u32) -> Self {
-        Self::ParseError { msg: msg.into(), line }
+        Self::ParseError {
+            msg: msg.into(),
+            line,
+        }
     }
 
     /// Create a compile error.
     pub fn compile(msg: impl Into<String>, line: u32) -> Self {
-        Self::CompileError { msg: msg.into(), line }
+        Self::CompileError {
+            msg: msg.into(),
+            line,
+        }
     }
 
     /// Create a runtime error.
     pub fn runtime(msg: impl Into<String>, line: u32) -> Self {
-        Self::RuntimeError { msg: msg.into(), line }
+        Self::RuntimeError {
+            msg: msg.into(),
+            line,
+        }
     }
 
     /// Get the line number of the error.

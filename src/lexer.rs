@@ -1,11 +1,16 @@
 /// Python tokenizer with INDENT/DEDENT tracking.
 use crate::error::PythonError;
+use num_bigint::BigInt;
 
 /// Token kind.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Literals
     IntLit(i64),
+    /// Integer literal that exceeded i64 range at lex time. Boxed so the
+    /// TokenKind enum stays small; only constructed for genuinely huge
+    /// literals, so the box allocation is rare.
+    BigIntLit(Box<BigInt>),
     FloatLit(f64),
     StringLit(String),
 
@@ -30,6 +35,22 @@ pub enum TokenKind {
     Pass,
     Break,
     Continue,
+    Class,
+    Try,
+    Except,
+    Finally,
+    Raise,
+    As,
+    With,
+    Assert,
+    Del,
+    Global,
+    Nonlocal,
+    Lambda,
+    Yield,
+    Is,
+    From,
+    Import,
 
     // Operators
     Plus,
@@ -53,15 +74,32 @@ pub enum TokenKind {
     DoubleSlashAssign,
     PercentAssign,
     DoubleStarAssign,
+    Ampersand,
+    Pipe,
+    Caret,
+    Tilde,
+    LShift,
+    RShift,
+    AmpersandAssign,
+    PipeAssign,
+    CaretAssign,
+    LShiftAssign,
+    RShiftAssign,
+    At,
 
     // Delimiters
     LParen,
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Colon,
     Comma,
     Dot,
+    Semicolon,
+    Ellipsis,
+    Arrow,
 
     // Structure
     Newline,
@@ -117,16 +155,28 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 break;
             }
 
-            let current_indent = *indent_stack.last().unwrap();
+            // indent_stack is initialized with [0] and the pop loop below
+            // never drains the bottom, so last() can't be None in practice —
+            // unwrap_or(&0) keeps the code panic-free if the invariant ever
+            // gets violated, treating an empty stack as zero indent.
+            let current_indent = *indent_stack.last().unwrap_or(&0);
             if indent > current_indent {
                 indent_stack.push(indent);
-                tokens.push(Token { kind: TokenKind::Indent, line, col: 1 });
+                tokens.push(Token {
+                    kind: TokenKind::Indent,
+                    line,
+                    col: 1,
+                });
             } else {
-                while indent < *indent_stack.last().unwrap() {
+                while indent < *indent_stack.last().unwrap_or(&0) {
                     indent_stack.pop();
-                    tokens.push(Token { kind: TokenKind::Dedent, line, col: 1 });
+                    tokens.push(Token {
+                        kind: TokenKind::Dedent,
+                        line,
+                        col: 1,
+                    });
                 }
-                if indent != *indent_stack.last().unwrap() {
+                if indent != *indent_stack.last().unwrap_or(&0) {
                     return Err(PythonError::lex("inconsistent indentation", line));
                 }
             }
@@ -165,8 +215,14 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
         if pos < len && chars[pos] == '\n' {
             if paren_depth == 0 {
                 // Only emit newline if the last token wasn't already a newline
-                if let Some(last) = tokens.last() && last.kind != TokenKind::Newline {
-                    tokens.push(Token { kind: TokenKind::Newline, line, col });
+                if let Some(last) = tokens.last()
+                    && last.kind != TokenKind::Newline
+                {
+                    tokens.push(Token {
+                        kind: TokenKind::Newline,
+                        line,
+                        col,
+                    });
                 }
             }
             pos += 1;
@@ -217,7 +273,11 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
             }
             pos += 1; // skip closing quote
             col += 1;
-            tokens.push(Token { kind: TokenKind::StringLit(s), line, col: start_col });
+            tokens.push(Token {
+                kind: TokenKind::StringLit(s),
+                line,
+                col: start_col,
+            });
             continue;
         }
 
@@ -240,11 +300,45 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
             }
             let text: String = chars[start..pos].iter().collect();
             if is_float {
-                let f: f64 = text.parse().map_err(|_| PythonError::lex("invalid float", line))?;
-                tokens.push(Token { kind: TokenKind::FloatLit(f), line, col: start_col });
+                let f: f64 = text
+                    .parse()
+                    .map_err(|_| PythonError::lex("invalid float", line))?;
+                tokens.push(Token {
+                    kind: TokenKind::FloatLit(f),
+                    line,
+                    col: start_col,
+                });
             } else {
-                let i: i64 = text.parse().map_err(|_| PythonError::lex("invalid integer", line))?;
-                tokens.push(Token { kind: TokenKind::IntLit(i), line, col: start_col });
+                // Digit-count dispatch — 19 decimal digits is the i64 boundary.
+                // Up to 18 digits always fits in i64. 19 digits is the boundary
+                // case (i64::MAX has 19). 20+ digits never fit.
+                let digits = text.len();
+                let kind = if digits < 19 {
+                    TokenKind::IntLit(
+                        text.parse()
+                            .map_err(|_| PythonError::lex("invalid integer", line))?,
+                    )
+                } else if digits == 19 {
+                    match text.parse::<i64>() {
+                        Ok(i) => TokenKind::IntLit(i),
+                        Err(_) => {
+                            let b = text
+                                .parse::<BigInt>()
+                                .map_err(|_| PythonError::lex("invalid integer", line))?;
+                            TokenKind::BigIntLit(Box::new(b))
+                        }
+                    }
+                } else {
+                    let b = text
+                        .parse::<BigInt>()
+                        .map_err(|_| PythonError::lex("invalid integer", line))?;
+                    TokenKind::BigIntLit(Box::new(b))
+                };
+                tokens.push(Token {
+                    kind,
+                    line,
+                    col: start_col,
+                });
             }
             continue;
         }
@@ -275,10 +369,71 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 "pass" => TokenKind::Pass,
                 "break" => TokenKind::Break,
                 "continue" => TokenKind::Continue,
+                "class" => TokenKind::Class,
+                "try" => TokenKind::Try,
+                "except" => TokenKind::Except,
+                "finally" => TokenKind::Finally,
+                "raise" => TokenKind::Raise,
+                "as" => TokenKind::As,
+                "with" => TokenKind::With,
+                "assert" => TokenKind::Assert,
+                "del" => TokenKind::Del,
+                "global" => TokenKind::Global,
+                "nonlocal" => TokenKind::Nonlocal,
+                "lambda" => TokenKind::Lambda,
+                "yield" => TokenKind::Yield,
+                "is" => TokenKind::Is,
+                "from" => TokenKind::From,
+                "import" => TokenKind::Import,
                 _ => TokenKind::Ident(word),
             };
-            tokens.push(Token { kind, line, col: start_col });
+            tokens.push(Token {
+                kind,
+                line,
+                col: start_col,
+            });
             continue;
+        }
+
+        // Three-character tokens
+        if pos + 2 < len {
+            let three: String = chars[pos..pos + 3].iter().collect();
+            let kind3 = match three.as_str() {
+                "..." => Some(TokenKind::Ellipsis),
+                "<<=" => Some(TokenKind::LShiftAssign),
+                ">>=" => Some(TokenKind::RShiftAssign),
+                "**=" => {
+                    pos += 3;
+                    col += 3;
+                    tokens.push(Token {
+                        kind: TokenKind::DoubleStarAssign,
+                        line,
+                        col: start_col,
+                    });
+                    continue;
+                }
+                "//=" => {
+                    pos += 3;
+                    col += 3;
+                    tokens.push(Token {
+                        kind: TokenKind::DoubleSlashAssign,
+                        line,
+                        col: start_col,
+                    });
+                    continue;
+                }
+                _ => Option::None,
+            };
+            if let Some(k) = kind3 {
+                pos += 3;
+                col += 3;
+                tokens.push(Token {
+                    kind: k,
+                    line,
+                    col: start_col,
+                });
+                continue;
+            }
         }
 
         // Two-character operators
@@ -289,35 +444,29 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 "!=" => Some(TokenKind::NotEq),
                 "<=" => Some(TokenKind::LtEq),
                 ">=" => Some(TokenKind::GtEq),
-                "//" => {
-                    if pos + 2 < len && chars[pos + 2] == '=' {
-                        pos += 3;
-                        col += 3;
-                        tokens.push(Token { kind: TokenKind::DoubleSlashAssign, line, col: start_col });
-                        continue;
-                    }
-                    Some(TokenKind::DoubleSlash)
-                }
-                "**" => {
-                    if pos + 2 < len && chars[pos + 2] == '=' {
-                        pos += 3;
-                        col += 3;
-                        tokens.push(Token { kind: TokenKind::DoubleStarAssign, line, col: start_col });
-                        continue;
-                    }
-                    Some(TokenKind::DoubleStar)
-                }
+                "//" => Some(TokenKind::DoubleSlash),
+                "**" => Some(TokenKind::DoubleStar),
                 "+=" => Some(TokenKind::PlusAssign),
                 "-=" => Some(TokenKind::MinusAssign),
                 "*=" => Some(TokenKind::StarAssign),
                 "/=" => Some(TokenKind::SlashAssign),
                 "%=" => Some(TokenKind::PercentAssign),
+                "<<" => Some(TokenKind::LShift),
+                ">>" => Some(TokenKind::RShift),
+                "&=" => Some(TokenKind::AmpersandAssign),
+                "|=" => Some(TokenKind::PipeAssign),
+                "^=" => Some(TokenKind::CaretAssign),
+                "->" => Some(TokenKind::Arrow),
                 _ => Option::None,
             };
             if let Some(k) = kind {
                 pos += 2;
                 col += 2;
-                tokens.push(Token { kind: k, line, col: start_col });
+                tokens.push(Token {
+                    kind: k,
+                    line,
+                    col: start_col,
+                });
                 continue;
             }
         }
@@ -332,6 +481,11 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
             '<' => Some(TokenKind::Lt),
             '>' => Some(TokenKind::Gt),
             '=' => Some(TokenKind::Assign),
+            '&' => Some(TokenKind::Ampersand),
+            '|' => Some(TokenKind::Pipe),
+            '^' => Some(TokenKind::Caret),
+            '~' => Some(TokenKind::Tilde),
+            '@' => Some(TokenKind::At),
             '(' => {
                 paren_depth += 1;
                 Some(TokenKind::LParen)
@@ -348,34 +502,65 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, PythonError> {
                 paren_depth = paren_depth.saturating_sub(1);
                 Some(TokenKind::RBracket)
             }
+            '{' => {
+                paren_depth += 1;
+                Some(TokenKind::LBrace)
+            }
+            '}' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                Some(TokenKind::RBrace)
+            }
             ':' => Some(TokenKind::Colon),
             ',' => Some(TokenKind::Comma),
             '.' => Some(TokenKind::Dot),
+            ';' => Some(TokenKind::Semicolon),
             _ => Option::None,
         };
 
         if let Some(k) = kind {
             pos += 1;
             col += 1;
-            tokens.push(Token { kind: k, line, col: start_col });
+            tokens.push(Token {
+                kind: k,
+                line,
+                col: start_col,
+            });
             continue;
         }
 
-        return Err(PythonError::lex(format!("unexpected character '{ch}'"), line));
+        return Err(PythonError::lex(
+            format!("unexpected character '{ch}'"),
+            line,
+        ));
     }
 
     // Emit final newline if needed
-    if let Some(last) = tokens.last() && last.kind != TokenKind::Newline && last.kind != TokenKind::Dedent {
-        tokens.push(Token { kind: TokenKind::Newline, line, col });
+    if let Some(last) = tokens.last()
+        && last.kind != TokenKind::Newline
+        && last.kind != TokenKind::Dedent
+    {
+        tokens.push(Token {
+            kind: TokenKind::Newline,
+            line,
+            col,
+        });
     }
 
     // Close any remaining indentation
     while indent_stack.len() > 1 {
         indent_stack.pop();
-        tokens.push(Token { kind: TokenKind::Dedent, line, col: 1 });
+        tokens.push(Token {
+            kind: TokenKind::Dedent,
+            line,
+            col: 1,
+        });
     }
 
-    tokens.push(Token { kind: TokenKind::Eof, line, col });
+    tokens.push(Token {
+        kind: TokenKind::Eof,
+        line,
+        col,
+    });
     Ok(tokens)
 }
 
@@ -384,42 +569,52 @@ mod tests {
     use super::*;
 
     fn kinds(source: &str) -> Vec<TokenKind> {
-        tokenize(source).unwrap().into_iter().map(|t| t.kind).collect()
+        tokenize(source)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.kind)
+            .collect()
     }
 
     #[test]
     fn simple_assignment() {
         let k = kinds("x = 10\n");
-        assert_eq!(k, vec![
-            TokenKind::Ident("x".into()),
-            TokenKind::Assign,
-            TokenKind::IntLit(10),
-            TokenKind::Newline,
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Ident("x".into()),
+                TokenKind::Assign,
+                TokenKind::IntLit(10),
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn indent_dedent() {
         let src = "if True:\n    x = 1\ny = 2\n";
         let k = kinds(src);
-        assert_eq!(k, vec![
-            TokenKind::If,
-            TokenKind::True,
-            TokenKind::Colon,
-            TokenKind::Newline,
-            TokenKind::Indent,
-            TokenKind::Ident("x".into()),
-            TokenKind::Assign,
-            TokenKind::IntLit(1),
-            TokenKind::Newline,
-            TokenKind::Dedent,
-            TokenKind::Ident("y".into()),
-            TokenKind::Assign,
-            TokenKind::IntLit(2),
-            TokenKind::Newline,
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::If,
+                TokenKind::True,
+                TokenKind::Colon,
+                TokenKind::Newline,
+                TokenKind::Indent,
+                TokenKind::Ident("x".into()),
+                TokenKind::Assign,
+                TokenKind::IntLit(1),
+                TokenKind::Newline,
+                TokenKind::Dedent,
+                TokenKind::Ident("y".into()),
+                TokenKind::Assign,
+                TokenKind::IntLit(2),
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
@@ -448,7 +643,9 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let k = kinds("if elif else for in while def return and or not True False None pass break continue\n");
+        let k = kinds(
+            "if elif else for in while def return and or not True False None pass break continue\n",
+        );
         assert!(k.contains(&TokenKind::If));
         assert!(k.contains(&TokenKind::Elif));
         assert!(k.contains(&TokenKind::Else));
@@ -472,20 +669,64 @@ mod tests {
     fn paren_line_continuation() {
         let k = kinds("f(1,\n  2)\n");
         // No Newline between 1, and 2 due to paren depth
-        assert!(!k[..k.len() - 1].windows(2).any(|w|
-            w[0] == TokenKind::IntLit(1) && w[1] == TokenKind::Newline
-        ));
+        assert!(
+            !k[..k.len() - 1]
+                .windows(2)
+                .any(|w| w[0] == TokenKind::IntLit(1) && w[1] == TokenKind::Newline)
+        );
     }
 
     #[test]
     fn float_literal() {
-        let k = kinds("3.14\n");
-        assert_eq!(k[0], TokenKind::FloatLit(3.14));
+        let k = kinds("2.5\n");
+        assert_eq!(k[0], TokenKind::FloatLit(2.5));
     }
 
     #[test]
     fn augmented_assign() {
         let k = kinds("x += 1\n");
         assert_eq!(k[1], TokenKind::PlusAssign);
+    }
+
+    #[test]
+    fn new_keywords() {
+        let k = kinds(
+            "class try except finally raise as with assert del global nonlocal lambda yield is from\n",
+        );
+        assert!(k.contains(&TokenKind::Class));
+        assert!(k.contains(&TokenKind::Try));
+        assert!(k.contains(&TokenKind::Except));
+        assert!(k.contains(&TokenKind::Finally));
+        assert!(k.contains(&TokenKind::Raise));
+        assert!(k.contains(&TokenKind::As));
+        assert!(k.contains(&TokenKind::With));
+        assert!(k.contains(&TokenKind::Assert));
+        assert!(k.contains(&TokenKind::Del));
+        assert!(k.contains(&TokenKind::Global));
+        assert!(k.contains(&TokenKind::Nonlocal));
+        assert!(k.contains(&TokenKind::Lambda));
+        assert!(k.contains(&TokenKind::Yield));
+        assert!(k.contains(&TokenKind::Is));
+        assert!(k.contains(&TokenKind::From));
+    }
+
+    #[test]
+    fn bitwise_operators() {
+        let k = kinds("a & b | c ^ d ~ e << f >> g\n");
+        assert!(k.contains(&TokenKind::Ampersand));
+        assert!(k.contains(&TokenKind::Pipe));
+        assert!(k.contains(&TokenKind::Caret));
+        assert!(k.contains(&TokenKind::Tilde));
+        assert!(k.contains(&TokenKind::LShift));
+        assert!(k.contains(&TokenKind::RShift));
+    }
+
+    #[test]
+    fn braces_and_semicolons() {
+        let k = kinds("{1: 2}; ...\n");
+        assert!(k.contains(&TokenKind::LBrace));
+        assert!(k.contains(&TokenKind::RBrace));
+        assert!(k.contains(&TokenKind::Semicolon));
+        assert!(k.contains(&TokenKind::Ellipsis));
     }
 }

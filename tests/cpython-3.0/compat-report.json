@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "target": "CPython 3.0.1",
+  "vendor_path": "vendor/cpython-3.0/",
+  "ran_at": null,
+  "python_rs_commit": null,
+  "total_test_files": 325,
+  "passed": 0,
+  "failed": 0,
+  "skipped_by_us": 38,
+  "skipped_by_test": 0,
+  "errored": 0,
+  "not_yet_run": 287,
+  "note": "Initial baseline. No tests have been executed yet — the harness is in place ahead of milestone M3 (import system + Tier-1 C modules), which is when regrtest.py first becomes runnable under python-rs. The skipped_by_us count reflects entries in tests/cpython-3.0/skip.toml. by_file will be populated by scripts/update-compat-report.py once the harness produces real output.",
+  "by_file": {}
+}

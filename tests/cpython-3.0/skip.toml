@@ -1,0 +1,179 @@
+# Skip list for CPython 3.0 regression suite.
+#
+# Every entry in this file represents a test file from
+# vendor/cpython-3.0/Lib/test/ that python-rs deliberately does not run.
+# Each entry must declare a category and a human-readable reason.
+#
+# Categories (see design spec section "Skip-list policy"):
+#   c_extension_deferred — needs a Tier-3 C module deferred to a later milestone
+#   platform_specific    — only valid on an OS/arch we do not target
+#   cpython_internal     — pokes at CPython implementation details we do not share
+#   python_3_0_bug       — known failure on CPython 3.0 itself
+#   temporary            — fixable, has tracking issue; discouraged
+#
+# The skip list is part of the design surface, not an escape hatch. Reviewed
+# at every milestone boundary.
+
+# ---------------------------------------------------------------------------
+# Tier-3 C extensions deferred to post-M10 work
+# ---------------------------------------------------------------------------
+
+[skip.test_socket]
+category = "c_extension_deferred"
+reason = "Requires _socket. Deferred until cpyext milestone."
+
+[skip.test_socketserver]
+category = "c_extension_deferred"
+reason = "Requires _socket."
+
+[skip.test_ssl]
+category = "c_extension_deferred"
+reason = "Requires _ssl."
+
+[skip.test_ctypes]
+category = "c_extension_deferred"
+reason = "Requires _ctypes."
+
+[skip.test_select]
+category = "c_extension_deferred"
+reason = "Requires select module."
+
+[skip.test_signal]
+category = "c_extension_deferred"
+reason = "Requires signal module."
+
+[skip.test_mmap]
+category = "c_extension_deferred"
+reason = "Requires mmap module."
+
+[skip.test_fcntl]
+category = "c_extension_deferred"
+reason = "Requires fcntl (POSIX-only and depends on _fcntl C ext)."
+
+[skip.test_curses]
+category = "c_extension_deferred"
+reason = "Requires _curses."
+
+[skip.test_pyexpat]
+category = "c_extension_deferred"
+reason = "Requires pyexpat (XML parser C extension)."
+
+[skip.test_sax]
+category = "c_extension_deferred"
+reason = "Depends on pyexpat."
+
+[skip.test_sqlite]
+category = "c_extension_deferred"
+reason = "Requires _sqlite3."
+
+[skip.test_tcl]
+category = "c_extension_deferred"
+reason = "Requires _tkinter."
+
+[skip.test_multiprocessing]
+category = "c_extension_deferred"
+reason = "Requires _multiprocessing; also needs threading + fork."
+
+[skip.test_audioop]
+category = "c_extension_deferred"
+reason = "Requires audioop C extension."
+
+[skip.test_ossaudiodev]
+category = "c_extension_deferred"
+reason = "Requires ossaudiodev (Linux-specific audio device)."
+
+# ---------------------------------------------------------------------------
+# Threading-dependent tests — deferred until threading support lands
+# ---------------------------------------------------------------------------
+
+[skip.test_thread]
+category = "c_extension_deferred"
+reason = "Requires _thread (real, not stub)."
+
+[skip.test_threading]
+category = "c_extension_deferred"
+reason = "Requires _thread."
+
+[skip.test_threaded_import]
+category = "c_extension_deferred"
+reason = "Requires _thread."
+
+[skip.test_threadedtempfile]
+category = "c_extension_deferred"
+reason = "Requires _thread."
+
+[skip.test_threading_local]
+category = "c_extension_deferred"
+reason = "Requires _thread."
+
+[skip.test_threadsignals]
+category = "c_extension_deferred"
+reason = "Requires _thread + signal."
+
+# ---------------------------------------------------------------------------
+# Networking-dependent tests — depend on _socket and friends
+# ---------------------------------------------------------------------------
+
+[skip.test_asynchat]
+category = "c_extension_deferred"
+reason = "Async I/O over sockets; depends on _socket."
+
+[skip.test_asyncore]
+category = "c_extension_deferred"
+reason = "Same as test_asynchat."
+
+[skip.test_httplib]
+category = "c_extension_deferred"
+reason = "HTTP client over sockets."
+
+[skip.test_urllib]
+category = "c_extension_deferred"
+reason = "Depends on socket/http stack."
+
+[skip.test_urllib2]
+category = "c_extension_deferred"
+reason = "Depends on socket/http stack."
+
+[skip.test_urllibnet]
+category = "c_extension_deferred"
+reason = "Network test; requires live socket."
+
+[skip.test_urllib2net]
+category = "c_extension_deferred"
+reason = "Network test; requires live socket."
+
+[skip.test_urllib2_localnet]
+category = "c_extension_deferred"
+reason = "Local network test; requires socket."
+
+[skip.test_ftplib]
+category = "c_extension_deferred"
+reason = "FTP over sockets."
+
+[skip.test_smtplib]
+category = "c_extension_deferred"
+reason = "SMTP over sockets."
+
+[skip.test_telnetlib]
+category = "c_extension_deferred"
+reason = "Telnet over sockets."
+
+[skip.test_imaplib]
+category = "c_extension_deferred"
+reason = "IMAP over sockets."
+
+[skip.test_poplib]
+category = "c_extension_deferred"
+reason = "POP over sockets."
+
+[skip.test_wsgiref]
+category = "c_extension_deferred"
+reason = "WSGI reference impl; uses sockets."
+
+[skip.test_xmlrpc]
+category = "c_extension_deferred"
+reason = "XML-RPC; uses sockets."
+
+[skip.test_xmlrpc_net]
+category = "c_extension_deferred"
+reason = "Network XML-RPC test."

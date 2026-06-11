@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#
+# Installed by cargo-husky on `cargo test`. Runs the two lint checks that
+# CLAUDE.md mandates as "required clean before commit":
+#
+#   * cargo fmt --check
+#   * cargo clippy --all-targets -- -D warnings
+#
+# Use `git commit --no-verify` ONLY for emergency fixes — and explain why
+# in the commit message. Skipping should not become routine.
+
+set -e
+
+echo "[pre-commit] cargo fmt --check"
+cargo fmt --check
+
+echo "[pre-commit] cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "[pre-commit] OK"
