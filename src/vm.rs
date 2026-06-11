@@ -2078,21 +2078,19 @@ impl VM {
                 HeapObject::Dict { .. } => {
                     return self.dict_method_dispatch(obj_idx, attr, line);
                 }
-                HeapObject::Tuple(items) => {
-                    if attr == "__len__" {
-                        return Ok(Value::small_int_unchecked(items.len() as i64));
-                    }
+                HeapObject::Tuple(items) if attr == "__len__" => {
+                    return Ok(Value::small_int_unchecked(items.len() as i64));
                 }
-                HeapObject::Generator { .. } => {
-                    if attr == "__next__" || attr == "send" || attr == "close" {
-                        // Return a bound method placeholder
-                        let bound_idx = self.heap.len();
-                        self.heap.push(HeapObject::BoundMethod {
-                            instance: obj,
-                            method: Value::none(), // Handled specially
-                        });
-                        return Ok(Value::object_ref(bound_idx));
-                    }
+                HeapObject::Generator { .. }
+                    if attr == "__next__" || attr == "send" || attr == "close" =>
+                {
+                    // Return a bound method placeholder
+                    let bound_idx = self.heap.len();
+                    self.heap.push(HeapObject::BoundMethod {
+                        instance: obj,
+                        method: Value::none(), // Handled specially
+                    });
+                    return Ok(Value::object_ref(bound_idx));
                 }
                 HeapObject::Module { name, globals, .. } => {
                     if let Some(&val) = globals.get(attr) {

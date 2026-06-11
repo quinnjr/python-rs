@@ -1295,17 +1295,11 @@ impl Compiler {
                     self.prescan_locals(co, else_body);
                     self.prescan_locals(co, finally_body);
                 }
-                Stmt::FunctionDef { name, .. } => {
-                    if !co.local_names.contains(name) {
-                        co.local_names.push(name.clone());
-                        co.num_locals = co.local_names.len();
-                    }
-                }
-                Stmt::ClassDef { name, .. } => {
-                    if !co.local_names.contains(name) {
-                        co.local_names.push(name.clone());
-                        co.num_locals = co.local_names.len();
-                    }
+                Stmt::FunctionDef { name, .. } | Stmt::ClassDef { name, .. }
+                    if !co.local_names.contains(name) =>
+                {
+                    co.local_names.push(name.clone());
+                    co.num_locals = co.local_names.len();
                 }
                 _ => {}
             }
@@ -1618,11 +1612,9 @@ fn target_name(target: &AssignTarget) -> String {
 
 fn add_target_locals(co: &mut CodeObject, target: &AssignTarget) {
     match target {
-        AssignTarget::Name(name) => {
-            if !co.local_names.contains(name) {
-                co.local_names.push(name.clone());
-                co.num_locals = co.local_names.len();
-            }
+        AssignTarget::Name(name) if !co.local_names.contains(name) => {
+            co.local_names.push(name.clone());
+            co.num_locals = co.local_names.len();
         }
         AssignTarget::Tuple(targets) => {
             for t in targets {
@@ -1800,10 +1792,10 @@ fn collect_comp_targets_in_expr(expr: &Expr, scope: &mut ScopeInfo) {
 
 fn collect_target_names(target: &AssignTarget, scope: &mut ScopeInfo) {
     match target {
-        AssignTarget::Name(name) => {
-            if !scope.globals.contains(name) && !scope.nonlocals.contains(name) {
-                scope.locals.insert(name.clone());
-            }
+        AssignTarget::Name(name)
+            if !scope.globals.contains(name) && !scope.nonlocals.contains(name) =>
+        {
+            scope.locals.insert(name.clone());
         }
         AssignTarget::Tuple(targets) => {
             for t in targets {
@@ -1990,17 +1982,12 @@ fn expr_collect_names(expr: &Expr, out: &mut HashSet<String>) {
 fn contains_yield(stmts: &[Stmt]) -> bool {
     for stmt in stmts {
         match stmt {
-            Stmt::ExprStmt { expr, .. } | Stmt::Assign { value: expr, .. } => {
-                if expr_contains_yield(expr) {
-                    return true;
-                }
-            }
-            Stmt::Return {
+            Stmt::ExprStmt { expr, .. }
+            | Stmt::Assign { value: expr, .. }
+            | Stmt::Return {
                 value: Some(expr), ..
-            } => {
-                if expr_contains_yield(expr) {
-                    return true;
-                }
+            } if expr_contains_yield(expr) => {
+                return true;
             }
             Stmt::If {
                 body,
@@ -2017,10 +2004,8 @@ fn contains_yield(stmts: &[Stmt]) -> bool {
                     }
                 }
             }
-            Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                if contains_yield(body) {
-                    return true;
-                }
+            Stmt::While { body, .. } | Stmt::For { body, .. } if contains_yield(body) => {
+                return true;
             }
             Stmt::Try {
                 body,
